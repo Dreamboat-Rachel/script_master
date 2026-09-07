@@ -1,0 +1,24 @@
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: script-master-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: local_root_password
+      MYSQL_DATABASE: script_master
+      MYSQL_USER: script_master
+      MYSQL_PASSWORD: script_master
+      TZ: Asia/Shanghai
+    ports:
+      - "3306:3306"
+    volumes:
+      - script_master_mysql:/var/lib/mysql
+      - ./backend/sql/mysql-init.sql:/docker-entrypoint-initdb.d/001-init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uscript_master", "-pscript_master"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  script_master_mysql:
