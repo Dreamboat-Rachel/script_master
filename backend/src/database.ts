@@ -14,6 +14,7 @@ export interface CreateProjectInput {
   style: string;
   aspectRatio: string;
   durationSeconds: number;
+  targetEpisodeCount: number;
 }
 
 export interface DatabaseStore {
@@ -21,13 +22,14 @@ export interface DatabaseStore {
   listProjects(): Promise<Project[]>;
   getProject(id: string): Promise<Project | null>;
   createProject(input: CreateProjectInput): Promise<Project>;
+  deleteProject(id: string): Promise<boolean>;
   updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }): Promise<Project | null>;
   listScenes(projectId: string): Promise<Scene[]>;
   replaceScenes(projectId: string, scenes: Omit<Scene, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Scene[]>;
   listJobs(): Promise<RenderJob[]>;
   createRenderJob(projectId: string): Promise<RenderJob>;
   getScriptDocument(projectId: string): Promise<ScriptDocument | null>;
-  saveScriptDocument(projectId: string, originalText: string, formattedText: string): Promise<ScriptDocument>;
+  saveScriptDocument(projectId: string, originalText: string, formattedText: string, formatStatus?: "raw" | "formatted"): Promise<ScriptDocument>;
   listEpisodes(projectId: string): Promise<Episode[]>;
   replaceEpisodes(projectId: string, episodes: Omit<Episode, "id" | "projectId" | "sceneCount" | "createdAt" | "updatedAt">[]): Promise<Episode[]>;
   listSubjects(projectId: string): Promise<Subject[]>;
@@ -47,6 +49,7 @@ function toProject(row: DbRow): Project {
     style: row.style,
     aspectRatio: row.aspect_ratio,
     durationSeconds: Number(row.duration_seconds),
+    targetEpisodeCount: Number(row.target_episode_count ?? 3),
     status: row.status,
     progress: Number(row.progress),
     coverUrl: row.cover_url ?? null,
@@ -85,8 +88,12 @@ function toJob(row: DbRow): RenderJob {
   };
 }
 
+function withoutSourceAudit(value: string) {
+  return value.replace(/\n*【原文逐字归档 \/ SOURCE AUDIT】[\s\S]*$/u, "");
+}
+
 function toDocument(row: DbRow): ScriptDocument {
-  return { id: row.id, projectId: row.project_id, originalText: row.original_text, formattedText: row.formatted_text, formatStatus: row.format_status, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at };
+  return { id: row.id, projectId: row.project_id, originalText: row.original_text, formattedText: withoutSourceAudit(row.formatted_text), formatStatus: row.format_status, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at };
 }
 
 function jsonArray<T>(value: unknown, fallback: T[] = []) {
@@ -116,6 +123,7 @@ const projectSeeds = [
     style: "赛博电影",
     aspectRatio: "16:9",
     durationSeconds: 92,
+    targetEpisodeCount: 3,
     status: "storyboarding" as ProjectStatus,
     progress: 68,
     coverUrl: "https://images.unsplash.com/photo-1519608487953-e999c86e7455?auto=format&fit=crop&w=1400&q=84",
@@ -128,6 +136,7 @@ const projectSeeds = [
     style: "胶片写实",
     aspectRatio: "16:9",
     durationSeconds: 74,
+    targetEpisodeCount: 3,
     status: "completed" as ProjectStatus,
     progress: 100,
     coverUrl: "https://images.unsplash.com/photo-1477959858617-67f85cf4f1df?auto=format&fit=crop&w=1400&q=84",
@@ -140,6 +149,7 @@ const projectSeeds = [
     style: "冷峻纪实",
     aspectRatio: "9:16",
     durationSeconds: 56,
+    targetEpisodeCount: 3,
     status: "rendering" as ProjectStatus,
     progress: 36,
     coverUrl: "https://images.unsplash.com/photo-1530053969600-caed2596d242?auto=format&fit=crop&w=1400&q=84",
@@ -163,7 +173,14 @@ class SqliteStore implements DatabaseStore {
     const dbPath = resolve(process.cwd(), relativePath);
     mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+    this.db.exec("PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON;");
+    try {
+      this.db.exec("PRAGMA journal_mode = WAL;");
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("database is locked")) throw error;
+      console.warn("[database] 数据库正被已有进程使用，沿用当前日志模式继续启动");
+    }
   }
 
   async initialize() {
@@ -175,7 +192,8 @@ class SqliteStore implements DatabaseStore {
         genre TEXT NOT NULL,
         style TEXT NOT NULL,
         aspect_ratio TEXT NOT NULL DEFAULT '16:9',
-        duration_seconds INTEGER NOT NULL DEFAULT 60,
+    duration_seconds INTEGER NOT NULL DEFAULT 60,
+        target_episode_count INTEGER NOT NULL DEFAULT 3,
         status TEXT NOT NULL DEFAULT 'draft',
         progress INTEGER NOT NULL DEFAULT 0,
         cover_url TEXT,
@@ -236,6 +254,7 @@ class SqliteStore implements DatabaseStore {
     `);
 
     for (const statement of [
+      "ALTER TABLE projects ADD COLUMN target_episode_count INTEGER NOT NULL DEFAULT 3",
       "ALTER TABLE episodes ADD COLUMN hook TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE episodes ADD COLUMN original_text TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE episodes ADD COLUMN plot_nodes TEXT NOT NULL DEFAULT '[]'",
@@ -246,8 +265,8 @@ class SqliteStore implements DatabaseStore {
     if (count.total > 0) return;
 
     const insertProject = this.db.prepare(`
-      INSERT INTO projects (id, title, logline, genre, style, aspect_ratio, duration_seconds, status, progress, cover_url, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO projects (id, title, logline, genre, style, aspect_ratio, duration_seconds, target_episode_count, status, progress, cover_url, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const insertScene = this.db.prepare(`
       INSERT INTO scenes (id, project_id, scene_order, title, narration, visual_prompt, duration_seconds, camera, created_at, updated_at)
@@ -261,7 +280,7 @@ class SqliteStore implements DatabaseStore {
     try {
       for (const project of projectSeeds) {
         const stamp = now();
-        insertProject.run(project.id, project.title, project.logline, project.genre, project.style, project.aspectRatio, project.durationSeconds, project.status, project.progress, project.coverUrl, stamp, stamp);
+        insertProject.run(project.id, project.title, project.logline, project.genre, project.style, project.aspectRatio, project.durationSeconds, project.targetEpisodeCount, project.status, project.progress, project.coverUrl, stamp, stamp);
       }
       for (const scene of seedScenes(projectSeeds[0].id)) insertScene.run(...scene);
       const stamp = now();
@@ -286,10 +305,15 @@ class SqliteStore implements DatabaseStore {
     const id = randomUUID();
     const stamp = now();
     this.db.prepare(`
-      INSERT INTO projects (id, title, logline, genre, style, aspect_ratio, duration_seconds, status, progress, cover_url, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', 8, NULL, ?, ?)
-    `).run(id, input.title, input.logline, input.genre, input.style, input.aspectRatio, input.durationSeconds, stamp, stamp);
+      INSERT INTO projects (id, title, logline, genre, style, aspect_ratio, duration_seconds, target_episode_count, status, progress, cover_url, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'draft', 8, NULL, ?, ?)
+    `).run(id, input.title, input.logline, input.genre, input.style, input.aspectRatio, input.durationSeconds, input.targetEpisodeCount, stamp, stamp);
     return (await this.getProject(id))!;
+  }
+
+  async deleteProject(id: string) {
+    const result = this.db.prepare("DELETE FROM projects WHERE id = ?").run(id) as { changes: number | bigint };
+    return Number(result.changes) > 0;
   }
 
   async updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }) {
@@ -297,8 +321,8 @@ class SqliteStore implements DatabaseStore {
     if (!current) return null;
     const next = { ...current, ...input, updatedAt: now() };
     this.db.prepare(`
-      UPDATE projects SET title=?, logline=?, genre=?, style=?, aspect_ratio=?, duration_seconds=?, status=?, progress=?, updated_at=? WHERE id=?
-    `).run(next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.status, next.progress, next.updatedAt, id);
+      UPDATE projects SET title=?, logline=?, genre=?, style=?, aspect_ratio=?, duration_seconds=?, target_episode_count=?, status=?, progress=?, updated_at=? WHERE id=?
+    `).run(next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, next.updatedAt, id);
     return this.getProject(id);
   }
 
@@ -352,13 +376,13 @@ class SqliteStore implements DatabaseStore {
     return row ? toDocument(row) : null;
   }
 
-  async saveScriptDocument(projectId: string, originalText: string, formattedText: string) {
+  async saveScriptDocument(projectId: string, originalText: string, formattedText: string, formatStatus: "raw" | "formatted" = "formatted") {
     const existing = await this.getScriptDocument(projectId);
     const id = existing?.id ?? randomUUID();
     const stamp = now();
     this.db.prepare(`INSERT INTO script_documents (id,project_id,original_text,formatted_text,format_status,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET original_text=excluded.original_text,formatted_text=excluded.formatted_text,format_status=excluded.format_status,updated_at=excluded.updated_at`)
-      .run(id, projectId, originalText, formattedText, "formatted", existing?.createdAt ?? stamp, stamp);
+      .run(id, projectId, originalText, formattedText, formatStatus, existing?.createdAt ?? stamp, stamp);
     return (await this.getScriptDocument(projectId))!;
   }
 
@@ -411,9 +435,9 @@ class MysqlStore implements DatabaseStore {
 
   async initialize() {
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS projects (
-      id CHAR(36) PRIMARY KEY, title VARCHAR(120) NOT NULL, logline VARCHAR(500) NOT NULL DEFAULT '',
+      id CHAR(36) PRIMARY KEY, title VARCHAR(120) NOT NULL, logline VARCHAR(5000) NOT NULL DEFAULT '',
       genre VARCHAR(40) NOT NULL, style VARCHAR(40) NOT NULL, aspect_ratio VARCHAR(10) NOT NULL DEFAULT '16:9',
-      duration_seconds INT UNSIGNED NOT NULL DEFAULT 60, status VARCHAR(24) NOT NULL DEFAULT 'draft',
+      duration_seconds INT UNSIGNED NOT NULL DEFAULT 60, target_episode_count INT UNSIGNED NOT NULL DEFAULT 3, status VARCHAR(24) NOT NULL DEFAULT 'draft',
       progress TINYINT UNSIGNED NOT NULL DEFAULT 0, cover_url VARCHAR(1000) NULL,
       created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL, INDEX idx_projects_updated_at (updated_at DESC)
     ) ENGINE=InnoDB`);
@@ -442,6 +466,8 @@ class MysqlStore implements DatabaseStore {
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, UNIQUE KEY uq_episode_number (project_id,episode_number)
     ) ENGINE=InnoDB`);
     for (const statement of [
+      "ALTER TABLE projects MODIFY COLUMN logline VARCHAR(5000) NOT NULL DEFAULT ''",
+      "ALTER TABLE projects ADD COLUMN target_episode_count INT UNSIGNED NOT NULL DEFAULT 3",
       "ALTER TABLE episodes ADD COLUMN hook TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE episodes ADD COLUMN original_text LONGTEXT NOT NULL",
       "ALTER TABLE episodes ADD COLUMN plot_nodes JSON NOT NULL",
@@ -466,9 +492,9 @@ class MysqlStore implements DatabaseStore {
     for (const project of projectSeeds) {
       const stamp = new Date();
       await this.pool.execute(`INSERT INTO projects
-        (id,title,logline,genre,style,aspect_ratio,duration_seconds,status,progress,cover_url,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [project.id, project.title, project.logline, project.genre, project.style, project.aspectRatio, project.durationSeconds, project.status, project.progress, project.coverUrl, stamp, stamp]);
+        (id,title,logline,genre,style,aspect_ratio,duration_seconds,target_episode_count,status,progress,cover_url,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        [project.id, project.title, project.logline, project.genre, project.style, project.aspectRatio, project.durationSeconds, project.targetEpisodeCount, project.status, project.progress, project.coverUrl, stamp, stamp]);
     }
     for (const scene of seedScenes(projectSeeds[0].id)) {
       await this.pool.execute(`INSERT INTO scenes
@@ -496,18 +522,23 @@ class MysqlStore implements DatabaseStore {
     const id = randomUUID();
     const stamp = new Date();
     await this.pool.execute(`INSERT INTO projects
-      (id,title,logline,genre,style,aspect_ratio,duration_seconds,status,progress,cover_url,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,'draft',8,NULL,?,?)`,
-    [id, input.title, input.logline, input.genre, input.style, input.aspectRatio, input.durationSeconds, stamp, stamp]);
+      (id,title,logline,genre,style,aspect_ratio,duration_seconds,target_episode_count,status,progress,cover_url,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,'draft',8,NULL,?,?)`,
+    [id, input.title, input.logline, input.genre, input.style, input.aspectRatio, input.durationSeconds, input.targetEpisodeCount, stamp, stamp]);
     return (await this.getProject(id))!;
+  }
+
+  async deleteProject(id: string) {
+    const [result] = await this.pool.execute("DELETE FROM projects WHERE id = ?", [id]);
+    return Number((result as { affectedRows?: number }).affectedRows ?? 0) > 0;
   }
 
   async updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }) {
     const current = await this.getProject(id);
     if (!current) return null;
     const next = { ...current, ...input };
-    await this.pool.execute(`UPDATE projects SET title=?,logline=?,genre=?,style=?,aspect_ratio=?,duration_seconds=?,status=?,progress=?,updated_at=? WHERE id=?`,
-      [next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.status, next.progress, new Date(), id]);
+    await this.pool.execute(`UPDATE projects SET title=?,logline=?,genre=?,style=?,aspect_ratio=?,duration_seconds=?,target_episode_count=?,status=?,progress=?,updated_at=? WHERE id=?`,
+      [next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, new Date(), id]);
     return this.getProject(id);
   }
 
@@ -559,10 +590,10 @@ class MysqlStore implements DatabaseStore {
     return row ? toDocument(row) : null;
   }
 
-  async saveScriptDocument(projectId: string, originalText: string, formattedText: string) {
+  async saveScriptDocument(projectId: string, originalText: string, formattedText: string, formatStatus: "raw" | "formatted" = "formatted") {
     const existing = await this.getScriptDocument(projectId);
     const id = existing?.id ?? randomUUID(); const stamp = new Date();
-    await this.pool.execute(`INSERT INTO script_documents (id,project_id,original_text,formatted_text,format_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE original_text=VALUES(original_text),formatted_text=VALUES(formatted_text),format_status=VALUES(format_status),updated_at=VALUES(updated_at)`, [id, projectId, originalText, formattedText, "formatted", existing ? new Date(existing.createdAt) : stamp, stamp]);
+    await this.pool.execute(`INSERT INTO script_documents (id,project_id,original_text,formatted_text,format_status,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE original_text=VALUES(original_text),formatted_text=VALUES(formatted_text),format_status=VALUES(format_status),updated_at=VALUES(updated_at)`, [id, projectId, originalText, formattedText, formatStatus, existing ? new Date(existing.createdAt) : stamp, stamp]);
     return (await this.getScriptDocument(projectId))!;
   }
 

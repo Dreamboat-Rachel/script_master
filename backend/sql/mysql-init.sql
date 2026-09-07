@@ -7,11 +7,12 @@ USE script_master;
 CREATE TABLE IF NOT EXISTS projects (
   id CHAR(36) PRIMARY KEY,
   title VARCHAR(120) NOT NULL,
-  logline VARCHAR(500) NOT NULL DEFAULT '',
+  logline VARCHAR(5000) NOT NULL DEFAULT '',
   genre VARCHAR(40) NOT NULL,
   style VARCHAR(40) NOT NULL,
   aspect_ratio VARCHAR(10) NOT NULL DEFAULT '16:9',
   duration_seconds INT UNSIGNED NOT NULL DEFAULT 60,
+  target_episode_count INT UNSIGNED NOT NULL DEFAULT 3,
   status ENUM('draft', 'scripting', 'storyboarding', 'rendering', 'completed', 'failed') NOT NULL DEFAULT 'draft',
   progress TINYINT UNSIGNED NOT NULL DEFAULT 0,
   cover_url VARCHAR(1000) NULL,

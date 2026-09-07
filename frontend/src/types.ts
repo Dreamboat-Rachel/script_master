@@ -8,6 +8,7 @@ export interface Project {
   style: string;
   aspectRatio: string;
   durationSeconds: number;
+  targetEpisodeCount: number;
   status: ProjectStatus;
   progress: number;
   coverUrl: string | null;
