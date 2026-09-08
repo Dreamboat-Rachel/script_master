@@ -36,6 +36,7 @@ export interface ProjectDetail extends Project {
 export interface RenderJob {
   id: string;
   projectId: string;
+  shotId: string | null;
   projectTitle: string;
   provider: string;
   status: "queued" | "processing" | "completed" | "failed";
@@ -88,8 +89,34 @@ export interface Subject {
   role: "character" | "location" | "prop";
   description: string;
   visualPrompt: string;
+  imageUrl: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ImageSettings {
+  provider: "volcengine" | "aliyun" | "openai" | "custom";
+  model: string;
+  apiBase: string;
+  configured: boolean;
+}
+
+export interface VideoSettings {
+  provider: ImageSettings["provider"];
+  model: "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+  apiBase: string;
+  configured: boolean;
+}
+
+export type ImageResolution = "2K" | "4K";
+export type ImageAspectRatio = "1:1" | "16:9" | "9:16" | "3:2" | "2:3" | "4:3" | "3:4";
+
+export interface SubjectImageInput {
+  prompt: string;
+  model: string;
+  resolution: ImageResolution;
+  aspectRatio: ImageAspectRatio;
+  referenceImage?: string;
 }
 
 export interface Shot {

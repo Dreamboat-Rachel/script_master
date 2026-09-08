@@ -4,7 +4,7 @@
 
 - `frontend`: React、Vite、TypeScript
 - `backend`: Express、TypeScript、Zod
-- `database`: 默认本地 SQLite，支持切换到 localhost MySQL
+- `database`: 本地 localhost MySQL（SQLite 仍可作为回退方案）
 
 ## 本地启动
 
@@ -20,7 +20,7 @@ npm run dev
 
 打开 Web 首页后，点击“新建项目”会进入项目设定；也可以在已有项目卡片上点击“剧本解析”直接进入解析步骤。项目内部顶部导航固定为：项目设定 → 剧本格式化 → 剧本解析 → 主体生成 → 故事板。
 
-SQLite 数据库会在首次启动时自动创建于 `backend/data/script-master.db`。
+当前配置使用本机 MySQL：`script_master` 数据库，连接地址为 `localhost:3306`。如果需要回退到 SQLite，可将 `DATABASE_URL` 改为 `sqlite://./data/script-master.db`。
 
 ## DeepSeek 流水线引擎
 

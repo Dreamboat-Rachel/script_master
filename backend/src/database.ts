@@ -27,13 +27,14 @@ export interface DatabaseStore {
   listScenes(projectId: string): Promise<Scene[]>;
   replaceScenes(projectId: string, scenes: Omit<Scene, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Scene[]>;
   listJobs(): Promise<RenderJob[]>;
-  createRenderJob(projectId: string): Promise<RenderJob>;
+  createRenderJob(projectId: string, shotId?: string): Promise<RenderJob>;
   getScriptDocument(projectId: string): Promise<ScriptDocument | null>;
   saveScriptDocument(projectId: string, originalText: string, formattedText: string, formatStatus?: "raw" | "formatted"): Promise<ScriptDocument>;
   listEpisodes(projectId: string): Promise<Episode[]>;
   replaceEpisodes(projectId: string, episodes: Omit<Episode, "id" | "projectId" | "sceneCount" | "createdAt" | "updatedAt">[]): Promise<Episode[]>;
   listSubjects(projectId: string): Promise<Subject[]>;
-  replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Subject[]>;
+  replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "imageUrl" | "createdAt" | "updatedAt">[]): Promise<Subject[]>;
+  updateSubjectImage(projectId: string, subjectId: string, imageUrl: string): Promise<Subject | null>;
   listShots(projectId: string, episodeNumber?: number): Promise<Shot[]>;
   replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Shot[]>;
 }
@@ -77,6 +78,7 @@ function toJob(row: DbRow): RenderJob {
   return {
     id: row.id,
     projectId: row.project_id,
+    shotId: row.shot_id ?? null,
     projectTitle: row.project_title,
     provider: row.provider,
     status: row.status,
@@ -107,7 +109,7 @@ function toEpisode(row: DbRow): Episode {
 }
 
 function toSubject(row: DbRow): Subject {
-  return { id: row.id, projectId: row.project_id, name: row.name, role: row.role, description: row.description, visualPrompt: row.visual_prompt, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at };
+  return { id: row.id, projectId: row.project_id, name: row.name, role: row.role, description: row.description, visualPrompt: row.visual_prompt, imageUrl: row.image_url ?? null, createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at, updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at };
 }
 
 function toShot(row: DbRow): Shot {
@@ -217,6 +219,7 @@ class SqliteStore implements DatabaseStore {
       CREATE TABLE IF NOT EXISTS render_jobs (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
+        shot_id TEXT,
         provider TEXT NOT NULL DEFAULT 'mock',
         status TEXT NOT NULL DEFAULT 'queued',
         progress INTEGER NOT NULL DEFAULT 0,
@@ -239,7 +242,7 @@ class SqliteStore implements DatabaseStore {
       );
       CREATE TABLE IF NOT EXISTS subjects (
         id TEXT PRIMARY KEY, project_id TEXT NOT NULL, name TEXT NOT NULL, role TEXT NOT NULL, description TEXT NOT NULL,
-        visual_prompt TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        visual_prompt TEXT NOT NULL, image_url TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, UNIQUE(project_id, name, role)
       );
       CREATE TABLE IF NOT EXISTS shots (
@@ -259,6 +262,8 @@ class SqliteStore implements DatabaseStore {
       "ALTER TABLE episodes ADD COLUMN original_text TEXT NOT NULL DEFAULT ''",
       "ALTER TABLE episodes ADD COLUMN plot_nodes TEXT NOT NULL DEFAULT '[]'",
       "ALTER TABLE episodes ADD COLUMN characters TEXT NOT NULL DEFAULT '[]'",
+      "ALTER TABLE subjects ADD COLUMN image_url TEXT",
+      "ALTER TABLE render_jobs ADD COLUMN shot_id TEXT",
     ]) { try { this.db.exec(statement); } catch { /* Existing installations already have this column. */ } }
 
     const count = this.db.prepare("SELECT COUNT(*) AS total FROM projects").get() as { total: number };
@@ -358,13 +363,13 @@ class SqliteStore implements DatabaseStore {
     `).all() as DbRow[]).map(toJob);
   }
 
-  async createRenderJob(projectId: string) {
+  async createRenderJob(projectId: string, shotId?: string) {
     const id = randomUUID();
     const stamp = now();
     this.db.prepare(`
-      INSERT INTO render_jobs (id, project_id, provider, status, progress, output_url, error_message, created_at, updated_at)
-      VALUES (?, ?, 'mock-video', 'queued', 3, NULL, NULL, ?, ?)
-    `).run(id, projectId, stamp, stamp);
+      INSERT INTO render_jobs (id, project_id, shot_id, provider, status, progress, output_url, error_message, created_at, updated_at)
+      VALUES (?, ?, ?, 'mock-video', 'queued', 3, NULL, NULL, ?, ?)
+    `).run(id, projectId, shotId ?? null, stamp, stamp);
     const row = this.db.prepare(`
       SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?
     `).get(id) as DbRow;
@@ -406,11 +411,18 @@ class SqliteStore implements DatabaseStore {
     return (this.db.prepare("SELECT * FROM subjects WHERE project_id=? ORDER BY role,name").all(projectId) as DbRow[]).map(toSubject);
   }
 
-  async replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
+  async replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "imageUrl" | "createdAt" | "updatedAt">[]) {
     this.db.prepare("DELETE FROM subjects WHERE project_id=?").run(projectId);
-    const insert = this.db.prepare(`INSERT INTO subjects (id,project_id,name,role,description,visual_prompt,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)`);
-    for (const subject of subjects) { const stamp = now(); insert.run(randomUUID(), projectId, subject.name, subject.role, subject.description, subject.visualPrompt, stamp, stamp); }
+    const insert = this.db.prepare(`INSERT INTO subjects (id,project_id,name,role,description,visual_prompt,image_url,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)`);
+    for (const subject of subjects) { const stamp = now(); insert.run(randomUUID(), projectId, subject.name, subject.role, subject.description, subject.visualPrompt, null, stamp, stamp); }
     return this.listSubjects(projectId);
+  }
+
+  async updateSubjectImage(projectId: string, subjectId: string, imageUrl: string) {
+    const stamp = now();
+    const result = this.db.prepare("UPDATE subjects SET image_url=?, updated_at=? WHERE id=? AND project_id=?").run(imageUrl, stamp, subjectId, projectId) as { changes: number | bigint };
+    if (!Number(result.changes)) return null;
+    return toSubject(this.db.prepare("SELECT * FROM subjects WHERE id=? AND project_id=?").get(subjectId, projectId) as DbRow);
   }
 
   async listShots(projectId: string, episodeNumber?: number) {
@@ -449,7 +461,7 @@ class MysqlStore implements DatabaseStore {
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, UNIQUE KEY uq_scene_order (project_id, scene_order)
     ) ENGINE=InnoDB`);
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS render_jobs (
-      id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, provider VARCHAR(40) NOT NULL DEFAULT 'mock',
+      id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, shot_id CHAR(36) NULL, provider VARCHAR(40) NOT NULL DEFAULT 'mock',
       status VARCHAR(24) NOT NULL DEFAULT 'queued', progress TINYINT UNSIGNED NOT NULL DEFAULT 0,
       output_url VARCHAR(1000) NULL, error_message TEXT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, INDEX idx_jobs_status (status)
@@ -472,12 +484,14 @@ class MysqlStore implements DatabaseStore {
       "ALTER TABLE episodes ADD COLUMN original_text LONGTEXT NOT NULL",
       "ALTER TABLE episodes ADD COLUMN plot_nodes JSON NOT NULL",
       "ALTER TABLE episodes ADD COLUMN characters JSON NOT NULL",
+      "ALTER TABLE render_jobs ADD COLUMN shot_id CHAR(36) NULL",
     ]) { try { await this.pool.execute(statement); } catch { /* Existing installations already have this column. */ } }
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS subjects (
       id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, name VARCHAR(120) NOT NULL, role VARCHAR(20) NOT NULL,
-      description TEXT NOT NULL, visual_prompt TEXT NOT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,
+      description TEXT NOT NULL, visual_prompt TEXT NOT NULL, image_url VARCHAR(1000) NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
     ) ENGINE=InnoDB`);
+    try { await this.pool.execute("ALTER TABLE subjects ADD COLUMN image_url VARCHAR(1000) NULL"); } catch { /* Existing installations already have this column. */ }
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS shots (
       id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, episode_id CHAR(36) NOT NULL, episode_number INT UNSIGNED NOT NULL,
       shot_order INT UNSIGNED NOT NULL, title VARCHAR(120) NOT NULL, location VARCHAR(160) NOT NULL, action TEXT NOT NULL,
@@ -499,7 +513,7 @@ class MysqlStore implements DatabaseStore {
     for (const scene of seedScenes(projectSeeds[0].id)) {
       await this.pool.execute(`INSERT INTO scenes
         (id,project_id,scene_order,title,narration,visual_prompt,duration_seconds,camera,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?)`, scene);
+        VALUES (?,?,?,?,?,?,?,?,?,?)`, [...scene.slice(0, 8), new Date(String(scene[8])), new Date(String(scene[9]))]);
     }
     const stamp = new Date();
     await this.pool.execute(`INSERT INTO render_jobs
@@ -574,12 +588,12 @@ class MysqlStore implements DatabaseStore {
     return (rows as DbRow[]).map(toJob);
   }
 
-  async createRenderJob(projectId: string) {
+  async createRenderJob(projectId: string, shotId?: string) {
     const id = randomUUID();
     const stamp = new Date();
     await this.pool.execute(`INSERT INTO render_jobs
-      (id,project_id,provider,status,progress,output_url,error_message,created_at,updated_at) VALUES (?,?,'mock-video','queued',3,NULL,NULL,?,?)`,
-    [id, projectId, stamp, stamp]);
+      (id,project_id,shot_id,provider,status,progress,output_url,error_message,created_at,updated_at) VALUES (?, ?, ?,'mock-video','queued',3,NULL,NULL,?,?)`,
+    [id, projectId, shotId ?? null, stamp, stamp]);
     const [rows] = await this.pool.execute(`SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=?`, [id]);
     return toJob((rows as DbRow[])[0]);
   }
@@ -612,8 +626,15 @@ class MysqlStore implements DatabaseStore {
     const [rows] = await this.pool.execute("SELECT * FROM subjects WHERE project_id=? ORDER BY role,name", [projectId]); return (rows as DbRow[]).map(toSubject);
   }
 
-  async replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
-    await this.pool.execute("DELETE FROM subjects WHERE project_id=?", [projectId]); for (const subject of subjects) { const stamp = new Date(); await this.pool.execute("INSERT INTO subjects (id,project_id,name,role,description,visual_prompt,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)", [randomUUID(),projectId,subject.name,subject.role,subject.description,subject.visualPrompt,stamp,stamp]); } return this.listSubjects(projectId);
+  async replaceSubjects(projectId: string, subjects: Omit<Subject, "id" | "projectId" | "imageUrl" | "createdAt" | "updatedAt">[]) {
+    await this.pool.execute("DELETE FROM subjects WHERE project_id=?", [projectId]); for (const subject of subjects) { const stamp = new Date(); await this.pool.execute("INSERT INTO subjects (id,project_id,name,role,description,visual_prompt,image_url,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)", [randomUUID(),projectId,subject.name,subject.role,subject.description,subject.visualPrompt,null,stamp,stamp]); } return this.listSubjects(projectId);
+  }
+
+  async updateSubjectImage(projectId: string, subjectId: string, imageUrl: string) {
+    const [result] = await this.pool.execute("UPDATE subjects SET image_url=?,updated_at=? WHERE id=? AND project_id=?", [imageUrl, new Date(), subjectId, projectId]);
+    if (!Number((result as { affectedRows?: number }).affectedRows ?? 0)) return null;
+    const [rows] = await this.pool.execute("SELECT * FROM subjects WHERE id=? AND project_id=?", [subjectId, projectId]);
+    return toSubject((rows as DbRow[])[0]);
   }
 
   async listShots(projectId: string, episodeNumber?: number) {

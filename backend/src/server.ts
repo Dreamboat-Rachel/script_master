@@ -2,9 +2,13 @@ import "dotenv/config";
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { appendFileSync, mkdirSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { createDatabaseStore } from "./database.js";
+import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
+import { configureVideo, getVideoSettings } from "./video.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
 
 const port = Number(process.env.PORT ?? 8787);
@@ -12,11 +16,15 @@ const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
 const databaseUrl = process.env.DATABASE_URL ?? "sqlite://./data/script-master.db";
 const db = createDatabaseStore(databaseUrl);
 const deepSeek = new DeepSeekService();
+const imageGeneration = new ImageGenerationService();
 const localFallback = process.env.LOCAL_FALLBACK === "true";
 const logDirectory = resolve(process.cwd(), "logs");
 const logFile = resolve(logDirectory, "backend.log");
+const generatedDirectory = resolve(process.cwd(), "data", "generated");
+const subjectImageDirectory = resolve(generatedDirectory, "subjects");
 
 mkdirSync(logDirectory, { recursive: true });
+mkdirSync(subjectImageDirectory, { recursive: true });
 
 function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Record<string, unknown>) {
   const line = `${new Date().toISOString()} [${level}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`;
@@ -30,7 +38,8 @@ function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Reco
 const app = express();
 app.disable("x-powered-by");
 app.use(cors({ origin: clientOrigin }));
-app.use(express.json({ limit: "2mb" }));
+app.use("/api/generated", express.static(generatedDirectory, { maxAge: "1h" }));
+app.use(express.json({ limit: "12mb" }));
 app.use((request, response, next) => {
   const startedAt = Date.now();
   writeLog("INFO", "[api] 请求开始", { method: request.method, path: request.originalUrl });
@@ -70,6 +79,30 @@ const llmSettingsSchema = z.object({
   apiKey: z.string().max(500).optional(),
   model: z.string().trim().min(1).max(100).optional(),
   apiBase: z.string().trim().url().max(200).optional(),
+});
+const imageSettingsSchema = z.object({
+  provider: z.enum(["volcengine", "aliyun", "openai", "custom"]).optional(),
+  apiKey: z.string().max(1000).optional(),
+  model: z.string().trim().min(1).max(200).optional(),
+  apiBase: z.string().trim().url().max(500).optional(),
+});
+const videoSettingsSchema = z.object({
+  provider: z.enum(["volcengine", "aliyun", "openai", "custom"]).optional(),
+  apiKey: z.string().max(1000).optional(),
+  model: z.enum(["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  apiBase: z.string().trim().url().max(500).optional(),
+});
+const subjectImageSchema = z.object({
+  prompt: z.string().trim().min(10).max(12000),
+  model: z.string().trim().min(1).max(200),
+  resolution: z.enum(["2K", "4K"]),
+  aspectRatio: z.enum(["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4"]),
+  referenceImage: z.string().max(11_500_000).regex(/^data:image\/[a-z0-9.+-]+;base64,/i, "参考图格式无效").optional(),
+});
+const renderInputSchema = z.object({
+  shotId: z.string().uuid().optional(),
+  referenceSubjectIds: z.array(z.string().uuid()).max(12).default([]),
+  model: z.enum(["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
 });
 
 function normalizeScript(text: string) {
@@ -188,6 +221,24 @@ app.put("/api/settings/llm", asyncRoute(async (request, response) => {
   response.json({ data: configureDeepSeek(input) });
 }));
 
+app.get("/api/settings/image", (_request, response) => {
+  response.json({ data: getImageSettings() });
+});
+
+app.put("/api/settings/image", asyncRoute(async (request, response) => {
+  const input = imageSettingsSchema.parse(request.body);
+  response.json({ data: configureImage(input) });
+}));
+
+app.get("/api/settings/video", (_request, response) => {
+  response.json({ data: getVideoSettings() });
+});
+
+app.put("/api/settings/video", asyncRoute(async (request, response) => {
+  const input = videoSettingsSchema.parse(request.body);
+  response.json({ data: configureVideo(input) });
+}));
+
 app.get("/api/dashboard", asyncRoute(async (_request, response) => {
   const [projects, jobs] = await Promise.all([db.listProjects(), db.listJobs()]);
   const completed = projects.filter((project) => project.status === "completed").length;
@@ -258,9 +309,18 @@ app.post("/api/projects/:id/format", asyncRoute(async (request, response) => {
   let formattedText = normalizeScript(text);
   let qualityReport = "本地保真格式化：原文逐字保留";
   if (deepSeek.enabled) {
-    const result = await deepSeek.formatScript(text);
-    formattedText = result.formattedText;
-    qualityReport = result.qualityReport;
+    try {
+      const result = await deepSeek.formatScript(text);
+      formattedText = result.formattedText;
+      qualityReport = result.qualityReport;
+    } catch (caught) {
+      const detail = caught instanceof Error ? caught.message : String(caught);
+      if (!detail.includes("原文保真校验")) throw caught;
+      // Preserve the user's text and keep the pipeline usable when the model's audit field drifts.
+      formattedText = normalizeScript(text);
+      qualityReport = "模型保真校验未通过，已使用本地原文保真格式化";
+      writeLog("WARN", "[format] 模型保真校验失败，降级本地格式化", { projectId: project.id, detail });
+    }
   }
   const document = await db.saveScriptDocument(project.id, text, formattedText);
   const updated = await db.updateProject(project.id, { status: "scripting", progress: 20 });
@@ -297,6 +357,39 @@ app.post("/api/projects/:id/subjects/extract", asyncRoute(async (request, respon
   const subjects = await db.replaceSubjects(project.id, deepSeek.enabled ? await deepSeek.extractSubjects((await db.getScriptDocument(project.id))?.formattedText ?? "", project.style) : subjectsFromProject(project));
   const updated = await db.updateProject(project.id, { status: "storyboarding", progress: 56 });
   response.json({ data: { project: updated, subjects, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
+}));
+
+app.post("/api/projects/:id/subjects/:subjectId/image", asyncRoute(async (request, response) => {
+  const startedAt = Date.now();
+  const projectId = String(request.params.id);
+  const subjectId = String(request.params.subjectId);
+  const project = await db.getProject(projectId);
+  if (!project) return response.status(404).json({ error: "项目不存在" });
+  const subject = (await db.listSubjects(projectId)).find((item) => item.id === subjectId);
+  if (!subject) return response.status(404).json({ error: "主体不存在" });
+  if (!imageGeneration.enabled) return response.status(503).json({ error: "尚未配置图片生成 API Key，请先打开模型设置" });
+  const input = subjectImageSchema.parse(request.body);
+
+  writeLog("INFO", "[generate-subject-image] 开始", {
+    projectId,
+    subjectId,
+    subjectName: subject.name,
+    provider: imageConfig.provider,
+    model: input.model,
+    resolution: input.resolution,
+    aspectRatio: input.aspectRatio,
+    hasReferenceImage: Boolean(input.referenceImage),
+  });
+  const generated = await imageGeneration.generate(input);
+  if (!generated.bytes.length) throw new Error("图片平台返回了空文件");
+  if (generated.bytes.length > 25 * 1024 * 1024) throw new Error("生成图片超过 25MB，无法保存到本地");
+  const extension = generated.mimeType === "image/jpeg" ? "jpg" : generated.mimeType === "image/webp" ? "webp" : "png";
+  const fileName = `${randomUUID()}.${extension}`;
+  await writeFile(resolve(subjectImageDirectory, fileName), generated.bytes);
+  const updated = await db.updateSubjectImage(projectId, subjectId, `/api/generated/subjects/${fileName}`);
+  if (!updated) return response.status(404).json({ error: "主体不存在" });
+  writeLog("INFO", "[generate-subject-image] 完成", { projectId, subjectId, imageUrl: updated.imageUrl, model: input.model, size: generated.size, elapsedMs: Date.now() - startedAt });
+  response.json({ data: { subject: updated, provider: imageConfig.provider, model: input.model, size: generated.size } });
 }));
 
 app.post("/api/projects/:id/shots/extract", asyncRoute(async (request, response) => {
@@ -358,11 +451,26 @@ app.post("/api/projects/:id/generate-script", asyncRoute(async (request, respons
 app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
+  const input = renderInputSchema.parse(request.body ?? {});
   const shots = await db.listShots(project.id);
   if (!shots.length) return response.status(409).json({ error: "请先完成分镜提取" });
-  const job = await db.createRenderJob(project.id);
+  const selectedShot = input.shotId ? shots.find((shot) => shot.id === input.shotId) : undefined;
+  if (input.shotId && !selectedShot) return response.status(404).json({ error: "分镜不存在" });
+  const subjects = await db.listSubjects(project.id);
+  const referenceSubjects = input.referenceSubjectIds.flatMap((id) => {
+    const subject = subjects.find((item) => item.id === id && item.imageUrl);
+    return subject ? [subject] : [];
+  });
+  writeLog("INFO", "[render] 创建视频任务", {
+    projectId: project.id,
+    shotId: selectedShot?.id ?? null,
+    videoModel: input.model ?? getVideoSettings().model,
+    referenceSubjectIds: referenceSubjects.map((subject) => subject.id),
+    referenceImageUrls: referenceSubjects.map((subject) => subject.imageUrl),
+  });
+  const job = await db.createRenderJob(project.id, selectedShot?.id);
   await db.updateProject(project.id, { status: "rendering", progress: Math.max(project.progress, 52) });
-  response.status(202).json({ data: job });
+  response.status(202).json({ data: { ...job, shotId: selectedShot?.id ?? null, videoModel: input.model ?? getVideoSettings().model, referenceImageUrls: referenceSubjects.map((subject) => subject.imageUrl) } });
 }));
 
 app.get("/api/jobs", asyncRoute(async (_request, response) => {
@@ -379,7 +487,8 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
   writeLog("ERROR", "[api-error]", { method: request.method, path: request.originalUrl, error: error instanceof Error ? error.stack ?? detail : detail });
   const timedOut = detail.includes("请求超过") || detail.toLowerCase().includes("timeout");
   const modelResponseIssue = detail.includes("DeepSeek 返回空内容") || detail.includes("DeepSeek 返回了无法解析的 JSON");
-  response.status(timedOut ? 504 : modelResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : "服务器内部错误", details: detail });
+  const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务");
+  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : "服务器内部错误", details: detail });
 });
 
 await db.initialize();

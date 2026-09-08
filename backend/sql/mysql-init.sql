@@ -1,6 +1,6 @@
 CREATE DATABASE IF NOT EXISTS script_master
   CHARACTER SET utf8mb4
-  COLLATE utf8mb4_0900_ai_ci;
+  COLLATE utf8mb4_unicode_ci;
 
 USE script_master;
 
@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS scenes (
 CREATE TABLE IF NOT EXISTS render_jobs (
   id CHAR(36) PRIMARY KEY,
   project_id CHAR(36) NOT NULL,
+  shot_id CHAR(36) NULL,
   provider VARCHAR(40) NOT NULL DEFAULT 'mock',
   status ENUM('queued', 'processing', 'completed', 'failed') NOT NULL DEFAULT 'queued',
   progress TINYINT UNSIGNED NOT NULL DEFAULT 0,
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS subjects (
   role VARCHAR(20) NOT NULL,
   description TEXT NOT NULL,
   visual_prompt TEXT NOT NULL,
+  image_url VARCHAR(1000) NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   CONSTRAINT fk_subjects_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,

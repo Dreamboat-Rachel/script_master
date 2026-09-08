@@ -11,7 +11,7 @@ let runtimeApiBase = (process.env.DEEPSEEK_API_BASE ?? "https://api.deepseek.com
 export const SCRIPT_GENERATION_INPUT_TOKEN_BUDGET = 64000;
 export const SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET = 128000;
 
-function updateEnvFile(values: Record<string, string>) {
+export function updateEnvFile(values: Record<string, string>) {
   const envPath = resolve(process.cwd(), ".env");
   let content = existsSync(envPath) ? readFileSync(envPath, "utf8") : "";
   for (const [key, value] of Object.entries(values)) {
@@ -232,9 +232,10 @@ export class DeepSeekService {
     });
   }
 
-  async extractSubjects(formattedText: string, style: string): Promise<Array<Omit<Subject, "id" | "projectId" | "createdAt" | "updatedAt">>> {
+  async extractSubjects(formattedText: string, style: string): Promise<Array<Omit<Subject, "id" | "projectId" | "imageUrl" | "createdAt" | "updatedAt">>> {
     const result = await this.complete(
-      `你是影视美术与资产设定师。请从剧本中提取所有会影响画面一致性的主体，包含主要角色、反复出现的地点和关键道具。不要遗漏只出现一次但对剧情重要的主体。输出 JSON: {"subjects":[{"name":"","role":"character|location|prop","description":"","visualPrompt":""}]}。visualPrompt 要可直接用于图像模型，必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。`,
+      `你是影视美术与资产设定师。请从剧本中提取所有会影响画面一致性的主体，包含主要角色、反复出现的地点和关键道具。不要遗漏只出现一次但对剧情重要的主体。输出 JSON: {"subjects":[{"name":"","role":"character|location|prop","description":"","visualPrompt":""}]}。
+visualPrompt 是“主体设定提示词”，只用于生成该角色、场景或道具的独立设定图：描述主体本身的外观、材质、固定特征、服装或空间结构。禁止写具体镜头、景别、机位、构图、运镜、正在发生的动作、对白、光线氛围和其他主体；禁止把一段剧情改写成画面描述。必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。`,
       JSON.stringify({ style, formattedScreenplay: formattedText }),
     );
     const subjects = Array.isArray(result.subjects) ? result.subjects : [];
