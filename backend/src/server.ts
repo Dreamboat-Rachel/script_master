@@ -2,13 +2,13 @@ import "dotenv/config";
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { z } from "zod";
 import { createDatabaseStore } from "./database.js";
 import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
-import { configureVideo, getVideoSettings } from "./video.js";
+import { configureVideo, getVideoSettings, VideoGenerationService } from "./video.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
 
 const port = Number(process.env.PORT ?? 8787);
@@ -22,6 +22,8 @@ const logDirectory = resolve(process.cwd(), "logs");
 const logFile = resolve(logDirectory, "backend.log");
 const generatedDirectory = resolve(process.cwd(), "data", "generated");
 const subjectImageDirectory = resolve(generatedDirectory, "subjects");
+const videoGeneration = new VideoGenerationService();
+const renderJobStreams = new Set<Response>();
 
 mkdirSync(logDirectory, { recursive: true });
 mkdirSync(subjectImageDirectory, { recursive: true });
@@ -33,6 +35,87 @@ function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Reco
   else console.info(line);
   try { appendFileSync(logFile, `${line}\n`, "utf8"); }
   catch (error) { console.error("[logger] 日志文件写入失败", error); }
+}
+
+const wait = (milliseconds: number) => new Promise<void>((resolveWait) => setTimeout(resolveWait, milliseconds));
+
+async function broadcastRenderJobs() {
+  if (!renderJobStreams.size) return;
+  const message = `data: ${JSON.stringify(await db.listJobs())}\n\n`;
+  for (const stream of renderJobStreams) {
+    try {
+      stream.write(message);
+    } catch {
+      renderJobStreams.delete(stream);
+    }
+  }
+}
+
+function publicMediaUrl(value: string, request: Request) {
+  if (/^https?:\/\//i.test(value)) return value;
+  const configuredBase = process.env.VIDEO_PUBLIC_BASE_URL?.trim().replace(/\/$/, "");
+  const requestBase = `${request.protocol}://${request.get("host")}`;
+  return `${configuredBase || requestBase}${value.startsWith("/") ? value : `/${value}`}`;
+}
+
+function imageMimeType(value: string) {
+  const extension = value.toLowerCase().split(".").pop();
+  return extension === "jpg" || extension === "jpeg" ? "image/jpeg" : extension === "webp" ? "image/webp" : "image/png";
+}
+
+async function referenceImageSource(value: string, request: Request) {
+  if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(value)) return value;
+  if (/^https?:\/\//i.test(value)) return value;
+  const configuredBase = process.env.VIDEO_PUBLIC_BASE_URL?.trim();
+  if (configuredBase) return publicMediaUrl(value, request);
+  try {
+    const filePath = resolve(subjectImageDirectory, basename(value));
+    const bytes = await readFile(filePath);
+    return `data:${imageMimeType(value)};base64,${bytes.toString("base64")}`;
+  } catch {
+    return publicMediaUrl(value, request);
+  }
+}
+
+async function pollVideoTask(jobId: string, projectId: string, taskId: string) {
+  try {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const task = await videoGeneration.getTask(taskId);
+      await db.updateRenderJob(jobId, {
+        status: task.status,
+        progress: task.progress,
+        outputUrl: task.videoUrl ?? null,
+        errorMessage: task.errorMessage ?? null,
+      });
+      await broadcastRenderJobs();
+      if (task.status === "completed" || task.status === "failed") {
+        const jobs = (await db.listJobs()).filter((job) => job.projectId === projectId);
+        const active = jobs.some((job) => job.status === "queued" || job.status === "processing");
+        if (!active) await db.updateProject(projectId, { status: jobs.some((job) => job.status === "failed") ? "failed" : "completed", progress: jobs.some((job) => job.status === "failed") ? 76 : 100 });
+        return;
+      }
+      await wait(5000);
+    }
+    await db.updateRenderJob(jobId, { status: "failed", progress: 0, errorMessage: "视频任务轮询超时" });
+    await broadcastRenderJobs();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await db.updateRenderJob(jobId, { status: "failed", progress: 0, errorMessage: message }).catch(() => undefined);
+    await broadcastRenderJobs().catch(() => undefined);
+    writeLog("ERROR", "[render] 查询视频任务失败", { jobId, taskId, error: message });
+  }
+}
+
+async function resumeVideoTasks() {
+  const jobs = await db.listJobs();
+  for (const job of jobs) {
+    if (job.status !== "queued" && job.status !== "processing") continue;
+    if (!job.providerTaskId || job.provider !== "volcengine") {
+      await db.updateRenderJob(job.id, { status: "failed", progress: 0, errorMessage: "历史视频任务已失效，请重新提交" });
+      continue;
+    }
+    void pollVideoTask(job.id, job.projectId, job.providerTaskId);
+  }
 }
 
 const app = express();
@@ -89,7 +172,7 @@ const imageSettingsSchema = z.object({
 const videoSettingsSchema = z.object({
   provider: z.enum(["volcengine", "aliyun", "openai", "custom"]).optional(),
   apiKey: z.string().max(1000).optional(),
-  model: z.enum(["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
   apiBase: z.string().trim().url().max(500).optional(),
 });
 const subjectImageSchema = z.object({
@@ -102,7 +185,7 @@ const subjectImageSchema = z.object({
 const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
   referenceSubjectIds: z.array(z.string().uuid()).max(12).default([]),
-  model: z.enum(["doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
 });
 
 function normalizeScript(text: string) {
@@ -359,6 +442,17 @@ app.post("/api/projects/:id/subjects/extract", asyncRoute(async (request, respon
   response.json({ data: { project: updated, subjects, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
 }));
 
+app.delete("/api/projects/:id/subjects/:subjectId", asyncRoute(async (request, response) => {
+  const project = await db.getProject(String(request.params.id));
+  if (!project) return response.status(404).json({ error: "项目不存在" });
+  const subject = (await db.listSubjects(project.id)).find((item) => item.id === String(request.params.subjectId));
+  if (!subject) return response.status(404).json({ error: "主体不存在" });
+  const deleted = await db.deleteSubject(project.id, subject.id);
+  if (!deleted) return response.status(404).json({ error: "主体不存在" });
+  if (subject.imageUrl) await unlink(resolve(subjectImageDirectory, basename(subject.imageUrl))).catch(() => undefined);
+  response.json({ data: { project, subjects: await db.listSubjects(project.id) } });
+}));
+
 app.post("/api/projects/:id/subjects/:subjectId/image", asyncRoute(async (request, response) => {
   const startedAt = Date.now();
   const projectId = String(request.params.id);
@@ -451,30 +545,66 @@ app.post("/api/projects/:id/generate-script", asyncRoute(async (request, respons
 app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
+  if (!videoGeneration.enabled) return response.status(503).json({ error: "尚未配置视频生成 API Key，请先打开模型设置" });
   const input = renderInputSchema.parse(request.body ?? {});
   const shots = await db.listShots(project.id);
   if (!shots.length) return response.status(409).json({ error: "请先完成分镜提取" });
   const selectedShot = input.shotId ? shots.find((shot) => shot.id === input.shotId) : undefined;
   if (input.shotId && !selectedShot) return response.status(404).json({ error: "分镜不存在" });
   const subjects = await db.listSubjects(project.id);
-  const referenceSubjects = input.referenceSubjectIds.flatMap((id) => {
-    const subject = subjects.find((item) => item.id === id && item.imageUrl);
-    return subject ? [subject] : [];
-  });
-  writeLog("INFO", "[render] 创建视频任务", {
-    projectId: project.id,
-    shotId: selectedShot?.id ?? null,
-    videoModel: input.model ?? getVideoSettings().model,
-    referenceSubjectIds: referenceSubjects.map((subject) => subject.id),
-    referenceImageUrls: referenceSubjects.map((subject) => subject.imageUrl),
-  });
-  const job = await db.createRenderJob(project.id, selectedShot?.id);
+  const targetShots = selectedShot ? [selectedShot] : shots;
+  const jobs = [];
+  let referenceFallback = false;
+  for (const shot of targetShots) {
+    const content = [shot.title, shot.location, shot.action, shot.dialogue, shot.visualPrompt].join(" ");
+    const referenceSubjects = (input.referenceSubjectIds.length
+      ? subjects.filter((subject) => input.referenceSubjectIds.includes(subject.id))
+      : subjects.filter((subject) => subject.imageUrl && subject.name.trim() && content.includes(subject.name.trim()))).filter((subject) => subject.imageUrl);
+    const task = await videoGeneration.createTask({
+      prompt: [shot.title, `场景：${shot.location}`, `动作：${shot.action}`, shot.dialogue ? `对白：${shot.dialogue}` : "", shot.visualPrompt].filter(Boolean).join("\n"),
+      model: input.model,
+      referenceImageUrls: await Promise.all(referenceSubjects.map((subject) => referenceImageSource(subject.imageUrl!, request))),
+      ratio: project.aspectRatio,
+      duration: shot.durationSeconds,
+    });
+    referenceFallback ||= task.referenceFallback;
+    writeLog("INFO", "[render] 已提交视频任务", {
+      projectId: project.id,
+      shotId: shot.id,
+      taskId: task.taskId,
+      status: task.status,
+      referenceFallback: task.referenceFallback,
+      referenceSubjectIds: referenceSubjects.map((subject) => subject.id),
+    });
+    const job = await db.createRenderJob(project.id, shot.id, "volcengine", task.taskId, task.status, task.progress);
+    jobs.push(job);
+    if (task.status === "completed" && task.videoUrl) await db.updateRenderJob(job.id, { status: "completed", progress: 100, outputUrl: task.videoUrl });
+    await broadcastRenderJobs();
+    void pollVideoTask(job.id, project.id, task.taskId);
+  }
   await db.updateProject(project.id, { status: "rendering", progress: Math.max(project.progress, 52) });
-  response.status(202).json({ data: { ...job, shotId: selectedShot?.id ?? null, videoModel: input.model ?? getVideoSettings().model, referenceImageUrls: referenceSubjects.map((subject) => subject.imageUrl) } });
+  response.status(202).json({ data: { ...(jobs[0] ?? {}), videoModel: input.model ?? getVideoSettings().model, referenceFallback } });
 }));
 
 app.get("/api/jobs", asyncRoute(async (_request, response) => {
   response.json({ data: await db.listJobs() });
+}));
+
+app.get("/api/jobs/stream", asyncRoute(async (request, response) => {
+  response.set({
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "Content-Type": "text/event-stream",
+    "X-Accel-Buffering": "no",
+  });
+  response.flushHeaders();
+  renderJobStreams.add(response);
+  response.write(`retry: 10000\ndata: ${JSON.stringify(await db.listJobs())}\n\n`);
+  const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 25000);
+  request.on("close", () => {
+    clearInterval(heartbeat);
+    renderJobStreams.delete(response);
+  });
 }));
 
 app.use((_request, response) => response.status(404).json({ error: "接口不存在" }));
@@ -488,10 +618,12 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
   const timedOut = detail.includes("请求超过") || detail.toLowerCase().includes("timeout");
   const modelResponseIssue = detail.includes("DeepSeek 返回空内容") || detail.includes("DeepSeek 返回了无法解析的 JSON");
   const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务");
-  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : "服务器内部错误", details: detail });
+  const videoResponseIssue = detail.includes("视频平台") || detail.includes("视频任务") || detail.includes("视频生成");
+  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || videoResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频生成失败" : "服务器内部错误", details: detail });
 });
 
 await db.initialize();
+await resumeVideoTasks();
 app.listen(port, () => {
   writeLog("INFO", "[server] 启动完成", { url: `http://localhost:${port}`, database: databaseUrl.startsWith("mysql://") ? "mysql" : "sqlite", logFile });
 });

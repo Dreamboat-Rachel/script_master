@@ -234,9 +234,24 @@ export class DeepSeekService {
 
   async extractSubjects(formattedText: string, style: string): Promise<Array<Omit<Subject, "id" | "projectId" | "imageUrl" | "createdAt" | "updatedAt">>> {
     const result = await this.complete(
-      `你是影视美术与资产设定师。请从剧本中提取所有会影响画面一致性的主体，包含主要角色、反复出现的地点和关键道具。不要遗漏只出现一次但对剧情重要的主体。输出 JSON: {"subjects":[{"name":"","role":"character|location|prop","description":"","visualPrompt":""}]}。
-visualPrompt 是“主体设定提示词”，只用于生成该角色、场景或道具的独立设定图：描述主体本身的外观、材质、固定特征、服装或空间结构。禁止写具体镜头、景别、机位、构图、运镜、正在发生的动作、对白、光线氛围和其他主体；禁止把一段剧情改写成画面描述。必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。`,
+      `你是影视美术与资产设定师。请从剧本中提取所有会影响画面一致性的主体，包含主要角色、反复出现的地点和关键道具。不要遗漏只出现一次但对剧情重要的主体。
+输出 JSON: {"subjects":[{"name":"","stage":"","role":"character|location|prop","description":"","visualPrompt":""}]}。
+
+【人物阶段拆分规则，必须遵守】
+1. 同一人物只要在剧本中出现两个或以上明确的年龄、人生阶段或造型阶段，必须拆成多个独立的 character 主体，绝对不能合并成一个主体，也不能把多个阶段写在同一个 description 或 visualPrompt 中。
+2. 每个阶段的 name 必须是“原人物名-阶段”，例如：韩立-少儿、韩立-少年、韩立-青年。stage 字段只填写一个简短阶段名，例如“少儿”“少年”“青年”；如果 name 已经带阶段后缀，不要重复添加。
+3. 阶段命名参考：儿童、幼年、年幼或少年早期写“少儿”；约十四至十八岁、十五岁写“少年”；成年、二十岁以上、二十五岁写“青年”；更高年龄按事实写“中年”或“老年”。如果前一阶段只写“少年”、后一阶段明确写“十五岁”，前者按更年幼阶段命名为“少儿”，后者命名为“少年”。例如同一人物第一集为少年、第二集十五岁、第三集二十五岁时，必须输出“原名-少儿”“原名-少年”“原名-青年”三个主体。不要因为人物同名就合并不同阶段。
+4. 每个阶段只描述该阶段的年龄、身形、面容、发型、肤色、服装、固定道具和其他稳定识别特征。若某特征未设定，写“未设定”。不得把其他年龄阶段的信息带进来。
+5. 地点和道具也要按视觉上确实不同的版本拆分；仅仅在不同场次出现、但外观没有变化的主体不要重复创建。
+
+visualPrompt 是“主体设定提示词”，只用于生成该主体的独立设定图：描述主体本身的外观、材质、固定特征、服装或空间结构。禁止写具体镜头、景别、机位、构图、运镜、正在发生的动作、对白、光线氛围、其他阶段和其他主体；禁止把一段剧情改写成画面描述。必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。
+      返回前自检：如果一个人物的 description 或 visualPrompt 中出现了两个年龄/阶段，必须拆成多个对象；每个阶段对象的 name 必须唯一。`,
       JSON.stringify({ style, formattedScreenplay: formattedText }),
+      {
+        timeoutMs: 300000,
+        inputTokenBudget: SCRIPT_GENERATION_INPUT_TOKEN_BUDGET,
+        maxTokens: SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET,
+      },
     );
     const subjects = Array.isArray(result.subjects) ? result.subjects : [];
     if (!subjects.length) throw new Error("DeepSeek 没有返回主体结果");
@@ -245,7 +260,10 @@ visualPrompt 是“主体设定提示词”，只用于生成该角色、场景�
       const row = item as JsonObject;
       const roleValue = text(row.role, "character");
       const role = roleValue === "location" || roleValue === "prop" ? roleValue : "character";
-      const name = text(row.name, "未命名主体");
+      const rawName = text(row.name, "未命名主体");
+      const stage = role === "character" ? text(row.stage) : "";
+      const stageSeparator = stage ? ["-", "－", "—", "·", "•", "丨", "|", "｜"].find((separator) => rawName.endsWith(`${separator}${stage}`)) : undefined;
+      const name = stage ? stageSeparator ? `${rawName.slice(0, -(stage.length + stageSeparator.length))}-${stage}` : `${rawName}-${stage}` : rawName;
       const key = `${role}:${name}`;
       if (seen.has(key)) return [];
       seen.add(key);
@@ -255,7 +273,8 @@ visualPrompt 是“主体设定提示词”，只用于生成该角色、场景�
 
   async extractShots(formattedText: string, episodes: Array<{ id: string; episodeNumber: number }>, subjects: Subject[], style: string): Promise<Array<Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">>> {
     const result = await this.complete(
-      `你是影视分镜导演。请基于剧本、分集和主体资产生成可直接用于视频生成的镜头清单。必须覆盖原文剧情，不得跳过对白或关键动作；每个镜头只表达一个主要视觉动作。输出 JSON: {"shots":[{"episodeNumber":1,"shotOrder":1,"title":"","location":"","action":"","dialogue":"","visualPrompt":"","camera":"","durationSeconds":6,"status":"ready"}]}。shotOrder 在每集内从 1 连续编号。visualPrompt 要包含主体、环境、光线、情绪和连续性要求；对白原文保留；不得臆造剧本没有的剧情。`,
+      `你是影视分镜导演。请基于剧本、分集和主体资产生成可直接用于视频生成的镜头清单。必须覆盖原文剧情，不得跳过对白或关键动作；每个镜头只表达一个主要视觉动作。输出 JSON: {"shots":[{"episodeNumber":1,"shotOrder":1,"title":"","location":"","action":"","dialogue":"","visualPrompt":"","camera":"","durationSeconds":6,"status":"ready"}]}。shotOrder 在每集内从 1 连续编号。visualPrompt 要包含主体、环境、光线、情绪和连续性要求；对白原文保留；不得臆造剧本没有的剧情。
+如果主体资产中同一人物存在“原名-少儿”“原名-少年”“原名-青年”等阶段版本，必须根据该镜头所属集数和剧本中的年龄阶段选择唯一正确的版本，并在 visualPrompt 中逐字写出该主体资产的完整名称；禁止同时引用同一人物的其他阶段版本。`,
       JSON.stringify({
         style,
         subjects,

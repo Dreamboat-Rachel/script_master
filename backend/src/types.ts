@@ -18,7 +18,7 @@ export interface Project {
 
 export interface VideoSettings {
   provider: "volcengine" | "aliyun" | "openai" | "custom";
-  model: "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+  model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
   apiBase: string;
   configured: boolean;
 }
@@ -40,6 +40,7 @@ export interface RenderJob {
   id: string;
   projectId: string;
   shotId: string | null;
+  providerTaskId: string | null;
   projectTitle: string;
   provider: string;
   status: "queued" | "processing" | "completed" | "failed";

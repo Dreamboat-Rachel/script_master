@@ -56,6 +56,7 @@ export const api = {
   format: async (id: string, text: string) => (await request<{ data: { project: Project; document: PipelineData["document"] } }>(`/api/projects/${id}/format`, { method: "POST", body: JSON.stringify({ text }) })).data,
   extractEpisodes: async (id: string) => (await request<{ data: { project: Project; episodes: PipelineData["episodes"] } }>(`/api/projects/${id}/episodes/extract`, { method: "POST", body: "{}" })).data,
   extractSubjects: async (id: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${id}/subjects/extract`, { method: "POST", body: "{}" })).data,
+  deleteSubject: async (projectId: string, subjectId: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${projectId}/subjects/${subjectId}`, { method: "DELETE" })).data,
   generateSubjectImage: async (projectId: string, subjectId: string, input: SubjectImageInput) => (await request<{ data: { subject: Subject; provider: string; model: string; size: string } }>(`/api/projects/${projectId}/subjects/${subjectId}/image`, { method: "POST", body: JSON.stringify(input) })).data,
   extractShots: async (id: string) => (await request<{ data: { project: Project; shots: PipelineData["shots"] } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: "{}" })).data,
 };
