@@ -110,6 +110,9 @@ export interface VideoSettings {
   configured: boolean;
 }
 
+export type VideoAudioMode = "dialogue" | "ambient" | "silent";
+export type VideoSpeechRate = "slow" | "natural";
+
 export type ImageResolution = "2K" | "4K";
 export type ImageAspectRatio = "1:1" | "16:9" | "9:16" | "3:2" | "2:3" | "4:3" | "3:4";
 

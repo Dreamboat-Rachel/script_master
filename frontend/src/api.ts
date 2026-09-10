@@ -1,4 +1,4 @@
-import type { DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Subject, SubjectImageInput, VideoSettings } from "./types";
+import type { DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, Subject, SubjectImageInput, VideoAudioMode, VideoSettings, VideoSpeechRate } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -50,8 +50,10 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     })).data,
-  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"] } = {}) =>
+  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"]; duration?: number; prompt?: string; audioMode?: VideoAudioMode; speechRate?: VideoSpeechRate; bgm?: boolean; continuity?: boolean } = {}) =>
     (await request<{ data: RenderJob }>(`/api/projects/${id}/render`, { method: "POST", body: JSON.stringify(input) })).data,
+  updateShot: async (projectId: string, shotId: string, input: { location: string; action: string; visualPrompt: string }) =>
+    (await request<{ data: Shot }>(`/api/projects/${projectId}/shots/${shotId}`, { method: "PATCH", body: JSON.stringify(input) })).data,
   pipeline: async (id: string) => (await request<{ data: PipelineData }>(`/api/projects/${id}/pipeline`)).data,
   format: async (id: string, text: string) => (await request<{ data: { project: Project; document: PipelineData["document"] } }>(`/api/projects/${id}/format`, { method: "POST", body: JSON.stringify({ text }) })).data,
   extractEpisodes: async (id: string) => (await request<{ data: { project: Project; episodes: PipelineData["episodes"] } }>(`/api/projects/${id}/episodes/extract`, { method: "POST", body: "{}" })).data,

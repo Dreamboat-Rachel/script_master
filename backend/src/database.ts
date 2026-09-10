@@ -38,6 +38,7 @@ export interface DatabaseStore {
   deleteSubject(projectId: string, subjectId: string): Promise<boolean>;
   updateSubjectImage(projectId: string, subjectId: string, imageUrl: string): Promise<Subject | null>;
   listShots(projectId: string, episodeNumber?: number): Promise<Shot[]>;
+  updateShot(projectId: string, shotId: string, input: Pick<Shot, "location" | "action" | "visualPrompt">): Promise<Shot | null>;
   replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Shot[]>;
 }
 
@@ -467,6 +468,14 @@ class SqliteStore implements DatabaseStore {
     return rows.map(toShot);
   }
 
+  async updateShot(projectId: string, shotId: string, input: Pick<Shot, "location" | "action" | "visualPrompt">) {
+    const stamp = now();
+    const result = this.db.prepare("UPDATE shots SET location=?, action=?, visual_prompt=?, updated_at=? WHERE id=? AND project_id=?").run(input.location, input.action, input.visualPrompt, stamp, shotId, projectId) as { changes: number | bigint };
+    if (!Number(result.changes)) return null;
+    const row = this.db.prepare("SELECT * FROM shots WHERE id=? AND project_id=?").get(shotId, projectId) as DbRow | undefined;
+    return row ? toShot(row) : null;
+  }
+
   async replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
     this.db.prepare("DELETE FROM shots WHERE project_id=?").run(projectId);
     const insert = this.db.prepare(`INSERT INTO shots (id,project_id,episode_id,episode_number,shot_order,title,location,action,dialogue,visual_prompt,camera,duration_seconds,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
@@ -713,6 +722,14 @@ class MysqlStore implements DatabaseStore {
 
   async listShots(projectId: string, episodeNumber?: number) {
     const [rows] = await this.pool.execute(`SELECT * FROM shots WHERE project_id=? ${episodeNumber ? "AND episode_number=?" : ""} ORDER BY episode_number,shot_order`, episodeNumber ? [projectId,episodeNumber] : [projectId]); return (rows as DbRow[]).map(toShot);
+  }
+
+  async updateShot(projectId: string, shotId: string, input: Pick<Shot, "location" | "action" | "visualPrompt">) {
+    const [result] = await this.pool.execute("UPDATE shots SET location=?, action=?, visual_prompt=?, updated_at=? WHERE id=? AND project_id=?", [input.location, input.action, input.visualPrompt, new Date(), shotId, projectId]);
+    if (!Number((result as { affectedRows?: number }).affectedRows ?? 0)) return null;
+    const [rows] = await this.pool.execute("SELECT * FROM shots WHERE id=? AND project_id=?", [shotId, projectId]);
+    const row = (rows as DbRow[])[0];
+    return row ? toShot(row) : null;
   }
 
   async replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]) {

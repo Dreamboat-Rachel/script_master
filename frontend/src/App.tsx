@@ -1,11 +1,11 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, FileText, Film, FolderOpen, Layers3,
-  Eye, ImagePlus, LoaderCircle, Menu, MoreHorizontal, Play, Plus, RotateCcw, ScanSearch, Settings2, Sparkles,
-  Search, ListFilter, Trash2, Upload, UsersRound, WandSparkles, X,
+  Eye, ImagePlus, LoaderCircle, Menu, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
+  RefreshCw, Search, ListFilter, Trash2, Upload, UsersRound, WandSparkles, X,
 } from "lucide-react";
 import { api } from "./api";
-import type { DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, Subject, SubjectImageInput, VideoSettings } from "./types";
+import type { DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, Subject, SubjectImageInput, VideoAudioMode, VideoSettings, VideoSpeechRate } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
 type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
@@ -77,6 +77,20 @@ const subjectsMentionedInShot = (shot: Shot, subjects: Subject[]) => {
   const content = [shot.title, shot.location, shot.action, shot.dialogue, shot.visualPrompt].join(" ");
   return subjects.filter((subject) => subject.name.trim() && content.includes(subject.name.trim()));
 };
+const dialogueWithoutNarration = (dialogue: string) => dialogue
+  .split(/\r?\n/)
+  .filter((line) => !/^\s*(旁白|解说|画外音|narrator)\s*[：:]/i.test(line))
+  .join("\n")
+  .replace(/\s*(旁白|解说|画外音|narrator)\s*[：:][\s\S]*$/i, "")
+  .trim();
+const shotVideoPrompt = (shot: Shot) => [
+  `镜头：${shot.title}`,
+  `场景：${shot.location}`,
+  `动作：${shot.action}`,
+  `摄影：${shot.camera}`,
+  `画面：${shot.visualPrompt}`,
+  dialogueWithoutNarration(shot.dialogue) ? `人物对白 / 内心 OS（须逐字呈现）：${dialogueWithoutNarration(shot.dialogue)}` : "人物对白 / 内心 OS：无（禁止添加旁白或解说）",
+].join("\n");
 
 function App() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
@@ -168,7 +182,7 @@ function App() {
   const extractEpisodes = () => run("episodes", async () => { const result = await api.extractEpisodes(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, episodes: result.episodes })); setStage("episodes"); return result.episodes.length; }, (count) => `已拆分 ${count} 集剧情`);
   const extractSubjects = () => run("subjects", async () => { const result = await api.extractSubjects(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, subjects: result.subjects })); setStage("subjects"); }, "已提取角色、场景与道具");
   const extractShots = () => run("shots", async () => { const result = await api.extractShots(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, shots: result.shots })); setStage("shots"); return result.shots.length; }, (count) => `已生成 ${count} 个镜头`);
-  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"]) => run("render", async () => { setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.map((subject) => subject.id), model: model ?? videoSettings?.model }); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); setStage("render"); await refresh(); return job; }, (job) => job.referenceFallback ? "方舟安全策略拦截了真人参考图，已改用文字生成" : shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 已加入视频队列` : "视频已加入渲染队列");
+  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"], duration?: number, options?: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuity: boolean }) => run("render", async () => { setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.map((subject) => subject.id), model: model ?? videoSettings?.model, ...(duration ? { duration } : {}), ...options }); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); setStage("render"); await refresh(); return job; }, (job) => job.referenceFallback ? "方舟安全策略拦截了真人参考图，已改用文字生成" : shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 已加入视频队列` : "视频已加入渲染队列");
   const deleteProject = (item: Project) => setDeleteTarget(item);
   const deleteSubject = (item: Subject) => setDeleteSubjectTarget(item);
   const confirmDeleteProject = () => {
@@ -254,10 +268,22 @@ function App() {
   const chooseNewProjectMode = (hasScript: boolean) => { setNewProjectDialogOpen(false); setProject(null); setSourceScriptMode(hasScript); setPipeline(emptyPipeline()); setScriptText(""); setSetupDraft({ title: hasScript ? "已有剧本项目" : "", logline: "", genre: "悬疑", style: "电影写实", aspectRatio: "16:9", durationSeconds: 60, targetEpisodeCount: 3 }); setMobileNavOpen(false); if (hasScript) { setExistingScriptSetupOpen(true); return; } setHomeVisible(false); setStage("setup"); };
   const confirmExistingScriptSetup = () => run("setup", async () => { const next = await api.createProject(projectInput(setupDraft)); setProject(next); setHomeVisible(false); setExistingScriptSetupOpen(false); setStage("format"); setDashboard(await api.dashboard()); }, "项目设定已保存，请导入剧本");
   const goHome = () => { setProject(null); setSourceScriptMode(false); setHomeVisible(true); setProjectManagerVisible(false); window.scrollTo(0, 0); setStage("setup"); setMobileNavOpen(false); };
+  const saveShotEdits = async (shot: Shot, input: { location: string; action: string; visualPrompt: string }) => {
+    try {
+      const updated = await api.updateShot(shot.projectId, shot.id, input);
+      setPipeline((current) => ({ ...current, shots: current.shots.map((item) => item.id === updated.id ? updated : item) }));
+      setVideoPreview((current) => current?.shot.id === updated.id ? { ...current, shot: updated } : current);
+      setToast("分镜内容已保存");
+      return true;
+    } catch (caught) {
+      setToast(caught instanceof Error ? caught.message : "分镜内容保存失败");
+      return false;
+    }
+  };
   const settingsDialog = settingsOpen && <SettingsDialog settings={settings} imageSettings={imageSettings} videoSettings={videoSettings} draft={apiKeyDraft} imageDraft={imageSettingsDraft} videoDraft={videoSettingsDraft} busy={settingsBusy} onDraftChange={setApiKeyDraft} onImageDraftChange={setImageSettingsDraft} onVideoDraftChange={setVideoSettingsDraft} onSave={() => void saveSettings()} onClose={() => setSettingsOpen(false)} />;
   const subjectImageDialog = <>{imageDialogSubject && <SubjectImageDialog subject={imageDialogSubject} draft={subjectImageDraft} configured={imageSettings?.configured} busy={generatingSubjectIds.includes(imageDialogSubject.id)} onDraftChange={setSubjectImageDraft} onReference={selectSubjectReference} onGenerate={() => void generateSubjectImage()} onConfigure={() => { setImageDialogSubject(null); openSettings(); }} onClose={() => { if (!generatingSubjectIds.includes(imageDialogSubject.id)) setImageDialogSubject(null); }} />}{subjectImagePreview && <SubjectImagePreviewDialog subject={subjectImagePreview} onClose={() => setSubjectImagePreview(null)} />}</>;
-  const videoDialog = videoDialogShot && <ShotVideoDialog shot={videoDialogShot} subjects={pipeline.subjects} videoModel={videoSettings?.model} busy={workingAction === "render"} onGenerate={(references, model) => renderVideo(videoDialogShot, references, model)} onClose={() => { if (workingAction !== "render") setVideoDialogShot(null); }} />;
-  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} onClose={() => setVideoPreview(null)} />;
+  const videoDialog = videoDialogShot && <ShotVideoDialog shot={videoDialogShot} subjects={pipeline.subjects} videoModel={videoSettings?.model} busy={workingAction === "render"} onGenerate={(references, model, duration, options) => renderVideo(videoDialogShot, references, model, duration, options)} onClose={() => { if (workingAction !== "render") setVideoDialogShot(null); }} />;
+  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} history={renderJobs.filter((job) => job.shotId === videoPreview.shot.id && job.outputUrl).map((job) => ({ id: job.id, outputUrl: job.outputUrl!, createdAt: job.createdAt }))} onSave={(input) => saveShotEdits(videoPreview.shot, input)} onRegenerate={() => { setVideoPreview(null); setVideoDialogShot(videoPreview.shot); }} onClose={() => setVideoPreview(null)} />;
   const subjectDeleteDialog = deleteSubjectTarget && <DeleteSubjectDialog subject={deleteSubjectTarget} busy={workingAction === "deleteSubject"} onConfirm={confirmDeleteSubject} onClose={() => { if (workingAction !== "deleteSubject") setDeleteSubjectTarget(null); }} />;
 
   if (loading) return <div className="loading-screen"><LoaderCircle className="spin" size={24} /><span>正在载入工作区</span></div>;
@@ -393,14 +419,14 @@ function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, 
     const job = jobForShot(shot);
     if (!job || (job.status !== "completed" && !job.outputUrl)) return null;
     if (!job.outputUrl) return <span className="shot-video-result complete">已完成</span>;
-    return <span className="shot-video-output"><button className="shot-video-preview" onClick={() => onViewVideo(shot, job.outputUrl!)} aria-label={`查看第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title="查看视频"><video src={job.outputUrl} muted preload="metadata" /><span><Eye size={13} />查看</span></button><button className="shot-regenerate-button" onClick={() => onGenerateVideo(shot)} aria-label="重新生成视频" title="重新生成视频"><RotateCcw size={14} /></button></span>;
+    return <span className="shot-video-output"><button className="shot-video-preview" onClick={() => onViewVideo(shot, job.outputUrl!)} aria-label={`查看第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title="查看视频"><video src={job.outputUrl} muted preload="metadata" /><span><Eye size={13} />查看</span></button></span>;
   };
   const renderVideoCell = (shot: Shot) => {
     const job = jobForShot(shot);
     const active = job?.status === "queued" || job?.status === "processing";
     const output = renderVideoResult(shot);
     if (output) return <span className="shot-video-cell">{output}</span>;
-    return <span className="shot-video-cell"><button className="shot-video-button" onClick={() => onGenerateVideo(shot)} disabled={active} aria-label={`生成第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title={active ? "视频生成中" : job?.status === "failed" ? "重新生成视频" : "生成视频"}>{active ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}</button>{active && <span className="shot-video-progress">{job?.status === "queued" ? "排队中" : `${job?.progress ?? 0}%`}</span>}</span>;
+    return <span className="shot-video-cell"><button className="shot-video-button" onClick={() => onGenerateVideo(shot)} disabled={active} aria-label={`生成第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title={active ? "视频生成中" : "生成视频"}>{active ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}</button>{active && <span className="shot-video-progress">{job?.status === "queued" ? "排队中" : `${job?.progress ?? 0}%`}</span>}</span>;
   };
   return <div className="stage-view shots-view">
     <StepHeader eyebrow="05 / STORYBOARD" title="分镜清单" description="按集查看镜头、角色、物品和对白。确认后即可为单个镜头选择参考图并生成视频。" action={<div className="episode-tabs"><button className={selectedEpisode === 0 ? "selected" : ""} onClick={() => setSelectedEpisode(0)}>全部</button>{episodes.map((episode) => <button key={episode.id} className={selectedEpisode === episode.episodeNumber ? "selected" : ""} onClick={() => setSelectedEpisode(episode.episodeNumber)}>{formatEpisodeLabel(episode.episodeNumber)}</button>)}</div>} />
@@ -418,23 +444,49 @@ function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, 
   </div>;
 }
 
-function ShotVideoPreviewDialog({ shot, url, onClose }: { shot: Shot; url: string; onClose: () => void }) {
-  return <div className="settings-backdrop shot-video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-dialog shot-video-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-preview-title">
-    <div className="settings-dialog-head"><div><span className="panel-eyebrow">SHOT VIDEO</span><h2 id="shot-video-preview-title">分镜视频</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")} · {shot.title}</p></div><button className="icon-button" onClick={onClose} aria-label="关闭视频预览"><X size={18} /></button></div>
-    <video className="shot-video-player" src={url} controls autoPlay playsInline />
+type ShotEditInput = Pick<Shot, "location" | "action" | "visualPrompt">;
+
+function ShotVideoPreviewDialog({ shot, url, history, onSave, onRegenerate, onClose }: { shot: Shot; url: string; history: Array<{ id: string; outputUrl: string; createdAt: string }>; onSave: (input: ShotEditInput) => Promise<boolean>; onRegenerate: () => void; onClose: () => void }) {
+  const [selectedUrl, setSelectedUrl] = useState(url);
+  const [selectedCreatedAt, setSelectedCreatedAt] = useState(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString());
+  const [duration, setDuration] = useState<number | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [draft, setDraft] = useState<ShotEditInput>({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt });
+  useEffect(() => { setSelectedUrl(url); setSelectedCreatedAt(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString()); }, [history, url]);
+  useEffect(() => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); }, [shot.location, shot.action, shot.visualPrompt]);
+  const cancelEditing = () => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); setEditing(false); };
+  const saveEditing = async () => {
+    const input = { location: draft.location.trim(), action: draft.action.trim(), visualPrompt: draft.visualPrompt.trim() };
+    if (!input.location || !input.action || !input.visualPrompt) return;
+    setSaving(true);
+    const saved = await onSave(input);
+    setSaving(false);
+    if (saved) setEditing(false);
+  };
+  const validDraft = Boolean(draft.location.trim() && draft.action.trim() && draft.visualPrompt.trim());
+  return <div className="settings-backdrop shot-video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}><section className="shot-video-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-preview-title">
+    <div className="shot-video-preview-main"><video className="shot-video-player" src={selectedUrl} controls autoPlay playsInline onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} /><div className="shot-video-history"><strong>历史视频</strong>{history.length ? history.map((item) => <button className={`shot-video-history-item ${item.outputUrl === selectedUrl ? "selected" : ""}`} type="button" key={item.id} aria-label="查看历史视频" onClick={() => { setSelectedUrl(item.outputUrl); setSelectedCreatedAt(item.createdAt); setDuration(null); }}><video src={item.outputUrl} muted preload="metadata" /></button>) : <button className="shot-video-history-item selected" type="button" aria-label="当前视频"><video src={selectedUrl} muted preload="metadata" /></button>}</div></div>
+    <aside className="shot-video-preview-sidebar">
+      <div className="shot-video-preview-head"><div><span className="panel-eyebrow">SHOT VIDEO</span><h2 id="shot-video-preview-title">{shot.title}</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")}</p></div><button className="icon-button" onClick={onClose} disabled={saving} aria-label="关闭视频预览"><X size={18} /></button></div>
+      <div className="shot-video-meta"><span>生成时间 <b>{new Date(selectedCreatedAt).toLocaleString("zh-CN", { hour12: false })}</b></span><span>视频时长 <b>{duration ? formatDuration(Math.round(duration)) : `${shot.durationSeconds}s`}</b></span><span>镜头信息 <b>{shot.camera} · {shot.durationSeconds}s</b></span></div>
+      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>场景与动作</span>{!editing && <button type="button" onClick={() => setEditing(true)}><Pencil size={13} />编辑</button>}</div>{editing ? <div className="shot-video-edit-fields"><label><span>场景</span><input value={draft.location} maxLength={500} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, location: event.target.value }))} /></label><label><span>动作</span><textarea value={draft.action} maxLength={5000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, action: event.target.value }))} /></label></div> : <p>{shot.location} · {shot.action}</p>}</section>
+      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>提示词</span></div>{editing ? <textarea className="shot-video-prompt-editor" value={draft.visualPrompt} maxLength={12000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, visualPrompt: event.target.value }))} /> : <p>{shot.visualPrompt}</p>}</section>
+      <div className="shot-video-preview-actions">{editing ? <div className="shot-video-edit-actions"><button className="secondary-button" type="button" onClick={cancelEditing} disabled={saving}>取消</button><button className="primary-button" type="button" onClick={() => void saveEditing()} disabled={saving || !validDraft}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存修改</button></div> : <button className="secondary-button" type="button" onClick={onRegenerate}><RefreshCw size={15} /> 重新生成</button>}</div>
+    </aside>
   </section></div>;
 }
 
-function ShotVideoDialog({ shot, subjects, videoModel, busy, onGenerate, onClose }: { shot: Shot; subjects: Subject[]; videoModel?: VideoSettings["model"]; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"]) => void; onClose: () => void }) {
+function ShotVideoDialog({ shot, subjects, videoModel, busy, onGenerate, onClose }: { shot: Shot; subjects: Subject[]; videoModel?: VideoSettings["model"]; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"], duration: number, options: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuity: boolean }) => void; onClose: () => void }) {
   const referencedImageSubjects = subjectsMentionedInShot(shot, subjects).filter((subject) => Boolean(subject.imageUrl));
   const [selectedIds, setSelectedIds] = useState<string[]>(referencedImageSubjects.map((subject) => subject.id));
-  const [prompt, setPrompt] = useState(shot.visualPrompt);
+  const [prompt, setPrompt] = useState(() => shotVideoPrompt(shot));
   const [model, setModel] = useState<VideoSettings["model"]>(videoModel ?? videoModelOptions[0]);
-  const [duration, setDuration] = useState("10s");
+  const [duration, setDuration] = useState(String(Math.min(12, Math.max(2, shot.durationSeconds))));
   const [resolution, setResolution] = useState("720p");
-  const [sound, setSound] = useState(true);
+  const [audioMode, setAudioMode] = useState<VideoAudioMode>(dialogueWithoutNarration(shot.dialogue) ? "dialogue" : "ambient");
+  const [speechRate, setSpeechRate] = useState<VideoSpeechRate>("natural");
   const [bgm, setBgm] = useState(false);
-  const [subtitles, setSubtitles] = useState(false);
   const [continuity, setContinuity] = useState(true);
   const toggleReference = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   const selected = referencedImageSubjects.filter((subject) => selectedIds.includes(subject.id));
@@ -443,13 +495,14 @@ function ShotVideoDialog({ shot, subjects, videoModel, busy, onGenerate, onClose
     <div className="video-tabs"><button className="selected">参考生视频</button><button disabled>首尾帧视频</button></div>
     <div className="video-generation-content">
       <section className="video-generation-section"><span className="image-field-label">参考图 <small>仅显示当前镜头已引用的主体图片</small></span><div className="video-reference-grid">{referencedImageSubjects.map((subject) => <button type="button" key={subject.id} className={`video-reference-card ${selectedIds.includes(subject.id) ? "selected" : ""}`} onClick={() => toggleReference(subject.id)} disabled={busy}><img src={subject.imageUrl!} alt={subject.name} /><span>{subject.name}</span>{selectedIds.includes(subject.id) && <Check size={14} />}</button>)}{!referencedImageSubjects.length && <div className="video-reference-empty">当前镜头暂无已引用的主体图片。</div>}</div><small className="video-reference-count">已选择 {selected.length} 张参考图</small></section>
-      <label className="video-generation-section prompt-section"><span className="image-field-label">提示词 <b>*</b></span><textarea value={prompt} maxLength={12000} disabled={busy} onChange={(event) => setPrompt(event.target.value)} /><small className="prompt-count">{prompt.length} / 12000</small></label>
+      <label className="video-generation-section prompt-section"><span className="image-field-label">视频提示词 <b>*</b></span><textarea value={prompt} maxLength={16000} disabled={busy} onChange={(event) => setPrompt(event.target.value)} /><small className="prompt-count">{prompt.length} / 16000</small></label>
       <div className="image-control image-model-control"><span>模型</span><SmoothSelect value={model} options={videoModelOptions.map((value) => ({ value, label: videoModelLabels[value] }))} disabled={busy} ariaLabel="视频模型" onChange={(value) => setModel(value as VideoSettings["model"])} /></div>
-      <div className="image-parameter-grid video-parameter-grid"><div className="image-control"><span>分辨率</span><SmoothSelect value={resolution} options={[{ value: "720p", label: "720p" }, { value: "1080p", label: "1080p" }]} disabled={busy} ariaLabel="视频分辨率" onChange={setResolution} /></div><div className="image-control"><span>时长</span><SmoothSelect value={duration} options={[{ value: "5s", label: "5s" }, { value: "10s", label: "10s" }, { value: "15s", label: "15s" }]} disabled={busy} ariaLabel="视频时长" onChange={setDuration} /></div></div>
-      <div className="video-toggle-grid"><button type="button" className={`video-toggle ${sound ? "on" : ""}`} onClick={() => setSound((current) => !current)}><span>声音</span><i /></button><button type="button" className={`video-toggle ${bgm ? "on" : ""}`} onClick={() => setBgm((current) => !current)}><span>BGM</span><i /></button><button type="button" className={`video-toggle ${subtitles ? "on" : ""}`} onClick={() => setSubtitles((current) => !current)}><span>字幕</span><i /></button><button type="button" className={`video-toggle ${continuity ? "on" : ""}`} onClick={() => setContinuity((current) => !current)}><span>分镜连续</span><i /></button></div>
-      <p className="video-generation-note">参考图会通过主体 ID 传给后端，视频服务只读取主体资产中已有的图片地址。</p>
+      <div className="image-parameter-grid video-parameter-grid"><div className="image-control"><span>分辨率</span><SmoothSelect value={resolution} options={[{ value: "720p", label: "720p" }, { value: "1080p", label: "1080p" }]} disabled={busy} ariaLabel="视频分辨率" onChange={setResolution} /></div><label className="image-control video-duration-control"><span>时长 <small>2 - 12 秒</small></span><div className="video-duration-input"><input type="number" min={2} max={12} step={1} value={duration} disabled={busy} aria-label="自定义视频时长" onChange={(event) => setDuration(event.target.value.replace(/[^0-9]/g, ""))} /><b>秒</b></div></label></div>
+      <div className="image-parameter-grid video-audio-grid"><div className="image-control"><span>声音内容</span><SmoothSelect value={audioMode} options={[{ value: "dialogue", label: "原文对白 / 内心 OS" }, { value: "ambient", label: "仅环境音" }, { value: "silent", label: "无声" }]} disabled={busy} ariaLabel="声音内容" onChange={(value) => setAudioMode(value as VideoAudioMode)} /></div><div className="image-control"><span>说话语速</span><SmoothSelect value={speechRate} options={[{ value: "natural", label: "自然" }, { value: "slow", label: "舒缓" }]} disabled={busy || audioMode !== "dialogue"} ariaLabel="说话语速" onChange={(value) => setSpeechRate(value as VideoSpeechRate)} /></div></div>
+      <div className="video-toggle-grid"><button type="button" className={`video-toggle ${bgm ? "on" : ""}`} onClick={() => setBgm((current) => !current)} disabled={audioMode === "silent"}><span>背景音乐</span><i /></button><button type="button" className={`video-toggle ${continuity ? "on" : ""}`} onClick={() => setContinuity((current) => !current)}><span>承接上一镜头</span><i /></button></div>
+      <p className="video-generation-note">对白只使用上方列出的原文台词，不会把场景说明改成旁白。连续性通过上一镜头状态和相同主体参考图进行约束。</p>
     </div>
-    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model)} disabled={busy || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "正在提交" : "创作视频"}</button>
+    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model, Math.min(12, Math.max(2, Number(duration) || 10)), { prompt: prompt.trim(), audioMode, speechRate, bgm: audioMode !== "silent" && bgm, continuity })} disabled={busy || !prompt.trim() || Number(duration) < 2 || Number(duration) > 12}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "正在提交" : "创作视频"}</button>
   </section></div>;
 }
 function RenderStage({ project, shots, jobs, onBack, onRender, working }: { project: Project | null; shots: Shot[]; jobs: RenderJob[]; onBack: () => void; onRender: () => void; working: boolean }) {

@@ -10,6 +10,7 @@ import { createDatabaseStore } from "./database.js";
 import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
 import { configureVideo, getVideoSettings, VideoGenerationService } from "./video.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
+import type { Shot } from "./types.js";
 
 const port = Number(process.env.PORT ?? 8787);
 const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
@@ -186,7 +187,59 @@ const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
   referenceSubjectIds: z.array(z.string().uuid()).max(12).default([]),
   model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  duration: z.coerce.number().int().min(2).max(12).optional(),
+  prompt: z.string().trim().min(1).max(16000).optional(),
+  audioMode: z.enum(["dialogue", "ambient", "silent"]).default("dialogue"),
+  speechRate: z.enum(["slow", "natural"]).default("natural"),
+  bgm: z.boolean().default(false),
+  continuity: z.boolean().default(true),
 });
+const shotEditSchema = z.object({
+  location: z.string().trim().min(1).max(500),
+  action: z.string().trim().min(1).max(5000),
+  visualPrompt: z.string().trim().min(1).max(12000),
+});
+
+function dialogueWithoutNarration(dialogue: string) {
+  return dialogue
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(旁白|解说|画外音|narrator)\s*[：:]/i.test(line))
+    .join("\n")
+    .replace(/\s*(旁白|解说|画外音|narrator)\s*[：:][\s\S]*$/i, "")
+    .trim();
+}
+
+function videoPromptForShot(shot: Shot, input: z.infer<typeof renderInputSchema>, previousShot?: Shot) {
+  const dialogue = dialogueWithoutNarration(shot.dialogue);
+  const audioMode = input.audioMode === "dialogue" && !dialogue ? "ambient" : input.audioMode;
+  const basePrompt = input.prompt ?? [
+    `镜头：${shot.title}`,
+    `场景：${shot.location}`,
+    `动作：${shot.action}`,
+    `摄影：${shot.camera}`,
+    `画面：${shot.visualPrompt}`,
+  ].join("\n");
+  const continuityPrompt = input.continuity && previousShot ? [
+    "连续性要求：当前镜头必须从上一镜头的结束状态自然开始，不重复上一镜头动作。",
+    `上一镜头场景：${previousShot.location}`,
+    `上一镜头结束动作：${previousShot.action}`,
+    `上一镜头画面状态：${previousShot.visualPrompt}`,
+    "保持同一人物的面容、发型、服装、体态和所持道具一致；保持空间方位、光线、天气、色调和运动方向连续。",
+  ].join("\n") : "连续性要求：本镜头独立生成。";
+  const audioPrompt = audioMode === "silent"
+    ? "声音要求：生成无声视频，不要对白、内心 OS、旁白、解说、环境音或音乐。"
+    : audioMode === "ambient"
+      ? "声音要求：只生成与画面同步的环境音和动作拟音，禁止任何人声、旁白、解说或内心 OS。"
+      : [
+        `允许说出的唯一文本（人物对白 / 内心 OS，必须逐字使用）：${dialogue}`,
+        "禁止把场景、动作、背景介绍或提示词朗读出来；禁止自行补写旁白、解说、台词或口头语。对白由对应人物说出，标注为 OS 的内容只作为该人物内心声音。",
+        input.speechRate === "slow" ? "说话语速：舒缓，句间保留自然停顿，不能通过添加内容填满时长。" : "说话语速：自然，吐字清楚，不抢拍。",
+      ].join("\n");
+  const musicPrompt = audioMode === "silent" || !input.bgm
+    ? "音乐要求：不要背景音乐。"
+    : "音乐要求：使用克制的背景音乐，不得盖过对白和关键环境音。";
+  return [basePrompt, continuityPrompt, audioPrompt, musicPrompt, "画面中不要生成字幕、标题、标牌式说明文字或水印。"].join("\n\n");
+}
 
 function normalizeScript(text: string) {
   const lines = text.split(/\r\n|\r|\n/);
@@ -542,6 +595,16 @@ app.post("/api/projects/:id/generate-script", asyncRoute(async (request, respons
   }
 }));
 
+app.patch("/api/projects/:id/shots/:shotId", asyncRoute(async (request, response) => {
+  const projectId = String(request.params.id);
+  const project = await db.getProject(projectId);
+  if (!project) return response.status(404).json({ error: "项目不存在" });
+  const input = shotEditSchema.parse(request.body ?? {});
+  const shot = await db.updateShot(projectId, String(request.params.shotId), input);
+  if (!shot) return response.status(404).json({ error: "分镜不存在" });
+  response.json({ data: shot });
+}));
+
 app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
@@ -556,16 +619,20 @@ app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
   const jobs = [];
   let referenceFallback = false;
   for (const shot of targetShots) {
+    const previousShot = shots
+      .filter((candidate) => candidate.episodeNumber === shot.episodeNumber && candidate.shotOrder < shot.shotOrder)
+      .sort((left, right) => right.shotOrder - left.shotOrder)[0];
     const content = [shot.title, shot.location, shot.action, shot.dialogue, shot.visualPrompt].join(" ");
     const referenceSubjects = (input.referenceSubjectIds.length
       ? subjects.filter((subject) => input.referenceSubjectIds.includes(subject.id))
       : subjects.filter((subject) => subject.imageUrl && subject.name.trim() && content.includes(subject.name.trim()))).filter((subject) => subject.imageUrl);
     const task = await videoGeneration.createTask({
-      prompt: [shot.title, `场景：${shot.location}`, `动作：${shot.action}`, shot.dialogue ? `对白：${shot.dialogue}` : "", shot.visualPrompt].filter(Boolean).join("\n"),
+      prompt: videoPromptForShot(shot, { ...input, prompt: selectedShot ? input.prompt : undefined }, previousShot),
       model: input.model,
       referenceImageUrls: await Promise.all(referenceSubjects.map((subject) => referenceImageSource(subject.imageUrl!, request))),
       ratio: project.aspectRatio,
-      duration: shot.durationSeconds,
+      duration: input.duration ?? shot.durationSeconds,
+      generateAudio: input.audioMode !== "silent",
     });
     referenceFallback ||= task.referenceFallback;
     writeLog("INFO", "[render] 已提交视频任务", {
@@ -575,6 +642,10 @@ app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
       status: task.status,
       referenceFallback: task.referenceFallback,
       referenceSubjectIds: referenceSubjects.map((subject) => subject.id),
+      audioMode: input.audioMode,
+      speechRate: input.speechRate,
+      bgm: input.bgm,
+      continuity: input.continuity,
     });
     const job = await db.createRenderJob(project.id, shot.id, "volcengine", task.taskId, task.status, task.progress);
     jobs.push(job);
