@@ -47,6 +47,7 @@ export interface RenderJob {
   progress: number;
   outputUrl: string | null;
   errorMessage: string | null;
+  generationPrompt: string | null;
   createdAt: string;
   updatedAt: string;
 }

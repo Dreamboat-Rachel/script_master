@@ -44,9 +44,20 @@ export interface RenderJob {
   progress: number;
   outputUrl: string | null;
   errorMessage: string | null;
+  generationPrompt: string | null;
   createdAt: string;
   updatedAt: string;
   referenceFallback?: boolean;
+}
+
+export interface VideoMerge {
+  id: string;
+  projectId: string;
+  outputUrl: string;
+  shotIds: string[];
+  durationSeconds: number;
+  createdAt: string;
+  coverUrl: string | null;
 }
 
 export interface ScriptDocument {
@@ -112,6 +123,14 @@ export interface VideoSettings {
 
 export type VideoAudioMode = "dialogue" | "ambient" | "silent";
 export type VideoSpeechRate = "slow" | "natural";
+export type VideoContinuityMode = "auto" | "continue" | "cut" | "scene";
+
+export interface ShotContinuityPreview {
+  status: "ready" | "first-shot" | "missing-video" | "extract-failed";
+  previousShotId: string | null;
+  tailFrameUrl: string | null;
+  message: string;
+}
 
 export type ImageResolution = "2K" | "4K";
 export type ImageAspectRatio = "1:1" | "16:9" | "9:16" | "3:2" | "2:3" | "4:3" | "3:4";

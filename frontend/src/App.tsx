@@ -1,11 +1,11 @@
 import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeft, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, FileText, Film, FolderOpen, Layers3,
-  Eye, ImagePlus, LoaderCircle, Menu, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
+  ArrowLeft, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Combine, Download, FileText, Film, FolderOpen, Layers3,
+  Eye, ImagePlus, ListChecks, LoaderCircle, Menu, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
   RefreshCw, Search, ListFilter, Trash2, Upload, UsersRound, WandSparkles, X,
 } from "lucide-react";
 import { api } from "./api";
-import type { DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, Subject, SubjectImageInput, VideoAudioMode, VideoSettings, VideoSpeechRate } from "./types";
+import type { DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
 type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
@@ -15,7 +15,7 @@ const stages: Array<{ id: Stage; label: string; description: string; icon: typeo
   { id: "episodes", label: "剧本解析", description: "分集与情节结构", icon: Layers3 },
   { id: "subjects", label: "主体生成", description: "角色 · 场景 · 道具", icon: UsersRound },
   { id: "shots", label: "故事板", description: "生成分镜内容", icon: ScanSearch },
-  { id: "render", label: "生成视频", description: "进入渲染队列", icon: Clapperboard },
+  { id: "render", label: "视频合成", description: "选择并合并镜头", icon: Combine },
 ];
 const sampleScript = `午夜车站
 类型：悬疑短片
@@ -30,6 +30,7 @@ const sampleScript = `午夜车站
 
 林默打开信，车站深处传来列车启动的声音。`;
 const MAX_SCRIPT_LENGTH = 200000;
+const MIN_LOGLINE_LENGTH = 50;
 const imageProviderDefaults: Record<ImageSettings["provider"], string> = {
   volcengine: "https://ark.cn-beijing.volces.com/api/v3",
   aliyun: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -83,14 +84,37 @@ const dialogueWithoutNarration = (dialogue: string) => dialogue
   .join("\n")
   .replace(/\s*(旁白|解说|画外音|narrator)\s*[：:][\s\S]*$/i, "")
   .trim();
-const shotVideoPrompt = (shot: Shot) => [
-  `镜头：${shot.title}`,
-  `场景：${shot.location}`,
-  `动作：${shot.action}`,
-  `摄影：${shot.camera}`,
-  `画面：${shot.visualPrompt}`,
+const shotVideoPrompt = (shot: Shot, previousShot?: Shot) => [
+  ...(previousShot ? [
+    "上一镜头画面（当前镜头必须从此处自然延伸）：",
+    `上一镜头：${previousShot.title}`,
+    `上一场景：${previousShot.location}`,
+    `上一镜头结束动作：${previousShot.action}`,
+    `上一镜头摄影：${previousShot.camera}`,
+    `上一镜头画面提示词：${previousShot.visualPrompt}`,
+    "承接要求：继承上一镜头末尾的人物姿势、位置、视线、服装、道具、光线、空间方位和运动方向；不要重新入场，不要重复已经完成的动作，不要在视频内部制作转场。",
+    "",
+  ] : []),
+  "当前镜头目标（从上述结束状态继续）：",
+  `当前镜头：${shot.title}`,
+  `当前场景：${shot.location}`,
+  `当前动作：${shot.action}`,
+  `当前摄影：${shot.camera}`,
+  `当前画面：${shot.visualPrompt}`,
   dialogueWithoutNarration(shot.dialogue) ? `人物对白 / 内心 OS（须逐字呈现）：${dialogueWithoutNarration(shot.dialogue)}` : "人物对白 / 内心 OS：无（禁止添加旁白或解说）",
 ].join("\n");
+const submittedVideoPrompt = (generationPrompt: string | null) => {
+  if (!generationPrompt?.trim()) return null;
+  const matchers = [
+    /(?:^|\r?\n\r?\n)用户确认的视频提示词（除连续性首帧约束外必须执行）：\r?\n([\s\S]*?)(?=\r?\n\r?\n衔接方式：)/,
+    /(?:^|\r?\n\r?\n)当前镜头目标：\r?\n([\s\S]*?)(?=\r?\n\r?\n(?:声音要求：|允许说出的唯一文本|音乐要求：|画面中不要生成))/,
+  ];
+  for (const matcher of matchers) {
+    const matched = generationPrompt.match(matcher)?.[1]?.trim();
+    if (matched) return matched;
+  }
+  return generationPrompt.trim();
+};
 
 function App() {
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
@@ -121,6 +145,8 @@ function App() {
   const [imageDialogSubject, setImageDialogSubject] = useState<Subject | null>(null);
   const [subjectImageDraft, setSubjectImageDraft] = useState<SubjectImageDraft>({ prompt: "", model: imageModelOptions[0], resolution: "2K", aspectRatio: "1:1", referenceName: "" });
   const [videoDialogShot, setVideoDialogShot] = useState<Shot | null>(null);
+  const [videoDialogInitialPrompt, setVideoDialogInitialPrompt] = useState<string | null>(null);
+  const [submittedRenderJobId, setSubmittedRenderJobId] = useState<string | null>(null);
   const [videoPreview, setVideoPreview] = useState<{ shot: Shot; url: string } | null>(null);
   const [newProjectDialogOpen, setNewProjectDialogOpen] = useState(false);
   const [existingScriptSetupOpen, setExistingScriptSetupOpen] = useState(false);
@@ -164,17 +190,30 @@ function App() {
     };
     return () => stream.close();
   }, [project?.id, hasActiveRender]);
+  useEffect(() => {
+    if (!submittedRenderJobId) return;
+    const submittedJob = renderJobs.find((job) => job.id === submittedRenderJobId);
+    if (submittedJob?.status === "failed") {
+      setToast(`视频生成失败：${submittedJob.errorMessage || "视频平台未能创建任务"}`);
+      setSubmittedRenderJobId(null);
+    } else if (submittedJob?.status === "completed") {
+      setSubmittedRenderJobId(null);
+    }
+  }, [renderJobs, submittedRenderJobId]);
   useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 3400); return () => window.clearTimeout(timer); }, [toast]);
   useEffect(() => {
     const handlePreview = (event: Event) => setSubjectImagePreview((event as CustomEvent<Subject>).detail);
     window.addEventListener("subject-image-preview", handlePreview);
     return () => window.removeEventListener("subject-image-preview", handlePreview);
   }, []);
+  useEffect(() => {
+    if (!homeVisible) window.scrollTo({ top: 0, behavior: "auto" });
+  }, [homeVisible, stage]);
   const currentIndex = stages.findIndex((item) => item.id === stage);
   const completion = useMemo(() => Math.round(([pipeline.document?.formatStatus === "formatted", pipeline.episodes.length > 0, pipeline.subjects.length > 0, pipeline.shots.length > 0].filter(Boolean).length / 4) * 100), [pipeline]);
   const working = workingAction !== null;
-  const run = async <T,>(actionName: WorkingAction, action: () => Promise<T>, success: string | ((result: T) => string)) => { if (working) return; setWorkingAction(actionName); try { const result = await action(); setToast(typeof success === "function" ? success(result) : success); } catch (caught) { setToast(caught instanceof Error ? caught.message : "处理失败"); } finally { setWorkingAction(null); } };
-  const projectInput = (draft: ProjectDraft) => ({ title: draft.title.trim(), logline: (draft.logline.trim() || `围绕${draft.title.trim()}展开的${draft.genre}故事。`).slice(0, 5000), genre: draft.genre, style: draft.style, aspectRatio: draft.aspectRatio, durationSeconds: Math.min(720, Math.max(15, draft.durationSeconds)), targetEpisodeCount: Math.min(100, Math.max(1, draft.targetEpisodeCount)) });
+  const run = async <T,>(actionName: WorkingAction, action: () => Promise<T>, success: string | ((result: T) => string)) => { if (working) { setToast("当前操作正在处理中，请稍候"); return; } setWorkingAction(actionName); try { const result = await action(); setToast(typeof success === "function" ? success(result) : success); } catch (caught) { setToast(caught instanceof Error ? caught.message : "处理失败"); } finally { setWorkingAction(null); } };
+  const projectInput = (draft: ProjectDraft) => ({ title: draft.title.trim(), logline: draft.logline.trim().slice(0, 5000), genre: draft.genre, style: draft.style, aspectRatio: draft.aspectRatio, durationSeconds: Math.min(720, Math.max(15, draft.durationSeconds)), targetEpisodeCount: Math.min(100, Math.max(1, draft.targetEpisodeCount)) });
   const ensureProject = async () => { if (project) return project; const created = await api.createProject(projectInput({ ...setupDraft, title: setupDraft.title.trim() || getProjectTitle(scriptText) })); setProject(created); return created; };
   const saveProjectSetup = () => run("setup", async () => { const next = project ? await api.updateProject(project.id, projectInput(setupDraft)) : await ensureProject(); setProject(next); setHomeVisible(false); setDashboard(await api.dashboard()); setStage("format"); }, "项目设定已保存，请导入剧本");
   const generateProjectScript = () => run("generate", async () => { const input = projectInput(setupDraft); const next = project ? await api.updateProject(project.id, input) : await api.createProject(input); const result = await api.generateScript(next.id, input); const data = await api.pipeline(next.id); setProject(result.project); setScriptText(result.scriptText); setPipeline(data); setHomeVisible(false); setDashboard(await api.dashboard()); setStage("format"); }, "剧本草案已生成并保存，请开始格式化");
@@ -182,7 +221,7 @@ function App() {
   const extractEpisodes = () => run("episodes", async () => { const result = await api.extractEpisodes(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, episodes: result.episodes })); setStage("episodes"); return result.episodes.length; }, (count) => `已拆分 ${count} 集剧情`);
   const extractSubjects = () => run("subjects", async () => { const result = await api.extractSubjects(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, subjects: result.subjects })); setStage("subjects"); }, "已提取角色、场景与道具");
   const extractShots = () => run("shots", async () => { const result = await api.extractShots(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, shots: result.shots })); setStage("shots"); return result.shots.length; }, (count) => `已生成 ${count} 个镜头`);
-  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"], duration?: number, options?: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuity: boolean }) => run("render", async () => { setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.map((subject) => subject.id), model: model ?? videoSettings?.model, ...(duration ? { duration } : {}), ...options }); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); setStage("render"); await refresh(); return job; }, (job) => job.referenceFallback ? "方舟安全策略拦截了真人参考图，已改用文字生成" : shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 已加入视频队列` : "视频已加入渲染队列");
+  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"], duration?: number, options?: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => run("render", async () => { setToast(shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中"); setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.map((subject) => subject.id), model: model ?? videoSettings?.model, ...(duration ? { duration } : {}), ...options }); setSubmittedRenderJobId(job.id); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); await refresh(); return job; }, () => shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中");
   const deleteProject = (item: Project) => setDeleteTarget(item);
   const deleteSubject = (item: Subject) => setDeleteSubjectTarget(item);
   const confirmDeleteProject = () => {
@@ -234,7 +273,13 @@ function App() {
   };
   const openSubjectImageDialog = (subject: Subject) => {
     const role = subject.role === "character" ? "角色" : subject.role === "location" ? "场景" : "道具";
-    const prompt = [`视觉风格：${project?.style || "电影写实"}`, `${role}名称：${subject.name}`, `主体描述：${subject.description || "未设定"}`, `主体提示词：${subject.visualPrompt || "未设定"}`, "生成要求：只呈现当前主体的单一阶段，单人单幅画面，主体清晰完整，构图简洁；禁止多年龄、多版本、拼图、分屏或对比图；无文字，无水印"].join("\n");
+    const roleRequirement = subject.role === "location"
+      ? "生成要求：只呈现完整、空置、无人占用的场景设定图；不要出现人物、动物、手、人体、群演或正在发生的动作。完整展示房间边界、墙面、地面、天花板、门窗、出入口、固定家具设备、空间动线和相对位置；房屋布局必须符合真实建筑逻辑，禁止房间拼接、物件漂浮、穿模、悬空家具和无法到达的出入口；无文字，无水印。"
+      : subject.role === "prop"
+        ? "生成要求：只呈现完整单体物品设定图；不要出现人物、手、人体、房间、桌面或其他道具。展示物品完整外形、正反侧结构、比例、材质、颜色、纹理、接口和开合部件，不要只截取局部或描绘使用中的瞬间；无文字，无水印。"
+        : "生成要求：只呈现当前主体的单一阶段、单一人物，主体清晰完整，构图简洁；禁止多年龄、多版本、拼图、分屏或对比图；无文字，无水印。";
+    const descriptionLabel = subject.role === "location" ? "场景结构描述（仅作为空间事实，不得把其中人物画出来）" : subject.role === "prop" ? "物品结构描述（仅作为物品事实，不得把使用者或使用场景画出来）" : "主体描述";
+    const prompt = [`视觉风格：${project?.style || "电影写实"}`, `${role}名称：${subject.name}`, `${descriptionLabel}：${subject.description || "未设定"}`, `主体提示词：${subject.visualPrompt || "未设定"}`, roleRequirement].join("\n");
     setSubjectImageDraft({ prompt, model: imageSettings?.model || imageModelOptions[0], resolution: "2K", aspectRatio: (project?.aspectRatio as ImageAspectRatio | undefined) ?? "1:1", referenceName: "" });
     setImageDialogSubject(subject);
     if (!imageSettings) void api.imageSettings().then((next) => { setImageSettings(next); setSubjectImageDraft((current) => ({ ...current, model: next.model || current.model })); }).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
@@ -282,15 +327,18 @@ function App() {
   };
   const settingsDialog = settingsOpen && <SettingsDialog settings={settings} imageSettings={imageSettings} videoSettings={videoSettings} draft={apiKeyDraft} imageDraft={imageSettingsDraft} videoDraft={videoSettingsDraft} busy={settingsBusy} onDraftChange={setApiKeyDraft} onImageDraftChange={setImageSettingsDraft} onVideoDraftChange={setVideoSettingsDraft} onSave={() => void saveSettings()} onClose={() => setSettingsOpen(false)} />;
   const subjectImageDialog = <>{imageDialogSubject && <SubjectImageDialog subject={imageDialogSubject} draft={subjectImageDraft} configured={imageSettings?.configured} busy={generatingSubjectIds.includes(imageDialogSubject.id)} onDraftChange={setSubjectImageDraft} onReference={selectSubjectReference} onGenerate={() => void generateSubjectImage()} onConfigure={() => { setImageDialogSubject(null); openSettings(); }} onClose={() => { if (!generatingSubjectIds.includes(imageDialogSubject.id)) setImageDialogSubject(null); }} />}{subjectImagePreview && <SubjectImagePreviewDialog subject={subjectImagePreview} onClose={() => setSubjectImagePreview(null)} />}</>;
-  const videoDialog = videoDialogShot && <ShotVideoDialog shot={videoDialogShot} subjects={pipeline.subjects} videoModel={videoSettings?.model} busy={workingAction === "render"} onGenerate={(references, model, duration, options) => renderVideo(videoDialogShot, references, model, duration, options)} onClose={() => { if (workingAction !== "render") setVideoDialogShot(null); }} />;
-  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} history={renderJobs.filter((job) => job.shotId === videoPreview.shot.id && job.outputUrl).map((job) => ({ id: job.id, outputUrl: job.outputUrl!, createdAt: job.createdAt }))} onSave={(input) => saveShotEdits(videoPreview.shot, input)} onRegenerate={() => { setVideoPreview(null); setVideoDialogShot(videoPreview.shot); }} onClose={() => setVideoPreview(null)} />;
+  const previousVideoDialogShot = videoDialogShot ? pipeline.shots
+    .filter((shot) => shot.episodeNumber === videoDialogShot.episodeNumber && shot.shotOrder < videoDialogShot.shotOrder)
+    .sort((left, right) => right.shotOrder - left.shotOrder)[0] : undefined;
+  const videoDialog = videoDialogShot && <ShotVideoDialog key={videoDialogShot.id} shot={videoDialogShot} previousShot={previousVideoDialogShot} subjects={pipeline.subjects} videoModel={videoSettings?.model} initialPrompt={videoDialogInitialPrompt} busy={workingAction === "render"} onGenerate={(references, model, duration, options) => renderVideo(videoDialogShot, references, model, duration, options)} onClose={() => { if (workingAction !== "render") { setVideoDialogShot(null); setVideoDialogInitialPrompt(null); } }} />;
+  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} history={renderJobs.filter((job) => job.shotId === videoPreview.shot.id && job.outputUrl).map((job) => ({ id: job.id, outputUrl: job.outputUrl!, createdAt: job.createdAt, generationPrompt: job.generationPrompt }))} onSave={(input) => saveShotEdits(videoPreview.shot, input)} onRegenerate={(prompt) => { setVideoPreview(null); setVideoDialogInitialPrompt(prompt); setVideoDialogShot(videoPreview.shot); }} onClose={() => setVideoPreview(null)} />;
   const subjectDeleteDialog = deleteSubjectTarget && <DeleteSubjectDialog subject={deleteSubjectTarget} busy={workingAction === "deleteSubject"} onConfirm={confirmDeleteSubject} onClose={() => { if (workingAction !== "deleteSubject") setDeleteSubjectTarget(null); }} />;
 
   if (loading) return <div className="loading-screen"><LoaderCircle className="spin" size={24} /><span>正在载入工作区</span></div>;
   if (homeVisible) return <div className="app-shell home-shell"><header className="topbar home-topbar"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }}><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span><span className="brand-code">/ SCRIPT TO VIDEO</span></a><div className="home-topbar-title" aria-hidden="true" /> <div className="top-actions"><button className="text-button home-manager-button" onClick={openProjectManager}><FolderOpen size={15} />项目管理</button><span className="connection"><i />LOCAL WORKSPACE</span><button className="icon-button" aria-label="模型设置" onClick={openSettings}><Settings2 size={17} /></button><span className="avatar">M</span></div></header>{error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onBack={goHome} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} projectCount={dashboard?.stats.projectCount ?? 0} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}{newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}{existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}{deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={workingAction === "delete"} onConfirm={confirmDeleteProject} onClose={() => setDeleteTarget(null)} />}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}</div>;
   return <div className="app-shell project-shell">
     <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "新建项目"}</span><button className="icon-button" aria-label="模型设置" onClick={openSettings}><Settings2 size={17} /></button><span className="avatar">M</span></div></header>
-    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={renderVideo} onGenerateVideo={(shot) => setVideoDialogShot(shot)} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onBack={() => setStage("shots")} onRender={renderVideo} working={workingAction === "render"} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}
+    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}
   </div>;
 }
 
@@ -299,12 +347,39 @@ type SelectOption = { value: string; label: string };
 
 function HomeStage({ projects, projectCount, onNew, onManage, onOpen, onDelete }: { projects: Project[]; projectCount: number; onNew: () => void; onManage: () => void; onOpen: (project: Project, stage?: Stage) => void; onDelete: (project: Project) => void }) {
   const featured = projects[0];
-  return <main id="home" className="home-content"><section className="home-hero"><div className="hero-copy"><span className="panel-eyebrow">SCRIPT TO VIDEO / LOCAL AI WORKSPACE</span><h1>把剧本，变成<br /><em>可见的故事。</em></h1><p>从项目设定开始，经过剧本格式化、分集解析、主体生成和故事板，一条流水线完成视频创作准备。</p><div className="hero-actions"><button className="primary-button" onClick={onNew}>新建项目</button></div></div><div className="hero-showcase">{featured?.coverUrl ? <img src={featured.coverUrl} alt="" /> : <div className="showcase-placeholder"><Film size={42} /><span>YOUR NEXT FILM</span></div>}<div className="showcase-shade" /><div className="showcase-copy"><span>FEATURED PROJECT</span><strong>{featured?.title ?? "YOUR NEXT FILM"}</strong><small>{featured?.style ?? "从一份剧本开始"}</small></div><div className="showcase-index">01 <i /> 05</div></div></section><section className="home-section"><div className="home-section-head"><div><span className="panel-eyebrow">YOUR PROJECTS</span><h2>最近的项目</h2></div><div className="home-section-tools"><span className="project-count">{projectCount} 个项目</span><button className="text-button" onClick={onManage}><FolderOpen size={14} />项目管理</button></div></div>{projects.length ? <div className="home-project-grid">{projects.slice(0, 6).map((item) => <ProjectCard key={item.id} project={item} onOpen={onOpen} onDelete={onDelete} />)}</div> : <div className="home-empty"><Film size={26} /><p>还没有项目，从一份剧本开始。</p><button className="secondary-button" onClick={onNew}><Plus size={16} /> 新建第一个项目</button></div>}{projectCount > 6 && <button className="project-more-guide" onClick={onManage}><span><ListFilter size={16} /><strong>查看更多项目</strong><small>全部 {projectCount} 个项目可在项目管理中搜索和筛选</small></span><ArrowRight size={17} /></button>}</section><section className="home-pipeline"><div><span className="panel-eyebrow">PIPELINE</span><h2>一条清晰的创作路径</h2></div><div className="pipeline-cards">{stages.slice(0, 5).map((item, index) => { const Icon = item.icon; return <div className="pipeline-card" key={item.id}><span>0{index + 1}</span><Icon size={19} /><strong>{item.label}</strong><small>{item.description}</small></div>; })}</div></section></main>;
+  return <main id="home" className="home-content">
+    <section className="home-hero">
+      <div className="hero-copy"><span className="panel-eyebrow">SCRIPT TO VIDEO / LOCAL AI WORKSPACE</span><h1>把剧本，变成<br /><em>可见的故事。</em></h1><p>从项目设定开始，经过剧本格式化、分集解析、主体生成和故事板，一条流水线完成视频创作准备。</p><div className="hero-actions"><button className="primary-button" onClick={onNew}>新建项目</button></div></div>
+      <div className="hero-showcase">{featured?.coverUrl ? <img src={featured.coverUrl} alt="" /> : <div className="showcase-placeholder"><Film size={42} /><span>YOUR NEXT FILM</span></div>}<div className="showcase-shade" /><div className="showcase-copy"><span>FEATURED PROJECT</span><strong>{featured?.title ?? "YOUR NEXT FILM"}</strong><small>{featured?.style ?? "从一份剧本开始"}</small></div><div className="showcase-index">01 <i /> 05</div></div>
+    </section>
+    <section className="home-section">
+      <div className="home-section-head">
+        <div><span className="panel-eyebrow">YOUR PROJECTS</span><h2>最近的项目</h2></div>
+        <div className="home-section-tools">
+          <span className="project-count">{projectCount} 个项目</span>
+          <div className="home-section-actions">
+            <button className="text-button" onClick={onManage}><FolderOpen size={14} />项目管理</button>
+            {projectCount > 6 && <button className="text-button home-more-button" onClick={onManage}>查看更多...</button>}
+          </div>
+        </div>
+      </div>
+      {projects.length ? <div className="home-project-grid">{projects.slice(0, 6).map((item) => <ProjectCard key={item.id} project={item} onOpen={onOpen} onDelete={onDelete} />)}</div> : <div className="home-empty"><Film size={26} /><p>还没有项目，从一份剧本开始。</p><button className="secondary-button" onClick={onNew}><Plus size={16} /> 新建第一个项目</button></div>}
+    </section>
+    <section className="home-pipeline"><div><span className="panel-eyebrow">PIPELINE</span><h2>一条清晰的创作路径</h2></div><div className="pipeline-cards">{stages.slice(0, 5).map((item, index) => { const Icon = item.icon; return <div className="pipeline-card" key={item.id}><span>0{index + 1}</span><Icon size={19} /><strong>{item.label}</strong><small>{item.description}</small></div>; })}</div></section>
+  </main>;
 }
 
 function ProjectCard({ project, onOpen, onDelete }: { project: Project; onOpen: (project: Project, stage?: Stage) => void; onDelete: (project: Project) => void }) {
-  const truncateLogline = (text: string) => text.length > 100 ? `${text.slice(0, 100)}...` : text;
-  return <article className="home-project-card"><div className="home-project-cover">{project.coverUrl ? <img src={project.coverUrl} alt="" /> : <Film size={28} />}<span>{project.status === "completed" ? "已完成" : `${project.progress}% 进行中`}</span></div><div className="home-project-body"><div className="home-project-heading"><div><span className="project-genre">{project.genre}</span><strong>{project.title}</strong></div><button className="icon-button small-icon delete-project-button" aria-label={`删除项目 ${project.title}`} title="删除项目" onClick={() => onDelete(project)}><Trash2 size={15} /></button></div><p>{truncateLogline(project.logline || "尚未填写项目简介")}</p><div className="home-project-meta"><span>{project.style}</span><span>{project.aspectRatio}</span><span>{project.durationSeconds}s / 集</span></div><div className="home-project-actions"><button className="secondary-button" onClick={() => onOpen(project)}><FolderOpen size={15} /> 进入项目</button><button className="text-button" onClick={() => onOpen(project, "episodes")}><Layers3 size={15} /> 剧本解析</button></div></div></article>;
+  const truncateLogline = (text: string) => text.length > 72 ? `${text.slice(0, 72)}...` : text;
+  return <article className="home-project-card">
+    <button type="button" className="project-card-open" aria-label={`进入项目 ${project.title}`} onClick={() => onOpen(project)} />
+    <div className="home-project-cover">{project.coverUrl ? <img src={project.coverUrl} alt="" /> : <Film size={28} />}<span>{project.status === "completed" ? "已完成" : `${project.progress}% 进行中`}</span></div>
+    <div className="home-project-body">
+      <div className="home-project-heading"><div><span className="project-genre">{project.genre}</span><strong>{project.title}</strong></div><button className="icon-button small-icon delete-project-button" aria-label={`删除项目 ${project.title}`} title="删除项目" onClick={() => onDelete(project)}><Trash2 size={15} /></button></div>
+      <p>{truncateLogline(project.logline || "尚未填写项目简介")}</p>
+      <div className="home-project-meta"><span>{project.style}</span><span>{project.aspectRatio}</span><span>{project.durationSeconds}s / 集</span></div>
+    </div>
+  </article>;
 }
 
 function ProjectManagerStage({ projects, loading, onBack, onOpen, onDelete, onNew }: { projects: Project[]; loading: boolean; onBack: () => void; onOpen: (project: Project, stage?: Stage) => void; onDelete: (project: Project) => void; onNew: () => void }) {
@@ -325,7 +400,8 @@ function NewProjectDialog({ onHasScript, onNoScript, onClose }: { onHasScript: (
 
 function ExistingScriptSetupDialog({ draft, setDraft, busy, onConfirm, onClose }: { draft: ProjectDraft; setDraft: React.Dispatch<React.SetStateAction<ProjectDraft>>; busy: boolean; onConfirm: () => void; onClose: () => void }) {
   const change = (key: keyof ProjectDraft, value: string | number) => setDraft((current) => ({ ...current, [key]: value }));
-  return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog existing-script-dialog" role="dialog" aria-modal="true" aria-labelledby="existing-script-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">EXISTING SCRIPT</span><h2 id="existing-script-title">先设定项目参数</h2><p>这些参数会带入后续主体生图、分镜和视频生成。</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭项目参数"><X size={18} /></button></div><div className="existing-script-form"><label className="setup-field existing-script-title"><span>剧本名称</span><input value={draft.title} onChange={(event) => change("title", event.target.value)} placeholder="例如：午夜车站" /></label><div className="setup-field"><span>内容类型</span><SmoothSelect value={draft.genre} onChange={(value) => change("genre", value)} ariaLabel="内容类型" options={["悬疑", "剧情", "科幻", "都市情感", "奇幻", "短片"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>视觉风格</span><SmoothSelect value={draft.style} onChange={(value) => change("style", value)} ariaLabel="视觉风格" options={["电影写实", "赛博电影", "胶片写实", "日系动画", "国风水墨", "3D 渲染"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>画面比例</span><SmoothSelect value={draft.aspectRatio} onChange={(value) => change("aspectRatio", value)} ariaLabel="画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="setup-field"><span>每集目标时长</span><SmoothSelect value={String(draft.durationSeconds)} onChange={(value) => change("durationSeconds", Number(value))} ariaLabel="每集目标时长" options={targetDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div></div><div className="settings-actions existing-script-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" onClick={onConfirm} disabled={busy || !draft.title.trim()}>{busy ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}确定，进入剧本格式化</button></div></section></div>;
+  const loglineLength = draft.logline.trim().length;
+  return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog existing-script-dialog" role="dialog" aria-modal="true" aria-labelledby="existing-script-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">EXISTING SCRIPT</span><h2 id="existing-script-title">先设定项目参数</h2><p>这些参数会带入后续主体生图、分镜和视频生成。</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭项目参数"><X size={18} /></button></div><div className="existing-script-form"><label className="setup-field existing-script-title"><span>剧本名称</span><input value={draft.title} onChange={(event) => change("title", event.target.value)} placeholder="例如：午夜车站" /></label><label className="setup-field existing-script-logline"><span>一句话简介</span><div className="setup-logline-editor"><textarea value={draft.logline} maxLength={5000} onChange={(event) => change("logline", event.target.value)} placeholder="至少输入 50 个字，概括故事的核心冲突或人物目标" /><small className={`field-counter ${loglineLength >= MIN_LOGLINE_LENGTH ? "ready" : ""}`}>{loglineLength} / 5000（至少 50 字）</small></div></label><div className="setup-field"><span>内容类型</span><SmoothSelect value={draft.genre} onChange={(value) => change("genre", value)} ariaLabel="内容类型" options={["悬疑", "剧情", "科幻", "都市情感", "奇幻", "短片"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>视觉风格</span><SmoothSelect value={draft.style} onChange={(value) => change("style", value)} ariaLabel="视觉风格" options={["电影写实", "赛博电影", "胶片写实", "日系动画", "国风水墨", "3D 渲染"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>画面比例</span><SmoothSelect value={draft.aspectRatio} onChange={(value) => change("aspectRatio", value)} ariaLabel="画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="setup-field"><span>每集目标时长</span><SmoothSelect value={String(draft.durationSeconds)} onChange={(value) => change("durationSeconds", Number(value))} ariaLabel="每集目标时长" options={targetDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div></div><div className="settings-actions existing-script-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="primary-button" onClick={onConfirm} disabled={busy || !draft.title.trim() || loglineLength < MIN_LOGLINE_LENGTH}>{busy ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}确定，进入剧本格式化</button></div></section></div>;
 }
 
 function DeleteSubjectDialog({ subject, busy, onConfirm, onClose }: { subject: Subject; busy: boolean; onConfirm: () => void; onClose: () => void }) {
@@ -347,7 +423,8 @@ function SmoothSelect({ value, options, onChange, ariaLabel, disabled = false }:
 
 function SetupStage({ draft, setDraft, onNext, working, generate }: { draft: ProjectDraft; setDraft: React.Dispatch<React.SetStateAction<ProjectDraft>>; onNext: () => void; working: boolean; generate: boolean }) {
   const change = (key: keyof ProjectDraft, value: string | number) => setDraft((current) => ({ ...current, [key]: value }));
-  return <div className="stage-view setup-view"><StepHeader eyebrow="01 / PROJECT SETUP" title="先定义这个故事的边界" description="设定画面比例、类型和整体风格，后续格式化、主体生成与故事板都会以此为统一基准。" /><div className="setup-form"><label className="setup-title"><span>项目名称</span><input value={draft.title} onChange={(event) => change("title", event.target.value)} placeholder="例如：午夜车站" /></label><label className="setup-wide"><span>一句话简介</span><textarea value={draft.logline} maxLength={5000} onChange={(event) => change("logline", event.target.value)} placeholder="描述故事的核心冲突或人物目标" /><small className="field-counter">{draft.logline.length} / 5000</small></label><div className="setup-field setup-genre"><span>内容类型</span><SmoothSelect value={draft.genre} onChange={(value) => change("genre", value)} ariaLabel="内容类型" options={["悬疑", "剧情", "科幻", "都市情感", "奇幻", "短片"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>视觉风格</span><SmoothSelect value={draft.style} onChange={(value) => change("style", value)} ariaLabel="视觉风格" options={["电影写实", "赛博电影", "胶片写实", "日系动画", "国风水墨", "3D 渲染"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>画面比例</span><SmoothSelect value={draft.aspectRatio} onChange={(value) => change("aspectRatio", value)} ariaLabel="画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="setup-field"><span>每集目标时长（秒）</span><SmoothSelect value={String(draft.durationSeconds)} onChange={(value) => change("durationSeconds", Number(value))} ariaLabel="每集目标时长" options={targetDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div><label className="setup-episode-count"><span>目标集数</span><input type="number" min="1" max="100" value={draft.targetEpisodeCount} onChange={(event) => change("targetEpisodeCount", Math.min(100, Math.max(1, Number(event.target.value) || 3)))} /></label></div><div className="setup-spacer" /><div className="action-row setup-actions"><span className="action-hint"><Settings2 size={15} /> {generate ? "项目设定将传给模型，生成一份可继续格式化的剧本" : "项目设定完成后进入剧本格式化"}</span><button className="primary-button" onClick={onNext} disabled={working || !draft.title.trim()}>{working ? <LoaderCircle className="spin" size={17} /> : generate ? <WandSparkles size={17} /> : <Check size={17} />}{generate ? "开始生成剧本" : "保存设定，下一步"}{!generate && <ArrowRight size={16} />}</button></div></div>;
+  const loglineLength = draft.logline.trim().length;
+  return <div className="stage-view setup-view"><StepHeader eyebrow="01 / PROJECT SETUP" title="先定义这个故事的边界" description="设定画面比例、类型和整体风格，后续格式化、主体生成与故事板都会以此为统一基准。" /><div className="setup-form"><label className="setup-title"><span>项目名称</span><input value={draft.title} onChange={(event) => change("title", event.target.value)} placeholder="例如：午夜车站" /></label><label className="setup-wide"><span>一句话简介</span><div className="setup-logline-editor"><textarea value={draft.logline} maxLength={5000} onChange={(event) => change("logline", event.target.value)} placeholder="至少输入 50 个字，描述故事的核心冲突、人物目标和故事走向" /><small className={`field-counter ${loglineLength >= MIN_LOGLINE_LENGTH ? "ready" : ""}`}>{loglineLength} / 5000（至少 50 字）</small></div></label><div className="setup-field setup-genre"><span>内容类型</span><SmoothSelect value={draft.genre} onChange={(value) => change("genre", value)} ariaLabel="内容类型" options={["悬疑", "剧情", "科幻", "都市情感", "奇幻", "短片"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>视觉风格</span><SmoothSelect value={draft.style} onChange={(value) => change("style", value)} ariaLabel="视觉风格" options={["电影写实", "赛博电影", "胶片写实", "日系动画", "国风水墨", "3D 渲染"].map((value) => ({ value, label: value }))} /></div><div className="setup-field"><span>画面比例</span><SmoothSelect value={draft.aspectRatio} onChange={(value) => change("aspectRatio", value)} ariaLabel="画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="setup-field"><span>每集目标时长（秒）</span><SmoothSelect value={String(draft.durationSeconds)} onChange={(value) => change("durationSeconds", Number(value))} ariaLabel="每集目标时长" options={targetDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div><label className="setup-episode-count"><span>目标集数</span><input type="number" min="1" max="100" value={draft.targetEpisodeCount} onChange={(event) => change("targetEpisodeCount", Math.min(100, Math.max(1, Number(event.target.value) || 3)))} /></label></div><div className="setup-spacer" /><div className="action-row setup-actions"><span className="action-hint"><Settings2 size={15} /> {loglineLength < MIN_LOGLINE_LENGTH ? `一句话简介还需 ${MIN_LOGLINE_LENGTH - loglineLength} 个字` : generate ? "项目设定将传给模型，生成一份可继续格式化的剧本" : "项目设定完成后进入剧本格式化"}</span><button className="primary-button" onClick={onNext} disabled={working || !draft.title.trim() || loglineLength < MIN_LOGLINE_LENGTH}>{working ? <LoaderCircle className="spin" size={17} /> : generate ? <WandSparkles size={17} /> : <Check size={17} />}{generate ? "开始生成剧本" : "保存设定，下一步"}{!generate && <ArrowRight size={16} />}</button></div></div>;
 }
 
 function StepHeader({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: React.ReactNode }) { return <div className="step-header"><div><span className="panel-eyebrow">{eyebrow}</span><h2>{title}</h2><p>{description}</p></div>{action}</div>; }
@@ -401,7 +478,9 @@ function SubjectCard({ subject, generating, disabled, onGenerateImage, onDelete,
 function SubjectsStage({ subjects, onNext, working, generatingSubjectId, deletingSubjectId, onGenerateImage, onDeleteSubject, onViewImage }: { subjects: Subject[]; onNext: () => void; working: boolean; generatingSubjectId: string | string[] | null; deletingSubjectId: string | null; onGenerateImage: (subject: Subject) => void; onDeleteSubject: (subject: Subject) => void; onViewImage?: (subject: Subject) => void }) {
   const [page, setPage] = useState(1);
   const pageCount = Math.max(1, Math.ceil(subjects.length / SUBJECTS_PER_PAGE));
-  useEffect(() => setPage(1), [subjects]);
+  useEffect(() => {
+    setPage((current) => Math.min(current, pageCount));
+  }, [pageCount]);
   const visibleSubjects = subjects.slice((page - 1) * SUBJECTS_PER_PAGE, page * SUBJECTS_PER_PAGE);
   const activeGeneratingIds = Array.isArray(generatingSubjectId) ? generatingSubjectId : generatingSubjectId ? [generatingSubjectId] : [];
   const cardDisabled = Boolean(deletingSubjectId);
@@ -424,9 +503,10 @@ function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, 
   const renderVideoCell = (shot: Shot) => {
     const job = jobForShot(shot);
     const active = job?.status === "queued" || job?.status === "processing";
+    const failed = job?.status === "failed";
     const output = renderVideoResult(shot);
     if (output) return <span className="shot-video-cell">{output}</span>;
-    return <span className="shot-video-cell"><button className="shot-video-button" onClick={() => onGenerateVideo(shot)} disabled={active} aria-label={`生成第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title={active ? "视频生成中" : "生成视频"}>{active ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}</button>{active && <span className="shot-video-progress">{job?.status === "queued" ? "排队中" : `${job?.progress ?? 0}%`}</span>}</span>;
+    return <span className="shot-video-cell"><button className="shot-video-button" onClick={() => onGenerateVideo(shot)} disabled={active} aria-label={`生成第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title={active ? "视频生成中" : failed ? job.errorMessage || "上次生成失败，点击重试" : "生成视频"}>{active ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}</button>{active ? <span className="shot-video-progress">{job?.status === "queued" ? "生成中" : `${job?.progress ?? 0}%`}</span> : failed ? <span className="shot-video-progress failed">生成失败</span> : null}</span>;
   };
   return <div className="stage-view shots-view">
     <StepHeader eyebrow="05 / STORYBOARD" title="分镜清单" description="按集查看镜头、角色、物品和对白。确认后即可为单个镜头选择参考图并生成视频。" action={<div className="episode-tabs"><button className={selectedEpisode === 0 ? "selected" : ""} onClick={() => setSelectedEpisode(0)}>全部</button>{episodes.map((episode) => <button key={episode.id} className={selectedEpisode === episode.episodeNumber ? "selected" : ""} onClick={() => setSelectedEpisode(episode.episodeNumber)}>{formatEpisodeLabel(episode.episodeNumber)}</button>)}</div>} />
@@ -440,19 +520,21 @@ function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, 
       <span className="shot-duration">{shot.durationSeconds}s<i>{shot.camera}</i></span>
       {renderVideoCell(shot)}
     </article>)}</div>
-    <div className="action-row"><span className="action-hint"><ScanSearch size={15} /> {shots.length} 个镜头 · 预估 {formatDuration(shots.reduce((sum, shot) => sum + shot.durationSeconds, 0))}</span><button className="primary-button" onClick={onNext} disabled={working || !shots.length}>{working ? <LoaderCircle className="spin" size={17} /> : <Clapperboard size={17} />}全部生成视频 <ArrowRight size={16} /></button></div>
+    <div className="action-row"><span className="action-hint"><ScanSearch size={15} /> {shots.length} 个镜头 · 预估 {formatDuration(shots.reduce((sum, shot) => sum + shot.durationSeconds, 0))}</span><button className="primary-button" onClick={onNext} disabled={!shots.length}><Combine size={17} />视频合并</button></div>
   </div>;
 }
 
 type ShotEditInput = Pick<Shot, "location" | "action" | "visualPrompt">;
 
-function ShotVideoPreviewDialog({ shot, url, history, onSave, onRegenerate, onClose }: { shot: Shot; url: string; history: Array<{ id: string; outputUrl: string; createdAt: string }>; onSave: (input: ShotEditInput) => Promise<boolean>; onRegenerate: () => void; onClose: () => void }) {
+function ShotVideoPreviewDialog({ shot, url, history, onSave, onRegenerate, onClose }: { shot: Shot; url: string; history: Array<{ id: string; outputUrl: string; createdAt: string; generationPrompt: string | null }>; onSave: (input: ShotEditInput) => Promise<boolean>; onRegenerate: (prompt: string | null) => void; onClose: () => void }) {
   const [selectedUrl, setSelectedUrl] = useState(url);
   const [selectedCreatedAt, setSelectedCreatedAt] = useState(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString());
   const [duration, setDuration] = useState<number | null>(null);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [draft, setDraft] = useState<ShotEditInput>({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt });
+  const selectedGenerationPrompt = history.find((item) => item.outputUrl === selectedUrl)?.generationPrompt ?? null;
+  const selectedSubmittedPrompt = submittedVideoPrompt(selectedGenerationPrompt);
   useEffect(() => { setSelectedUrl(url); setSelectedCreatedAt(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString()); }, [history, url]);
   useEffect(() => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); }, [shot.location, shot.action, shot.visualPrompt]);
   const cancelEditing = () => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); setEditing(false); };
@@ -471,48 +553,162 @@ function ShotVideoPreviewDialog({ shot, url, history, onSave, onRegenerate, onCl
       <div className="shot-video-preview-head"><div><span className="panel-eyebrow">SHOT VIDEO</span><h2 id="shot-video-preview-title">{shot.title}</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")}</p></div><button className="icon-button" onClick={onClose} disabled={saving} aria-label="关闭视频预览"><X size={18} /></button></div>
       <div className="shot-video-meta"><span>生成时间 <b>{new Date(selectedCreatedAt).toLocaleString("zh-CN", { hour12: false })}</b></span><span>视频时长 <b>{duration ? formatDuration(Math.round(duration)) : `${shot.durationSeconds}s`}</b></span><span>镜头信息 <b>{shot.camera} · {shot.durationSeconds}s</b></span></div>
       <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>场景与动作</span>{!editing && <button type="button" onClick={() => setEditing(true)}><Pencil size={13} />编辑</button>}</div>{editing ? <div className="shot-video-edit-fields"><label><span>场景</span><input value={draft.location} maxLength={500} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, location: event.target.value }))} /></label><label><span>动作</span><textarea value={draft.action} maxLength={5000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, action: event.target.value }))} /></label></div> : <p>{shot.location} · {shot.action}</p>}</section>
-      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>提示词</span></div>{editing ? <textarea className="shot-video-prompt-editor" value={draft.visualPrompt} maxLength={12000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, visualPrompt: event.target.value }))} /> : <p>{shot.visualPrompt}</p>}</section>
-      <div className="shot-video-preview-actions">{editing ? <div className="shot-video-edit-actions"><button className="secondary-button" type="button" onClick={cancelEditing} disabled={saving}>取消</button><button className="primary-button" type="button" onClick={() => void saveEditing()} disabled={saving || !validDraft}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存修改</button></div> : <button className="secondary-button" type="button" onClick={onRegenerate}><RefreshCw size={15} /> 重新生成</button>}</div>
+      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>分镜画面提示词</span></div>{editing ? <textarea className="shot-video-prompt-editor" value={draft.visualPrompt} maxLength={12000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, visualPrompt: event.target.value }))} /> : <p>{shot.visualPrompt}</p>}</section>
+      {!editing && <section className="shot-video-detail"><div className="shot-video-detail-head"><span>本次视频实际生成提示词</span></div><p className={`shot-video-generation-prompt ${selectedSubmittedPrompt ? "" : "is-missing"}`}>{selectedSubmittedPrompt || "该历史视频生成时尚未记录提示词；重新生成后会在这里显示本次提交的内容。"}</p>{selectedGenerationPrompt && selectedSubmittedPrompt !== selectedGenerationPrompt.trim() && <details className="shot-video-full-prompt"><summary>查看模型收到的完整提示词</summary><p>{selectedGenerationPrompt}</p></details>}</section>}
+      <div className="shot-video-preview-actions">{editing ? <div className="shot-video-edit-actions"><button className="secondary-button" type="button" onClick={cancelEditing} disabled={saving}>取消</button><button className="primary-button" type="button" onClick={() => void saveEditing()} disabled={saving || !validDraft}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存修改</button></div> : <button className="secondary-button" type="button" onClick={() => onRegenerate(selectedSubmittedPrompt)}><RefreshCw size={15} /> 重新生成</button>}</div>
     </aside>
   </section></div>;
 }
 
-function ShotVideoDialog({ shot, subjects, videoModel, busy, onGenerate, onClose }: { shot: Shot; subjects: Subject[]; videoModel?: VideoSettings["model"]; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"], duration: number, options: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuity: boolean }) => void; onClose: () => void }) {
+function ShotVideoDialog({ shot, previousShot, subjects, videoModel, initialPrompt, busy, onGenerate, onClose }: { shot: Shot; previousShot?: Shot; subjects: Subject[]; videoModel?: VideoSettings["model"]; initialPrompt?: string | null; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"], duration: number, options: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => void; onClose: () => void }) {
   const referencedImageSubjects = subjectsMentionedInShot(shot, subjects).filter((subject) => Boolean(subject.imageUrl));
   const [selectedIds, setSelectedIds] = useState<string[]>(referencedImageSubjects.map((subject) => subject.id));
-  const [prompt, setPrompt] = useState(() => shotVideoPrompt(shot));
+  const [prompt, setPrompt] = useState(() => initialPrompt?.trim() || shotVideoPrompt(shot, previousShot));
   const [model, setModel] = useState<VideoSettings["model"]>(videoModel ?? videoModelOptions[0]);
   const [duration, setDuration] = useState(String(Math.min(12, Math.max(2, shot.durationSeconds))));
   const [resolution, setResolution] = useState("720p");
   const [audioMode, setAudioMode] = useState<VideoAudioMode>(dialogueWithoutNarration(shot.dialogue) ? "dialogue" : "ambient");
   const [speechRate, setSpeechRate] = useState<VideoSpeechRate>("natural");
   const [bgm, setBgm] = useState(false);
-  const [continuity, setContinuity] = useState(true);
+  const [continuityMode, setContinuityMode] = useState<VideoContinuityMode>("auto");
+  const contentRef = useRef<HTMLDivElement>(null);
+  const [continuityPreview, setContinuityPreview] = useState<ShotContinuityPreview | null>(previousShot ? null : { status: "first-shot", previousShotId: null, tailFrameUrl: null, message: "这是本集第一个镜头，无需承接上一镜头。" });
+  const [continuityPreviewLoading, setContinuityPreviewLoading] = useState(Boolean(previousShot));
+  useEffect(() => { contentRef.current?.scrollTo({ top: 0 }); }, []);
+  useEffect(() => {
+    if (!previousShot) return;
+    let active = true;
+    setContinuityPreviewLoading(true);
+    void api.shotContinuityPreview(shot.projectId, shot.id)
+      .then((result) => { if (active) setContinuityPreview(result); })
+      .catch((caught) => { if (active) setContinuityPreview({ status: "extract-failed", previousShotId: previousShot.id, tailFrameUrl: null, message: caught instanceof Error ? caught.message : "尾帧预览加载失败" }); })
+      .finally(() => { if (active) setContinuityPreviewLoading(false); });
+    return () => { active = false; };
+  }, [previousShot, shot.id, shot.projectId]);
   const toggleReference = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
   const selected = referencedImageSubjects.filter((subject) => selectedIds.includes(subject.id));
   return <div className="settings-backdrop video-generation-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog video-generation-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-title">
     <div className="settings-dialog-head"><div><span className="panel-eyebrow">VIDEO GENERATION</span><h2 id="shot-video-title">视频生成</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")} · {shot.title}</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭视频生成"><X size={18} /></button></div>
-    <div className="video-tabs"><button className="selected">参考生视频</button><button disabled>首尾帧视频</button></div>
-    <div className="video-generation-content">
+    <div className="video-generation-content" ref={contentRef}>
       <section className="video-generation-section"><span className="image-field-label">参考图 <small>仅显示当前镜头已引用的主体图片</small></span><div className="video-reference-grid">{referencedImageSubjects.map((subject) => <button type="button" key={subject.id} className={`video-reference-card ${selectedIds.includes(subject.id) ? "selected" : ""}`} onClick={() => toggleReference(subject.id)} disabled={busy}><img src={subject.imageUrl!} alt={subject.name} /><span>{subject.name}</span>{selectedIds.includes(subject.id) && <Check size={14} />}</button>)}{!referencedImageSubjects.length && <div className="video-reference-empty">当前镜头暂无已引用的主体图片。</div>}</div><small className="video-reference-count">已选择 {selected.length} 张参考图</small></section>
+      <section className="video-generation-section continuity-preview-section"><span className="image-field-label">上一镜头尾帧 <small>{previousShot ? `E${String(previousShot.episodeNumber).padStart(2, "0")} · ${String(previousShot.shotOrder).padStart(2, "0")} · ${previousShot.title}` : "本集首镜头"}</small></span><div className={`continuity-preview ${continuityPreview?.tailFrameUrl ? "has-frame" : ""}`}>{continuityPreviewLoading ? <><LoaderCircle className="spin" size={20} /><span>正在截取上一镜头稳定尾帧</span></> : continuityPreview?.tailFrameUrl ? <><img src={continuityPreview.tailFrameUrl} alt="上一镜头稳定尾帧" /><div><strong>此画面将用于动作续接</strong><small>{continuityPreview.message}</small></div></> : <><Film size={20} /><span>{continuityPreview?.message ?? "暂时无法读取上一镜头尾帧。"}</span></>}</div></section>
+      <section className="video-generation-section"><span className="image-field-label">镜头衔接</span><div className="video-tabs continuity-tabs" role="group" aria-label="镜头衔接方式">{([
+        ["auto", "智能"], ["continue", "动作续接"], ["cut", "直接切镜"], ["scene", "场景切换"],
+      ] as Array<[VideoContinuityMode, string]>).map(([value, label]) => <button type="button" key={value} className={continuityMode === value ? "selected" : ""} disabled={busy} onClick={() => setContinuityMode(value)}>{label}</button>)}</div></section>
       <label className="video-generation-section prompt-section"><span className="image-field-label">视频提示词 <b>*</b></span><textarea value={prompt} maxLength={16000} disabled={busy} onChange={(event) => setPrompt(event.target.value)} /><small className="prompt-count">{prompt.length} / 16000</small></label>
       <div className="image-control image-model-control"><span>模型</span><SmoothSelect value={model} options={videoModelOptions.map((value) => ({ value, label: videoModelLabels[value] }))} disabled={busy} ariaLabel="视频模型" onChange={(value) => setModel(value as VideoSettings["model"])} /></div>
       <div className="image-parameter-grid video-parameter-grid"><div className="image-control"><span>分辨率</span><SmoothSelect value={resolution} options={[{ value: "720p", label: "720p" }, { value: "1080p", label: "1080p" }]} disabled={busy} ariaLabel="视频分辨率" onChange={setResolution} /></div><label className="image-control video-duration-control"><span>时长 <small>2 - 12 秒</small></span><div className="video-duration-input"><input type="number" min={2} max={12} step={1} value={duration} disabled={busy} aria-label="自定义视频时长" onChange={(event) => setDuration(event.target.value.replace(/[^0-9]/g, ""))} /><b>秒</b></div></label></div>
       <div className="image-parameter-grid video-audio-grid"><div className="image-control"><span>声音内容</span><SmoothSelect value={audioMode} options={[{ value: "dialogue", label: "原文对白 / 内心 OS" }, { value: "ambient", label: "仅环境音" }, { value: "silent", label: "无声" }]} disabled={busy} ariaLabel="声音内容" onChange={(value) => setAudioMode(value as VideoAudioMode)} /></div><div className="image-control"><span>说话语速</span><SmoothSelect value={speechRate} options={[{ value: "natural", label: "自然" }, { value: "slow", label: "舒缓" }]} disabled={busy || audioMode !== "dialogue"} ariaLabel="说话语速" onChange={(value) => setSpeechRate(value as VideoSpeechRate)} /></div></div>
-      <div className="video-toggle-grid"><button type="button" className={`video-toggle ${bgm ? "on" : ""}`} onClick={() => setBgm((current) => !current)} disabled={audioMode === "silent"}><span>背景音乐</span><i /></button><button type="button" className={`video-toggle ${continuity ? "on" : ""}`} onClick={() => setContinuity((current) => !current)}><span>承接上一镜头</span><i /></button></div>
-      <p className="video-generation-note">对白只使用上方列出的原文台词，不会把场景说明改成旁白。连续性通过上一镜头状态和相同主体参考图进行约束。</p>
+      <div className="video-toggle-grid single"><button type="button" className={`video-toggle ${bgm ? "on" : ""}`} onClick={() => setBgm((current) => !current)} disabled={audioMode === "silent"}><span>背景音乐</span><i /></button></div>
+      <p className="video-generation-note">智能模式会在同机位动作续接时使用上一段稳定尾帧；换机位直接切镜，换地点直接进入新场景。</p>
     </div>
-    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model, Math.min(12, Math.max(2, Number(duration) || 10)), { prompt: prompt.trim(), audioMode, speechRate, bgm: audioMode !== "silent" && bgm, continuity })} disabled={busy || !prompt.trim() || Number(duration) < 2 || Number(duration) > 12}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "正在提交" : "创作视频"}</button>
+    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model, Math.min(12, Math.max(2, Number(duration) || 10)), { prompt: prompt.trim(), audioMode, speechRate, bgm: audioMode !== "silent" && bgm, continuityMode })} disabled={busy || !prompt.trim() || Number(duration) < 2 || Number(duration) > 12}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "视频生成中" : "创作视频"}</button>
   </section></div>;
 }
-function RenderStage({ project, shots, jobs, onBack, onRender, working }: { project: Project | null; shots: Shot[]; jobs: RenderJob[]; onBack: () => void; onRender: () => void; working: boolean }) {
-  const active = jobs.find((job) => job.projectId === project?.id && (job.status === "queued" || job.status === "processing"));
-  const [ratio, setRatio] = useState(project?.aspectRatio ?? "16:9");
-  const [style, setStyle] = useState(project?.style ?? "电影写实");
-  const [audio, setAudio] = useState("保留对白");
-  return <div className="stage-view render-view"><StepHeader eyebrow="06 / VIDEO OUTPUT" title="生成视频" description="镜头已准备好。选择输出规格，提交后会进入方舟异步渲染队列。" action={<span className="engine-tag"><i /> VIDEO ENGINE · ARK ASYNC</span>} /><div className="render-preview"><div className="preview-art"><div className="preview-grid" /><span className="preview-play"><Play size={20} fill="currentColor" /></span><div className="preview-caption"><span>READY TO RENDER</span><strong>{project?.title}</strong></div></div><div className="render-settings"><div className="settings-heading"><Settings2 size={16} /> 输出设置</div><label>画面比例<SmoothSelect value={ratio} onChange={setRatio} ariaLabel="输出画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></label><label>视频风格<SmoothSelect value={style} onChange={setStyle} ariaLabel="输出视频风格" options={["电影写实", "赛博电影", "日系动画", "国风水墨"].map((value) => ({ value, label: value }))} /></label><label>音频策略<SmoothSelect value={audio} onChange={setAudio} ariaLabel="音频策略" options={["保留对白", "自动配音", "暂不生成音频"].map((value) => ({ value, label: value }))} /></label><div className="render-summary"><span>镜头数量 <b>{shots.length}</b></span><span>预计时长 <b>{formatDuration(shots.reduce((sum, shot) => sum + shot.durationSeconds, 0))}</b></span></div></div></div>{active && <div className="active-job"><span className="job-spinner"><LoaderCircle className="spin" size={17} /></span><div><strong>正在处理：{active.projectTitle}</strong><p>视频合成中，当前进度 {active.progress}%</p></div><b>{active.progress}%</b><i><span style={{ width: `${active.progress}%` }} /></i></div>}<div className="action-row"><button className="secondary-button" onClick={onBack}><ArrowLeft size={16} /> 返回分镜</button><button className="primary-button" onClick={onRender} disabled={working || Boolean(active?.status === "processing")}>{working ? <LoaderCircle className="spin" size={17} /> : <Clapperboard size={17} />}提交渲染任务 <ArrowRight size={16} /></button></div></div>;
+function RenderStage({ project, shots, jobs, onCoverCreated, onBack }: { project: Project | null; shots: Shot[]; jobs: RenderJob[]; onCoverCreated: (coverUrl: string) => void; onBack: () => void }) {
+  const orderedShots = useMemo(() => [...shots].sort((left, right) => left.episodeNumber - right.episodeNumber || left.shotOrder - right.shotOrder), [shots]);
+  const latestVideoByShot = useMemo(() => {
+    const result = new Map<string, RenderJob>();
+    jobs
+      .filter((job) => job.projectId === project?.id && job.shotId && job.status === "completed" && job.outputUrl)
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .forEach((job) => { if (job.shotId && !result.has(job.shotId)) result.set(job.shotId, job); });
+    return result;
+  }, [jobs, project?.id]);
+  const availableShotIds = useMemo(() => orderedShots.filter((shot) => latestVideoByShot.has(shot.id)).map((shot) => shot.id), [latestVideoByShot, orderedShots]);
+  const availableShots = useMemo(() => orderedShots.filter((shot) => latestVideoByShot.has(shot.id)), [latestVideoByShot, orderedShots]);
+  const availableSignature = availableShotIds.join("|");
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [merges, setMerges] = useState<VideoMerge[]>([]);
+  const [selectedMergeId, setSelectedMergeId] = useState<string | null>(null);
+  const [loadingMerges, setLoadingMerges] = useState(true);
+  const [merging, setMerging] = useState(false);
+  const [mergeError, setMergeError] = useState("");
+  const knownAvailableIds = useRef<Set<string>>(new Set());
+
+  useEffect(() => {
+    const available = new Set(availableShotIds);
+    setSelectedIds((current) => {
+      const kept = current.filter((id) => available.has(id));
+      const added = availableShotIds.filter((id) => !knownAvailableIds.current.has(id));
+      return [...new Set([...kept, ...added])];
+    });
+    knownAvailableIds.current = available;
+  }, [availableSignature]);
+
+  useEffect(() => {
+    let mounted = true;
+    setLoadingMerges(true);
+    setMergeError("");
+    if (!project) {
+      setMerges([]);
+      setLoadingMerges(false);
+      return () => { mounted = false; };
+    }
+    void api.videoMerges(project.id)
+      .then((records) => { if (mounted) { setMerges(records); setSelectedMergeId((current) => records.some((item) => item.id === current) ? current : records[0]?.id ?? null); if (records[0]?.coverUrl) onCoverCreated(records[0].coverUrl); } })
+      .catch((caught) => { if (mounted) setMergeError(caught instanceof Error ? caught.message : "合成记录读取失败"); })
+      .finally(() => { if (mounted) setLoadingMerges(false); });
+    return () => { mounted = false; };
+  }, [project?.id]);
+
+  const selectedSet = new Set(selectedIds);
+  const selectedShots = orderedShots.filter((shot) => selectedSet.has(shot.id) && latestVideoByShot.has(shot.id));
+  const selectedDuration = selectedShots.reduce((sum, shot) => sum + shot.durationSeconds, 0);
+  const selectedMerge = merges.find((item) => item.id === selectedMergeId) ?? merges[0] ?? null;
+  const allSelected = availableShotIds.length > 0 && availableShotIds.every((id) => selectedSet.has(id));
+  const toggleShot = (shotId: string) => setSelectedIds((current) => current.includes(shotId) ? current.filter((id) => id !== shotId) : [...current, shotId]);
+  const toggleAll = () => setSelectedIds(allSelected ? [] : availableShotIds);
+  const mergeSelected = async () => {
+    if (!project || selectedShots.length < 2 || merging) return;
+    setMerging(true);
+    setMergeError("");
+    try {
+      const result = await api.mergeVideos(project.id, selectedShots.map((shot) => shot.id));
+      setMerges((current) => [result, ...current.filter((item) => item.id !== result.id)]);
+      setSelectedMergeId(result.id);
+      if (result.coverUrl) onCoverCreated(result.coverUrl);
+    } catch (caught) {
+      setMergeError(caught instanceof Error ? caught.message : "视频合并失败");
+    } finally {
+      setMerging(false);
+    }
+  };
+
+  return <div className="stage-view render-view">
+    <StepHeader eyebrow="06 / VIDEO MERGE" title="视频合成" description="勾选已经生成完成的镜头，系统会按故事板顺序合并为一个视频。" action={<span className="engine-tag"><i /> LOCAL VIDEO MERGE</span>} />
+    <div className="render-preview">
+      <section className="merge-preview" aria-label="合成视频预览">
+        {selectedMerge ? <video key={selectedMerge.id} src={selectedMerge.outputUrl} poster={selectedMerge.coverUrl || project?.coverUrl || undefined} controls preload="metadata" /> : <div className="merge-preview-empty">{loadingMerges ? <LoaderCircle className="spin" size={24} /> : <Combine size={28} />}<strong>{loadingMerges ? "正在读取合成结果" : "还没有合成视频"}</strong><span>{loadingMerges ? "请稍候" : "从右侧选择至少两个已有视频的镜头开始合并"}</span></div>}
+        <div className="merge-preview-bar"><div><span>{selectedMerge ? "MERGED VIDEO" : "VIDEO PREVIEW"}</span><strong>{project?.title ?? "未命名项目"}</strong>{selectedMerge && <small>{selectedMerge.shotIds.length} 个镜头 · {formatDuration(selectedMerge.durationSeconds)} · {new Date(selectedMerge.createdAt).toLocaleString("zh-CN", { hour12: false })}</small>}</div>{selectedMerge && <a className="secondary-button merge-download" href={selectedMerge.outputUrl} download={`${project?.title || "合成视频"}.mp4`}><Download size={16} />导出视频</a>}</div>
+        {!!merges.length && <div className="merge-history"><div className="merge-history-head"><strong>合并历史</strong><span>{merges.length} 个版本</span></div><div className="merge-history-list">{merges.map((merge, index) => <button type="button" key={merge.id} className={`merge-history-item ${merge.id === selectedMerge?.id ? "selected" : ""}`} onClick={() => setSelectedMergeId(merge.id)}><span className="merge-history-thumb">{merge.coverUrl ? <img src={merge.coverUrl} alt="" /> : <Film size={17} />}</span><span><strong>版本 {String(merges.length - index).padStart(2, "0")}</strong><small>{merge.shotIds.length} 个镜头 · {formatDuration(merge.durationSeconds)}</small><time>{new Date(merge.createdAt).toLocaleString("zh-CN", { hour12: false })}</time></span></button>)}</div></div>}
+      </section>
+      <aside className="render-settings merge-shot-panel">
+        <div className="settings-heading"><ListChecks size={16} /> 视频镜头选择</div>
+        <div className="merge-select-toolbar"><span>已生成 {availableShots.length} 个镜头</span><button type="button" className="text-button" onClick={toggleAll} disabled={!availableShotIds.length}>{allSelected ? "取消全选" : "全选"}</button></div>
+        <div className="merge-shot-list">
+          {availableShots.map((shot) => {
+            const videoJob = latestVideoByShot.get(shot.id)!;
+            const selected = selectedSet.has(shot.id);
+            return <label key={shot.id} className={`merge-shot-item ${selected ? "selected" : ""}`}>
+              <input type="checkbox" checked={selected} disabled={merging} onChange={() => toggleShot(shot.id)} />
+              <span className="merge-shot-check">{selected && <Check size={12} />}</span>
+              <span className="merge-shot-thumb"><video src={videoJob.outputUrl!} muted preload="metadata" /></span>
+              <span className="merge-shot-copy"><strong>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")} {shot.title}</strong><small>{formatDuration(shot.durationSeconds)} · 已生成</small></span>
+            </label>;
+          })}
+          {!availableShots.length && <div className="merge-list-empty">还没有生成完成的视频镜头。</div>}
+        </div>
+        <div className="render-summary"><span>已选镜头 <b>{selectedShots.length}</b></span><span>合计时长 <b>{formatDuration(selectedDuration)}</b></span></div>
+        {mergeError && <div className="merge-error">{mergeError}</div>}
+        <button className="primary-button merge-submit" onClick={() => void mergeSelected()} disabled={selectedShots.length < 2 || merging}>{merging ? <LoaderCircle className="spin" size={17} /> : <Combine size={17} />}{merging ? "正在合并视频" : "合并所选镜头"}</button>
+        <button className="secondary-button merge-back" onClick={onBack} disabled={merging}><ArrowLeft size={17} />返回分镜</button>
+      </aside>
+    </div>
+    <p className="merge-footer-note">合并只使用已生成的视频，不会再次消耗生成额度。</p>
+  </div>;
 }
-function Inspector({ stage, project, pipeline }: { stage: Stage; project: Project | null; pipeline: PipelineData }) { const labels: Record<Stage, string> = { setup: "项目设定", format: "格式化结果", episodes: "剧本解析", subjects: "主体结果", shots: "故事板结果", render: "输出结果" }; return <aside className="inspector"><div className="inspector-head"><span>当前产物</span><button className="icon-button"><MoreHorizontal size={17} /></button></div><div className="inspector-title"><span className="inspector-icon"><Sparkles size={16} /></span><div><strong>{labels[stage]}</strong><small>{project?.title ?? "尚未创建项目"}</small></div></div><div className="inspector-stats"><div><span>进度</span><b>{project?.progress ?? 0}%</b></div><div><span>分集</span><b>{pipeline.episodes.length || "—"}</b></div><div><span>镜头</span><b>{pipeline.shots.length || "—"}</b></div></div><div className="inspector-section"><span className="section-label">流水线状态</span>{stages.slice(1).map((item) => { const ready = item.id === "format" ? Boolean(pipeline.document) : item.id === "episodes" ? pipeline.episodes.length > 0 : item.id === "subjects" ? pipeline.subjects.length > 0 : item.id === "shots" || item.id === "render" ? pipeline.shots.length > 0 : false; return <div className="status-line" key={item.id}><span className={ready ? "status-check ready" : "status-check"}>{ready && <Check size={11} />}</span><span>{item.label}</span><small>{ready ? "已完成" : "待处理"}</small></div>; })}</div><div className="inspector-tip"><Sparkles size={15} /><p>分集、主体和分镜会调用 DeepSeek v4 Flash；未配置 Key 时会阻止模型步骤，不生成示例结果。</p></div></aside>; }
+function Inspector({ stage, project, pipeline }: { stage: Stage; project: Project | null; pipeline: PipelineData }) { const labels: Record<Stage, string> = { setup: "项目设定", format: "格式化结果", episodes: "剧本解析", subjects: "主体结果", shots: "故事板结果", render: "合成结果" }; return <aside className="inspector"><div className="inspector-head"><span>当前产物</span><button className="icon-button"><MoreHorizontal size={17} /></button></div><div className="inspector-title"><span className="inspector-icon"><Sparkles size={16} /></span><div><strong>{labels[stage]}</strong><small>{project?.title ?? "尚未创建项目"}</small></div></div><div className="inspector-stats"><div><span>进度</span><b>{project?.progress ?? 0}%</b></div><div><span>分集</span><b>{pipeline.episodes.length || "—"}</b></div><div><span>镜头</span><b>{pipeline.shots.length || "—"}</b></div></div><div className="inspector-section"><span className="section-label">流水线状态</span>{stages.slice(1).map((item) => { const ready = item.id === "format" ? Boolean(pipeline.document) : item.id === "episodes" ? pipeline.episodes.length > 0 : item.id === "subjects" ? pipeline.subjects.length > 0 : item.id === "shots" || item.id === "render" ? pipeline.shots.length > 0 : false; return <div className="status-line" key={item.id}><span className={ready ? "status-check ready" : "status-check"}>{ready && <Check size={11} />}</span><span>{item.label}</span><small>{ready ? "已完成" : "待处理"}</small></div>; })}</div><div className="inspector-tip"><Sparkles size={15} /><p>分集、主体和分镜会调用 DeepSeek v4 Flash；未配置 Key 时会阻止模型步骤，不生成示例结果。</p></div></aside>; }
 
 function SubjectImagePreviewDialog({ subject, onClose }: { subject: Subject; onClose: () => void }) {
   return <div className="settings-backdrop subject-image-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-dialog subject-image-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="subject-image-preview-title">

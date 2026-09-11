@@ -151,30 +151,57 @@ export class VideoGenerationService {
     return payload;
   }
 
-  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; ratio: string; duration: number; generateAudio?: boolean; watermark?: boolean }) {
+  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; firstFrameUrl?: string; ratio: string; duration: number; generateAudio?: boolean; watermark?: boolean }) {
     const referenceItems = (input.referenceImageUrls ?? []).filter(Boolean).map((url) => ({ type: "image_url", image_url: { url }, role: "reference_image" }));
-    const body = (withReferences: boolean) => JSON.stringify({
+    const firstFrameItem = input.firstFrameUrl ? { type: "image_url", image_url: { url: input.firstFrameUrl }, role: "first_frame" } : undefined;
+    const body = (withReferences: boolean, withFirstFrame: boolean) => JSON.stringify({
       model: input.model ?? runtimeModel,
-      content: [{ type: "text", text: input.prompt }, ...(withReferences ? referenceItems : [])],
+      content: [
+        { type: "text", text: input.prompt },
+        ...(withFirstFrame && firstFrameItem ? [firstFrameItem] : []),
+        ...(withReferences ? referenceItems : []),
+      ],
       generate_audio: input.generateAudio ?? true,
       ratio: input.ratio,
       duration: Math.max(2, Math.min(12, Math.round(input.duration))),
       watermark: input.watermark ?? false,
     });
-    let referenceFallback = false;
+    // Seedance rejects first/last-frame media mixed with reference media. A real
+    // first frame is the stronger continuity constraint, so it takes priority.
+    let referenceFallback = Boolean(firstFrameItem && referenceItems.length);
+    let continuityFrameFallback = false;
     let payload: Record<string, unknown>;
     try {
-      payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(true) });
+      payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(!firstFrameItem, true) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      if (!referenceItems.length || !/(real person|真人|真实人物|may contain real)/i.test(message)) throw error;
-      referenceFallback = true;
-      payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(false) });
+      if (!/(real person|真人|真实人物|may contain real)/i.test(message)) throw error;
+      if (firstFrameItem) {
+        continuityFrameFallback = true;
+        if (!referenceItems.length) {
+          payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(false, false) });
+        } else {
+          referenceFallback = false;
+          try {
+            payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(true, false) });
+          } catch (retryError) {
+            const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+            if (!/(real person|真人|真实人物|may contain real)/i.test(retryMessage)) throw retryError;
+            referenceFallback = true;
+            payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(false, false) });
+          }
+        }
+      } else if (referenceItems.length) {
+        referenceFallback = true;
+        payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(false, false) });
+      } else {
+        throw error;
+      }
     }
     const taskId = findTaskId(payload);
     if (!taskId) throw new Error("视频平台没有返回任务 ID");
     const status = findStatus(payload);
-    return { taskId, status, progress: findProgress(payload, status), videoUrl: findVideoUrl(payload), referenceFallback };
+    return { taskId, status, progress: findProgress(payload, status), videoUrl: findVideoUrl(payload), referenceFallback, continuityFrameFallback };
   }
 
   async getTask(taskId: string) {

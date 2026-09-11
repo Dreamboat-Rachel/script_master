@@ -246,8 +246,13 @@ export class DeepSeekService {
 4. 每个阶段只描述该阶段的年龄、身形、面容、发型、肤色、服装、固定道具和其他稳定识别特征。若某特征未设定，写“未设定”。不得把其他年龄阶段的信息带进来。
 5. 地点和道具也要按视觉上确实不同的版本拆分；仅仅在不同场次出现、但外观没有变化的主体不要重复创建。
 
-visualPrompt 是“主体设定提示词”，只用于生成该主体的独立设定图：描述主体本身的外观、材质、固定特征、服装或空间结构。禁止写具体镜头、景别、机位、构图、运镜、正在发生的动作、对白、光线氛围、其他阶段和其他主体；禁止把一段剧情改写成画面描述。必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。
-      返回前自检：如果一个人物的 description 或 visualPrompt 中出现了两个年龄/阶段，必须拆成多个对象；每个阶段对象的 name 必须唯一。`,
+visualPrompt 是“主体设定提示词”，只用于生成该主体的完整、独立设定图，不能把一段剧情改写成某个镜头。所有主体都必须只根据剧本事实，未知信息明确写“未设定”，不得臆造年龄、肤色或品牌。禁止写具体镜头、景别、机位、构图、运镜、正在发生的动作、对白、剧情瞬间、其他阶段和其他主体。
+
+主体类型的额外规则，必须严格执行：
+1. role=location（场景）：生成完整的、无人占用的空场景设定。必须描述可拍摄且合理的空间布局、房间边界、墙面/地面/天花板、门窗和出入口、固定家具与设备、主要动线、各物件的相对位置、尺度关系和固定光源安装位置；同一场景在不同镜头中要能按这些方位复原。禁止出现人物、动物、手、人体、群演、正在发生的动作、对白、剧情道具特写或把多个房间不可能地拼在一起；除非剧本明确要求，不要加入与场景无关的装饰。
+2. role=prop（道具）：生成完整的单体物品设定。必须描述物品整体外形、正反侧结构、比例、材质、颜色、纹理、接口/开合部件和可识别细节，确保物品能在镜头中被准确复现。禁止出现人物、手、人体、场景、桌面、正在使用它的动作或其他道具；不要只描述屏幕、局部或一个使用瞬间。
+3. role=character（角色）：只描述该阶段单一人物的完整外观、服装、发型、体态和固定识别特征，不要混入其他年龄阶段、场景或动作。
+返回前自检：场景 visualPrompt 中不得出现人物或“某人正在……”等动态内容；道具 visualPrompt 中不得出现人物、手或使用场景；房屋/室内场景必须能画出完整平面关系而不是杂乱物件堆叠；如果一个人物的 description 或 visualPrompt 中出现了两个年龄/阶段，必须拆成多个对象；每个阶段对象的 name 必须唯一。`,
       JSON.stringify({ style, formattedScreenplay: formattedText }),
       {
         timeoutMs: 300000,
@@ -269,7 +274,14 @@ visualPrompt 是“主体设定提示词”，只用于生成该主体的独立�
       const key = `${role}:${name}`;
       if (seen.has(key)) return [];
       seen.add(key);
-      return [{ name, role, description: text(row.description, "未设定"), visualPrompt: text(row.visualPrompt, `${style}，${name}`) }];
+      const description = text(row.description, "未设定");
+      const generatedPrompt = text(row.visualPrompt, `${style}，${name}`);
+      const promptGuard = role === "location"
+        ? "主体图要求：完整、空置、无人场景设定图；只呈现建筑/空间本身，不出现人物、动物、手、人体或剧情动作。明确墙面、地面、天花板、门窗、出入口、固定家具设备、空间边界、相对位置、尺度和合理动线；布局必须符合真实建筑逻辑，禁止房间拼接、物件漂浮、穿模、悬空家具和无法到达的出入口。"
+        : role === "prop"
+          ? "主体图要求：完整单体道具设定图；只呈现该物品本身，不出现人物、手、人体、桌面、房间或其他道具。展示完整外形、正反侧结构、比例、材质、颜色、纹理、接口和开合部件，禁止只截取局部或描绘使用中的瞬间。"
+          : "主体图要求：单一阶段、单一人物的完整角色设定图；不出现其他人物、其他年龄阶段、剧情动作或场景。";
+      return [{ name, role, description, visualPrompt: `${generatedPrompt}\n${promptGuard}` }];
     });
   }
 
@@ -282,11 +294,18 @@ visualPrompt 是“主体设定提示词”，只用于生成该主体的独立�
 2. 禁止把场景说明、动作、背景介绍、人物心理推测改写成旁白、解说、画外音或新增台词。原文没有对白或 OS 时，dialogue 必须为空字符串。
 3. 不要为了填满镜头时长增加台词。较长原文对白应按自然语义拆到连续镜头中，每个镜头的台词量必须能以自然或舒缓语速在 durationSeconds 内说完。
 
-连续性规则：
-1. visualPrompt 要包含主体、环境、光线、情绪、本镜头开场状态和结束状态；相邻镜头的“结束状态 → 开场状态”必须能直接衔接。
-2. 同一场景的相邻镜头必须保持人物外观与服装、道具、空间方位、光线、天气、色调和运动方向一致，除非原文明确发生变化。
-3. camera 写清景别、机位和运镜，避免相邻镜头无理由跳轴。
-4. 不得臆造剧本没有的剧情、对白或心理活动。
+连续性规则（这是分镜提示词的硬约束，不是可选建议）：
+1. 必须按每集 shotOrder 从前到后规划镜头。除每集第一个镜头外，每个 visualPrompt 都必须明确写出“承接上一镜头结束状态”：上一镜头最后一帧的人物姿势、位置、视线、服装、道具位置、空间方位、光线、色调、运动方向和动作进度；然后写“本镜头首帧”：从这些状态原地开始的当前构图；最后写“本镜头发展”：只在连续时间中完成当前动作和结束状态。不得把后续镜头写成重新入场或独立重启。
+2. visualPrompt 要包含主体、环境、光线、情绪、本镜头开场状态和结束状态；相邻镜头的“结束状态 → 开场状态”必须能直接衔接。每个镜头都要有明确的结束状态，供下一个镜头继承。
+3. 同一场景的相邻镜头必须保持人物外观与服装、道具、空间方位、光线、天气、色调和运动方向一致，除非原文明确发生变化。
+4. camera 写清景别、机位和运镜，避免相邻镜头无理由跳轴；若必须换景别或机位，要把变化放在剪辑点并保持人物/道具/视线/光线的空间连续，不要在镜头内部旋转、变形或无理由转景。
+5. 不得臆造剧本没有的剧情、对白或心理活动。
+6. 相邻镜头更换景别或机位时，默认在剪辑点直接切镜；每个镜头的第一帧就是本镜头目标构图，但该第一帧必须继承上一镜头结束时的主体状态，禁止把从上一构图移动、旋转或变形成当前构图的过程写进 visualPrompt。
+7. 只有同一场景、同一机位下的连续动作才可直接使用上一镜头尾帧；如果更换时间或地点，剪辑点发生在视频开始前，第一帧直接进入新场景，但仍继承可见人物外观、服装、道具、色彩和叙事动作进度，不要默认添加淡入淡出、叠化、甩镜或遮挡转场。
+8. 以第一镜头建立整部影片的基础色彩方案。后续镜头默认继承同一色温、白平衡、明暗关系、曝光倾向、饱和度和统一调色风格；即使切到普通新地点，也不能无理由在暖色调与冷色调之间跳变。
+9. 只有原文明确发生时间、天气变化，进入本身具有特殊光色的地点，或明确出现闪回、梦境等视觉动机时，才允许改变基础色彩方案；变化后的连续镜头必须稳定继承新的色彩基线，直至原文再次明确变化。
+10. 每个 visualPrompt 都必须重复写明该镜头所继承的色温、主光方向、曝光或明暗关系、饱和度以及统一调色关键词。同一连续场景必须复用一致措辞，禁止在相邻镜头中无依据地交替使用“暖色调”“冷色调”等冲突描述。
+11. 生成前自检每集相邻镜头：如果当前镜头开场状态无法从上一镜头结束状态自然推出，必须先修改当前镜头的 action、camera 和 visualPrompt，再输出 JSON；不能仅依赖剪辑或后期弥补不连续。
 
 如果主体资产中同一人物存在“原名-少儿”“原名-少年”“原名-青年”等阶段版本，必须根据该镜头所属集数和剧本中的年龄阶段选择唯一正确的版本，并在 visualPrompt 中逐字写出该主体资产的完整名称；禁止同时引用同一人物的其他阶段版本。`,
       JSON.stringify({
@@ -301,13 +320,29 @@ visualPrompt 是“主体设定提示词”，只用于生成该主体的独立�
     if (!shots.length) throw new Error("DeepSeek 没有返回分镜结果");
     const episodeIds = new Map(episodes.map((episode) => [episode.episodeNumber, episode.id]));
     const nextOrder = new Map<number, number>();
-    return shots.map((item, index) => {
+    const normalized = shots.map((item, index) => {
       const row = item as JsonObject;
       const requestedEpisode = Math.round(number(row.episodeNumber, 1));
       const episodeNumber = episodeIds.has(requestedEpisode) ? requestedEpisode : episodes[Math.min(index, episodes.length - 1)].episodeNumber;
       const shotOrder = (nextOrder.get(episodeNumber) ?? 0) + 1;
       nextOrder.set(episodeNumber, shotOrder);
       return { episodeId: episodeIds.get(episodeNumber)!, episodeNumber, shotOrder, title: text(row.title, `镜头 ${index + 1}`), location: text(row.location, "未设定"), action: text(row.action, "未设定"), dialogue: text(row.dialogue), visualPrompt: text(row.visualPrompt, `${style}，${text(row.action, "场景")}`), camera: text(row.camera, "中景"), durationSeconds: Math.min(30, Math.max(2, Math.round(number(row.durationSeconds, 6)))), status: "ready" as const };
+    });
+    return normalized.map((shot, index) => {
+      const previousShot = normalized
+        .slice(0, index)
+        .filter((candidate) => candidate.episodeNumber === shot.episodeNumber)
+        .at(-1);
+      const previousPromptTail = previousShot?.visualPrompt.trim().slice(-1200);
+      const continuityAnchor = previousShot
+        ? [
+          "连续性锚点（必须执行，不是独立镜头）：",
+          `上一镜头《${previousShot.title}》结束于：${previousShot.location}；结束动作：${previousShot.action}；摄影机：${previousShot.camera}。`,
+          previousPromptTail ? `上一镜头画面提示词的末尾状态：${previousPromptTail}` : "上一镜头画面提示词未提供末尾状态。",
+          "本镜头第 0 秒必须从上述结束状态自然开始，继承人物/道具位置、姿势、视线、空间方位、光线、色温、曝光、饱和度和运动方向；先保持状态，再逐步完成当前动作，最后写清本镜头结束状态供下一个镜头继续。禁止重新入场、重置空间、无理由转景或在片内制作转场。",
+        ].join("\n")
+        : "连续性锚点（本集首镜头）：建立人物、道具、空间方位、摄影机、光线、色温、曝光、饱和度和运动方向的基线，并写清本镜头结束状态，供下一镜头从此处继续。";
+      return { ...shot, visualPrompt: `${continuityAnchor}\n当前镜头画面：${shot.visualPrompt}` };
     });
   }
 }

@@ -17,17 +17,21 @@ export interface CreateProjectInput {
   targetEpisodeCount: number;
 }
 
+type UpdateProjectInput = Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number; coverUrl?: string | null };
+
 export interface DatabaseStore {
   initialize(): Promise<void>;
   listProjects(): Promise<Project[]>;
   getProject(id: string): Promise<Project | null>;
   createProject(input: CreateProjectInput): Promise<Project>;
   deleteProject(id: string): Promise<boolean>;
-  updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }): Promise<Project | null>;
+  updateProject(id: string, input: UpdateProjectInput): Promise<Project | null>;
   listScenes(projectId: string): Promise<Scene[]>;
   replaceScenes(projectId: string, scenes: Omit<Scene, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Scene[]>;
   listJobs(): Promise<RenderJob[]>;
   createRenderJob(projectId: string, shotId?: string, provider?: string, providerTaskId?: string, status?: RenderJob["status"], progress?: number): Promise<RenderJob>;
+  setRenderJobPrompt(id: string, generationPrompt: string): Promise<RenderJob | null>;
+  startRenderJob(id: string, providerTaskId: string, status: RenderJob["status"], progress: number): Promise<RenderJob | null>;
   updateRenderJob(id: string, input: { status: RenderJob["status"]; progress: number; outputUrl?: string | null; errorMessage?: string | null }): Promise<RenderJob | null>;
   getScriptDocument(projectId: string): Promise<ScriptDocument | null>;
   saveScriptDocument(projectId: string, originalText: string, formattedText: string, formatStatus?: "raw" | "formatted"): Promise<ScriptDocument>;
@@ -89,6 +93,7 @@ function toJob(row: DbRow): RenderJob {
     progress: Number(row.progress),
     outputUrl: row.output_url ?? null,
     errorMessage: row.error_message ?? null,
+    generationPrompt: row.generation_prompt ?? null,
     createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
     updatedAt: row.updated_at instanceof Date ? row.updated_at.toISOString() : row.updated_at,
   };
@@ -230,6 +235,7 @@ class SqliteStore implements DatabaseStore {
         progress INTEGER NOT NULL DEFAULT 0,
         output_url TEXT,
         error_message TEXT,
+        generation_prompt TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
@@ -270,6 +276,7 @@ class SqliteStore implements DatabaseStore {
       "ALTER TABLE subjects ADD COLUMN image_url TEXT",
       "ALTER TABLE render_jobs ADD COLUMN shot_id TEXT",
       "ALTER TABLE render_jobs ADD COLUMN provider_task_id TEXT",
+      "ALTER TABLE render_jobs ADD COLUMN generation_prompt TEXT",
     ]) { try { this.db.exec(statement); } catch { /* Existing installations already have this column. */ } }
 
     const count = this.db.prepare("SELECT COUNT(*) AS total FROM projects").get() as { total: number };
@@ -327,13 +334,13 @@ class SqliteStore implements DatabaseStore {
     return Number(result.changes) > 0;
   }
 
-  async updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }) {
+  async updateProject(id: string, input: UpdateProjectInput) {
     const current = await this.getProject(id);
     if (!current) return null;
     const next = { ...current, ...input, updatedAt: now() };
     this.db.prepare(`
-      UPDATE projects SET title=?, logline=?, genre=?, style=?, aspect_ratio=?, duration_seconds=?, target_episode_count=?, status=?, progress=?, updated_at=? WHERE id=?
-    `).run(next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, next.updatedAt, id);
+      UPDATE projects SET title=?, logline=?, genre=?, style=?, aspect_ratio=?, duration_seconds=?, target_episode_count=?, status=?, progress=?, cover_url=?, updated_at=? WHERE id=?
+    `).run(next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, next.coverUrl, next.updatedAt, id);
     return this.getProject(id);
   }
 
@@ -380,6 +387,21 @@ class SqliteStore implements DatabaseStore {
       SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?
     `).get(id) as DbRow;
     return toJob(row);
+  }
+
+  async setRenderJobPrompt(id: string, generationPrompt: string) {
+    const stamp = now();
+    this.db.prepare("UPDATE render_jobs SET generation_prompt=?, updated_at=? WHERE id=?").run(generationPrompt, stamp, id);
+    const row = this.db.prepare("SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?").get(id) as DbRow | undefined;
+    return row ? toJob(row) : null;
+  }
+
+  async startRenderJob(id: string, providerTaskId: string, status: RenderJob["status"], progress: number) {
+    const stamp = now();
+    this.db.prepare(`UPDATE render_jobs SET provider_task_id=?, status=?, progress=?, error_message=NULL, updated_at=? WHERE id=?`)
+      .run(providerTaskId, status, progress, stamp, id);
+    const row = this.db.prepare(`SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id = j.project_id WHERE j.id = ?`).get(id) as DbRow | undefined;
+    return row ? toJob(row) : null;
   }
 
   async updateRenderJob(id: string, input: { status: RenderJob["status"]; progress: number; outputUrl?: string | null; errorMessage?: string | null }) {
@@ -509,7 +531,7 @@ class MysqlStore implements DatabaseStore {
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS render_jobs (
       id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, shot_id CHAR(36) NULL, provider_task_id VARCHAR(200) NULL, provider VARCHAR(40) NOT NULL DEFAULT 'mock',
       status VARCHAR(24) NOT NULL DEFAULT 'queued', progress TINYINT UNSIGNED NOT NULL DEFAULT 0,
-      output_url VARCHAR(1000) NULL, error_message TEXT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,
+      output_url VARCHAR(1000) NULL, error_message TEXT NULL, generation_prompt LONGTEXT NULL, created_at DATETIME(3) NOT NULL, updated_at DATETIME(3) NOT NULL,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE, INDEX idx_jobs_status (status)
     ) ENGINE=InnoDB`);
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS script_documents (
@@ -532,6 +554,7 @@ class MysqlStore implements DatabaseStore {
       "ALTER TABLE episodes ADD COLUMN characters JSON NOT NULL",
       "ALTER TABLE render_jobs ADD COLUMN shot_id CHAR(36) NULL",
       "ALTER TABLE render_jobs ADD COLUMN provider_task_id VARCHAR(200) NULL",
+      "ALTER TABLE render_jobs ADD COLUMN generation_prompt LONGTEXT NULL",
     ]) { try { await this.pool.execute(statement); } catch { /* Existing installations already have this column. */ } }
     await this.pool.execute(`CREATE TABLE IF NOT EXISTS subjects (
       id CHAR(36) PRIMARY KEY, project_id CHAR(36) NOT NULL, name VARCHAR(120) NOT NULL, role VARCHAR(20) NOT NULL,
@@ -594,12 +617,12 @@ class MysqlStore implements DatabaseStore {
     return Number((result as { affectedRows?: number }).affectedRows ?? 0) > 0;
   }
 
-  async updateProject(id: string, input: Partial<CreateProjectInput> & { status?: ProjectStatus; progress?: number }) {
+  async updateProject(id: string, input: UpdateProjectInput) {
     const current = await this.getProject(id);
     if (!current) return null;
     const next = { ...current, ...input };
-    await this.pool.execute(`UPDATE projects SET title=?,logline=?,genre=?,style=?,aspect_ratio=?,duration_seconds=?,target_episode_count=?,status=?,progress=?,updated_at=? WHERE id=?`,
-      [next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, new Date(), id]);
+    await this.pool.execute(`UPDATE projects SET title=?,logline=?,genre=?,style=?,aspect_ratio=?,duration_seconds=?,target_episode_count=?,status=?,progress=?,cover_url=?,updated_at=? WHERE id=?`,
+      [next.title, next.logline, next.genre, next.style, next.aspectRatio, next.durationSeconds, next.targetEpisodeCount ?? 3, next.status, next.progress, next.coverUrl, new Date(), id]);
     return this.getProject(id);
   }
 
@@ -643,6 +666,22 @@ class MysqlStore implements DatabaseStore {
     [id, projectId, shotId ?? null, provider, providerTaskId ?? null, status, progress, stamp, stamp]);
     const [rows] = await this.pool.execute(`SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=?`, [id]);
     return toJob((rows as DbRow[])[0]);
+  }
+
+  async setRenderJobPrompt(id: string, generationPrompt: string) {
+    const stamp = new Date();
+    await this.pool.execute("UPDATE render_jobs SET generation_prompt=?,updated_at=? WHERE id=?", [generationPrompt, stamp, id]);
+    const [rows] = await this.pool.execute("SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=?", [id]);
+    const row = (rows as DbRow[])[0];
+    return row ? toJob(row) : null;
+  }
+
+  async startRenderJob(id: string, providerTaskId: string, status: RenderJob["status"], progress: number) {
+    const stamp = new Date();
+    await this.pool.execute("UPDATE render_jobs SET provider_task_id=?,status=?,progress=?,error_message=NULL,updated_at=? WHERE id=?", [providerTaskId, status, progress, stamp, id]);
+    const [rows] = await this.pool.execute(`SELECT j.*, p.title AS project_title FROM render_jobs j JOIN projects p ON p.id=j.project_id WHERE j.id=?`, [id]);
+    const row = (rows as DbRow[])[0];
+    return row ? toJob(row) : null;
   }
 
   async updateRenderJob(id: string, input: { status: RenderJob["status"]; progress: number; outputUrl?: string | null; errorMessage?: string | null }) {

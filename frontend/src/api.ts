@@ -1,4 +1,4 @@
-import type { DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, Subject, SubjectImageInput, VideoAudioMode, VideoSettings, VideoSpeechRate } from "./types";
+import type { DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -16,7 +16,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   if (!response.ok) {
     const details = Array.isArray(payload?.details)
       ? payload.details.map((item: { path?: Array<string | number>; message?: string }) => `${item.path?.join(".") || "参数"}：${item.message || "无效"}`).join("；")
-      : typeof payload.details === "string" ? payload.details : "";
+      : typeof payload?.details === "string" ? payload.details : "";
     throw new Error(details ? `${payload?.error ?? "请求失败"}（${details}）` : payload?.error ?? `请求失败（HTTP ${response.status}）`);
   }
   return payload;
@@ -50,10 +50,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     })).data,
-  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"]; duration?: number; prompt?: string; audioMode?: VideoAudioMode; speechRate?: VideoSpeechRate; bgm?: boolean; continuity?: boolean } = {}) =>
+  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"]; duration?: number; prompt?: string; audioMode?: VideoAudioMode; speechRate?: VideoSpeechRate; bgm?: boolean; continuityMode?: VideoContinuityMode } = {}) =>
     (await request<{ data: RenderJob }>(`/api/projects/${id}/render`, { method: "POST", body: JSON.stringify(input) })).data,
+  videoMerges: async (id: string) => (await request<{ data: VideoMerge[] }>(`/api/projects/${id}/video-merges`)).data,
+  mergeVideos: async (id: string, shotIds: string[]) => (await request<{ data: VideoMerge }>(`/api/projects/${id}/video-merges`, { method: "POST", body: JSON.stringify({ shotIds }) })).data,
   updateShot: async (projectId: string, shotId: string, input: { location: string; action: string; visualPrompt: string }) =>
     (await request<{ data: Shot }>(`/api/projects/${projectId}/shots/${shotId}`, { method: "PATCH", body: JSON.stringify(input) })).data,
+  shotContinuityPreview: async (projectId: string, shotId: string) =>
+    (await request<{ data: ShotContinuityPreview }>(`/api/projects/${projectId}/shots/${shotId}/continuity-preview`)).data,
   pipeline: async (id: string) => (await request<{ data: PipelineData }>(`/api/projects/${id}/pipeline`)).data,
   format: async (id: string, text: string) => (await request<{ data: { project: Project; document: PipelineData["document"] } }>(`/api/projects/${id}/format`, { method: "POST", body: JSON.stringify({ text }) })).data,
   extractEpisodes: async (id: string) => (await request<{ data: { project: Project; episodes: PipelineData["episodes"] } }>(`/api/projects/${id}/episodes/extract`, { method: "POST", body: "{}" })).data,
