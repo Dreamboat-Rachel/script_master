@@ -1,4 +1,4 @@
-import type { CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
+import type { CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -66,5 +66,8 @@ export const api = {
   generateSubjectImage: async (projectId: string, subjectId: string, input: SubjectImageInput) => (await request<{ data: { subject: Subject; provider: string; model: string; size: string } }>(`/api/projects/${projectId}/subjects/${subjectId}/image`, { method: "POST", body: JSON.stringify(input) })).data,
   assetImages: async (assetType: StudioAssetType) => (await request<{ data: CharacterImageResult[] }>(`/api/tools/${assetType}-images`)).data,
   generateAssetImage: async (assetType: StudioAssetType, input: SubjectImageInput) => (await request<{ data: CharacterImageResult }>(`/api/tools/${assetType}-images`, { method: "POST", body: JSON.stringify(input) })).data,
+  studioVideos: async (videoType: StudioVideoType) => (await request<{ data: StudioVideoResult[] }>(`/api/tools/${videoType}-videos`)).data,
+  generateStudioVideo: async (videoType: StudioVideoType, input: StudioVideoInput) => (await request<{ data: StudioVideoResult }>(`/api/tools/${videoType}-videos`, { method: "POST", body: JSON.stringify(input) })).data,
+  studioVideo: async (videoType: StudioVideoType, id: string) => (await request<{ data: StudioVideoResult }>(`/api/tools/${videoType}-videos/${id}`)).data,
   extractShots: async (id: string) => (await request<{ data: { project: Project; shots: PipelineData["shots"] } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: "{}" })).data,
 };

@@ -5,7 +5,7 @@ import {
   RefreshCw, Search, ListFilter, Sun, Trash2, Upload, UserRound, UsersRound, WandSparkles, X,
 } from "lucide-react";
 import { api } from "./api";
-import type { CharacterImageResult, DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
+import type { CharacterImageResult, DashboardData, Episode, HomeToolType, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
 type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
@@ -147,7 +147,7 @@ function App() {
   const [accountDialog, setAccountDialog] = useState<AccountDialogKind | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [homeSection, setHomeSection] = useState<"home" | "pipeline">("home");
-  const [homeTool, setHomeTool] = useState<StudioAssetType | null>(null);
+  const [homeTool, setHomeTool] = useState<HomeToolType | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [renderJobs, setRenderJobs] = useState<RenderJob[]>([]);
   const [project, setProject] = useState<Project | null>(null);
@@ -377,11 +377,15 @@ function App() {
     window.scrollTo(0, 0);
   };
   const openProjectManager = () => { setHomeTool(null); setHomeSection("home"); setProjectManagerVisible(true); void refreshProjectManager(); };
-  const openAssetStudio = (assetType: StudioAssetType) => {
+  const openAssetStudio = (toolType: HomeToolType) => {
     setProjectManagerVisible(false);
-    setHomeTool(assetType);
+    setHomeTool(toolType);
     window.scrollTo({ top: 0, behavior: "smooth" });
-    void api.imageSettings().then(setImageSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
+    if (toolType === "reference-video" || toolType === "keyframe-video") {
+      void api.videoSettings().then(setVideoSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "视频模型设置读取失败"));
+    } else {
+      void api.imageSettings().then(setImageSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
+    }
   };
   const chooseNewProjectMode = (hasScript: boolean) => { setNewProjectDialogOpen(false); setProject(null); setSourceScriptMode(hasScript); setPipeline(emptyPipeline()); setScriptText(""); setSetupDraft({ title: hasScript ? "已有剧本项目" : "", logline: "", genre: "悬疑", style: "电影写实", aspectRatio: "16:9", durationSeconds: 60, targetEpisodeCount: 3 }); setMobileNavOpen(false); if (hasScript) { setExistingScriptSetupOpen(true); return; } setHomeVisible(false); setStage("setup"); };
   const confirmExistingScriptSetup = () => run("setup", async () => { const next = await api.createProject(projectInput(setupDraft)); setProject(next); setHomeVisible(false); setExistingScriptSetupOpen(false); setStage("format"); setDashboard(await api.dashboard()); }, "项目设定已保存，请导入剧本");
@@ -425,7 +429,7 @@ function App() {
       <HomeNavigation active={homeTool ? "tools" : projectManagerVisible ? "assets" : homeSection} onHome={() => showHomeSection()} onPipeline={() => showHomeSection("pipeline")} onAssets={openProjectManager} onSelectTool={openAssetStudio} onCreate={newWorkflow} onHelp={() => setHelpOpen(true)} />
       <div className="top-actions">{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div>
     </header>
-    {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onBack={() => showHomeSection()} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
+    {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onBack={() => showHomeSection()} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
     {newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}
     {existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={workingAction === "delete"} onConfirm={confirmDeleteProject} onClose={() => setDeleteTarget(null)} />}
@@ -447,7 +451,7 @@ type HomeNavigationProps = {
   onHome: () => void;
   onPipeline: () => void;
   onAssets: () => void;
-  onSelectTool: (assetType: StudioAssetType) => void;
+  onSelectTool: (toolType: HomeToolType) => void;
   onCreate: () => void;
   onHelp: () => void;
 };
@@ -465,8 +469,8 @@ function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, on
   }, [toolsOpen]);
   const runAndClose = (action: () => void) => { setToolsOpen(false); action(); };
   const toolButton = (label: string) => {
-    const assetType = ({ "角色": "character", "场景": "scene", "物品": "prop" } as Partial<Record<string, StudioAssetType>>)[label];
-    return <button type="button" key={label} onClick={() => runAndClose(assetType ? () => onSelectTool(assetType) : onCreate)}>{label}</button>;
+    const toolType = ({ "角色": "character", "场景": "scene", "物品": "prop", "参考生视频": "reference-video", "首尾帧视频": "keyframe-video" } as Partial<Record<string, HomeToolType>>)[label];
+    return <button type="button" key={label} onClick={() => runAndClose(toolType ? () => onSelectTool(toolType) : onCreate)}>{label}</button>;
   };
 
   return <div className="home-nav-shell" ref={navigationRef}>
@@ -479,7 +483,7 @@ function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, on
     </nav>
     {toolsOpen && <section className="home-nav-mega" aria-label="更多创作工具">
       <div className="mega-column">
-        <div><span>创作</span><div className="mega-tool-list">{["角色", "场景", "物品", "分镜图"].map(toolButton)}</div></div>
+        <div><span>创作</span><div className="mega-tool-list">{["角色", "场景", "物品"].map(toolButton)}</div></div>
         <div><span>AI 视频</span><div className="mega-tool-list">{["参考生视频", "首尾帧视频"].map(toolButton)}</div></div>
         <div><span>配音</span><div className="mega-tool-list">{["声音克隆", "文转语音"].map(toolButton)}</div></div>
       </div>
@@ -803,6 +807,177 @@ function CharacterStudio({ assetType, imageSettings, onConfigure, onToast }: { a
             {selected && !generating && <div className="character-preview-actions"><span>{selected.size || imageSizeLabels[draft.resolution][draft.aspectRatio]}</span><a className="icon-button" href={selected.imageUrl} download={`${assetType}-${selected.id}`} aria-label="下载生成图片" title="下载生成图片"><Download size={17} /></a></div>}
           </div>
           <aside className="character-history" aria-label="最近生成"><div><strong>最近生成</strong><span>{results.length ? `${results.length} 张` : "暂无记录"}</span></div>{results.length ? <div className="character-history-strip">{results.map((item, index) => <button type="button" key={item.id} className={item.id === selected?.id ? "selected" : ""} onClick={() => setSelectedId(item.id)} aria-label={`查看第 ${index + 1} 张图片`}><img src={item.imageUrl} alt="" /><span>{String(index + 1).padStart(2, "0")}</span></button>)}</div> : <div className="character-history-empty"><ImagePlus size={18} /><span>生成后显示</span></div>}</aside>
+        </div>
+      </section>
+    </div>
+  </main>;
+}
+
+type VideoUploadItem = { id: string; name: string; dataUrl: string };
+type VideoToolDraft = {
+  prompt: string;
+  model: VideoSettings["model"];
+  ratio: "16:9" | "9:16" | "1:1";
+  duration: number;
+  generateAudio: boolean;
+  watermark: boolean;
+};
+
+const studioVideoConfig: Record<StudioVideoType, { title: string; englishTitle: string; description: string; placeholder: string; example: string }> = {
+  "reference-video": {
+    title: "参考生视频", englishTitle: "REFERENCE VIDEO", description: "通过一至三张参考图锁定人物、物品或场景特征，生成结果自动保存在本地。",
+    placeholder: "描述主体动作、镜头运动、环境变化、光线和节奏",
+    example: "镜头缓慢向前推进，人物抬头看向窗外，衣角被风轻轻吹动。雨滴沿玻璃滑落，远处霓虹在湿润街道上形成自然倒影，电影级写实光影，动作连续稳定。",
+  },
+  "keyframe-video": {
+    title: "首尾帧视频", englishTitle: "KEYFRAME VIDEO", description: "指定开场画面与可选结束画面，让镜头运动和动作变化拥有明确起点与落点。",
+    placeholder: "描述首帧到尾帧之间发生的动作、镜头路径与氛围变化",
+    example: "从首帧构图开始，镜头平稳环绕主体向右移动，人物缓慢转身并走向光源，环境光从冷蓝逐渐过渡为暖金，最终自然衔接至尾帧构图，无跳切。",
+  },
+};
+
+function readVideoImage(file: File) {
+  return new Promise<VideoUploadItem>((resolveFile, rejectFile) => {
+    const reader = new FileReader();
+    reader.onload = () => resolveFile({ id: `${file.name}-${file.lastModified}-${Math.random()}`, name: file.name, dataUrl: String(reader.result ?? "") });
+    reader.onerror = () => rejectFile(new Error("图片读取失败，请重新选择"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function VideoToolStudio({ videoType, videoSettings, onConfigure, onToast }: { videoType: StudioVideoType; videoSettings: VideoSettings | null; onConfigure: () => void; onToast: (message: string) => void }) {
+  const config = studioVideoConfig[videoType];
+  const [draft, setDraft] = useState<VideoToolDraft>({ prompt: "", model: videoSettings?.model ?? videoModelOptions[0], ratio: "16:9", duration: 5, generateAudio: true, watermark: false });
+  const [references, setReferences] = useState<VideoUploadItem[]>([]);
+  const [firstFrame, setFirstFrame] = useState<VideoUploadItem | null>(null);
+  const [lastFrame, setLastFrame] = useState<VideoUploadItem | null>(null);
+  const [results, setResults] = useState<StudioVideoResult[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [pageError, setPageError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void api.studioVideos(videoType).then((items) => {
+      if (!active) return;
+      setResults(items);
+      setSelectedId(items[0]?.id ?? null);
+    }).catch((caught) => { if (active) setPageError(caught instanceof Error ? caught.message : "生成记录读取失败"); })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
+  }, [videoType]);
+
+  useEffect(() => {
+    if (videoSettings?.model) setDraft((current) => ({ ...current, model: videoSettings.model }));
+  }, [videoSettings?.model]);
+
+  const pendingKey = results.filter((item) => item.status === "queued" || item.status === "processing").map((item) => item.id).join(",");
+  useEffect(() => {
+    const ids = pendingKey ? pendingKey.split(",") : [];
+    if (!ids.length) return;
+    let active = true;
+    const refreshPending = async () => {
+      const settled = await Promise.all(ids.map((id) => api.studioVideo(videoType, id).catch(() => null)));
+      if (!active) return;
+      setResults((current) => current.map((item) => settled.find((next) => next?.id === item.id) ?? item));
+    };
+    const timer = window.setInterval(() => void refreshPending(), 3500);
+    void refreshPending();
+    return () => { active = false; window.clearInterval(timer); };
+  }, [pendingKey, videoType]);
+
+  const selected = results.find((item) => item.id === selectedId) ?? results[0] ?? null;
+  const hasRequiredMedia = videoType === "reference-video" ? references.length > 0 : Boolean(firstFrame);
+  const ready = Boolean(videoSettings?.configured && draft.prompt.trim().length >= 10 && hasRequiredMedia && !submitting);
+  const change = <K extends keyof VideoToolDraft>(key: K, value: VideoToolDraft[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const modelOptions = Array.from(new Set([videoSettings?.model, draft.model, ...videoModelOptions].filter(Boolean) as VideoSettings["model"][])).map((value) => ({ value, label: videoModelLabels[value] }));
+
+  const validateFiles = (files: File[]) => {
+    const invalid = files.find((file) => !["image/png", "image/jpeg", "image/webp"].includes(file.type));
+    if (invalid) { setPageError("请选择 PNG、JPG 或 WebP 图片"); return false; }
+    const oversized = files.find((file) => file.size > 4 * 1024 * 1024);
+    if (oversized) { setPageError("单张图片不能超过 4MB"); return false; }
+    return true;
+  };
+  const addReferences = async (files: File[]) => {
+    const available = Math.max(0, 3 - references.length);
+    const accepted = files.slice(0, available);
+    if (!accepted.length || !validateFiles(accepted)) return;
+    try { const items = await Promise.all(accepted.map(readVideoImage)); setReferences((current) => [...current, ...items].slice(0, 3)); setPageError(""); }
+    catch (caught) { setPageError(caught instanceof Error ? caught.message : "图片读取失败"); }
+  };
+  const replaceReference = async (id: string, file: File | undefined) => {
+    if (!file || !validateFiles([file])) return;
+    try { const item = await readVideoImage(file); setReferences((current) => current.map((value) => value.id === id ? item : value)); setPageError(""); }
+    catch (caught) { setPageError(caught instanceof Error ? caught.message : "图片读取失败"); }
+  };
+  const setFrame = async (kind: "first" | "last", file: File | undefined) => {
+    if (!file || !validateFiles([file])) return;
+    try { const item = await readVideoImage(file); kind === "first" ? setFirstFrame(item) : setLastFrame(item); setPageError(""); }
+    catch (caught) { setPageError(caught instanceof Error ? caught.message : "图片读取失败"); }
+  };
+  const generate = async () => {
+    if (!videoSettings?.configured) { onConfigure(); return; }
+    if (!hasRequiredMedia) { setPageError(videoType === "reference-video" ? "请至少添加一张参考图" : "请添加首帧图片"); return; }
+    if (draft.prompt.trim().length < 10) { setPageError("视频提示词至少需要 10 个字"); return; }
+    setSubmitting(true);
+    setPageError("");
+    try {
+      const result = await api.generateStudioVideo(videoType, {
+        prompt: draft.prompt.trim(), model: draft.model, ratio: draft.ratio, duration: draft.duration,
+        generateAudio: draft.generateAudio, watermark: draft.watermark,
+        referenceImages: videoType === "reference-video" ? references.map((item) => item.dataUrl) : undefined,
+        firstFrame: videoType === "keyframe-video" ? firstFrame?.dataUrl : undefined,
+        lastFrame: videoType === "keyframe-video" ? lastFrame?.dataUrl : undefined,
+      });
+      setResults((current) => [result, ...current.filter((item) => item.id !== result.id)]);
+      setSelectedId(result.id);
+      onToast("视频任务已提交，完成后会自动保存到本地");
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : "视频任务提交失败");
+    } finally { setSubmitting(false); }
+  };
+
+  const uploadTile = (item: VideoUploadItem | null, label: string, onFile: (file: File | undefined) => void, onRemove: () => void, required = false) => <div className="studio-video-upload-wrap">
+    <label className={`studio-video-upload ${item ? "has-preview" : ""}`} title={item ? `更换${label}` : `上传${label}`}>
+      <input type="file" accept="image/png,image/jpeg,image/webp" disabled={submitting} onChange={(event) => { onFile(event.target.files?.[0]); event.target.value = ""; }} />
+      {item ? <img src={item.dataUrl} alt={`${label}预览`} /> : <><ImagePlus size={19} /><strong>{label}{required ? " *" : ""}</strong><small>PNG / JPG / WebP</small></>}
+    </label>
+    {item && <button type="button" className="character-reference-remove" onClick={onRemove} aria-label={`移除${label}`} title={`移除${label}`}><X size={12} /></button>}
+  </div>;
+
+  return <main className="character-studio-content video-tool-content">
+    <header className="character-studio-head">
+      <div><span className="panel-eyebrow">{config.englishTitle}</span><h1>{config.title}</h1><p>{config.description}</p></div>
+      <span className={`character-config-state ${videoSettings?.configured ? "configured" : ""}`}><i />{videoSettings?.configured ? "视频模型已连接" : "视频模型未配置"}</span>
+    </header>
+    <div className="character-studio-layout video-tool-layout">
+      <section className="character-controls video-tool-controls" aria-label={`${config.title}参数`}>
+        <div className="character-section-title"><span>生成参数</span><small>01 / INPUT</small></div>
+        <div className="character-field studio-video-media-field"><span>{videoType === "reference-video" ? "参考图" : "关键帧"}</span>
+          {videoType === "reference-video" ? <div className="studio-video-reference-list">
+            {references.map((item) => uploadTile(item, "参考图", (file) => void replaceReference(item.id, file), () => setReferences((current) => current.filter((value) => value.id !== item.id))))}
+            {references.length < 3 && <label className="studio-video-upload studio-video-add"><input type="file" multiple accept="image/png,image/jpeg,image/webp" disabled={submitting} onChange={(event) => { void addReferences(Array.from(event.target.files ?? [])); event.target.value = ""; }} /><Plus size={20} /><strong>添加参考图</strong><small>{references.length} / 3</small></label>}
+          </div> : <div className="studio-video-frame-row">{uploadTile(firstFrame, "首帧", (file) => void setFrame("first", file), () => setFirstFrame(null), true)}<span className="studio-video-frame-link"><ArrowRight size={17} /></span>{uploadTile(lastFrame, "尾帧", (file) => void setFrame("last", file), () => setLastFrame(null))}</div>}
+        </div>
+        <div className="character-field character-prompt-field"><div className="character-field-label"><span>视频提示词</span><button type="button" className="character-example-button" onClick={() => change("prompt", config.example)}><Sparkles size={13} />使用示例</button></div><textarea value={draft.prompt} maxLength={16000} onChange={(event) => change("prompt", event.target.value)} placeholder={config.placeholder} /><small>{draft.prompt.length} / 16000</small></div>
+        <div className="character-field"><span>视频模型</span><SmoothSelect value={draft.model} onChange={(value) => change("model", value as VideoSettings["model"])} ariaLabel="视频模型" options={modelOptions} /></div>
+        <div className="studio-video-parameter-row"><div className="character-field"><span>画面比例</span><SmoothSelect value={draft.ratio} onChange={(value) => change("ratio", value as VideoToolDraft["ratio"])} ariaLabel="视频画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="character-field"><span>视频时长</span><SmoothSelect value={String(draft.duration)} onChange={(value) => change("duration", Number(value))} ariaLabel="视频时长" options={[4, 5, 6, 8, 10, 12].map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div></div>
+        <div className="studio-video-toggle-row"><button type="button" className={`video-toggle ${draft.generateAudio ? "on" : ""}`} onClick={() => change("generateAudio", !draft.generateAudio)} aria-pressed={draft.generateAudio}><span>生成声音</span><i /></button><button type="button" className={`video-toggle ${draft.watermark ? "on" : ""}`} onClick={() => change("watermark", !draft.watermark)} aria-pressed={draft.watermark}><span>添加水印</span><i /></button></div>
+        {pageError && <div className="character-error" role="alert">{pageError}</div>}
+        {!videoSettings?.configured ? <button type="button" className="primary-button character-generate" onClick={onConfigure}><Settings2 size={17} />前往模型设置</button> : <button type="button" className="primary-button character-generate" onClick={() => void generate()} disabled={!ready}>{submitting ? <LoaderCircle className="spin" size={18} /> : <WandSparkles size={18} />}{submitting ? "正在提交任务" : "开始生成视频"}</button>}
+      </section>
+      <section className="character-results video-tool-results" aria-label={`${config.title}结果`}>
+        <div className="character-section-title"><span>生成结果</span><small>{results.length ? `${results.length} 个本地任务` : "02 / OUTPUT"}</small></div>
+        <div className="character-results-body video-tool-results-body">
+          <div className="character-preview studio-video-preview">
+            {selected?.outputUrl ? <video key={selected.id} src={selected.outputUrl} controls playsInline preload="metadata" /> : <div className="character-empty">{historyLoading ? <><LoaderCircle className="spin" size={26} /><strong>正在读取本地作品</strong></> : <><Film size={31} /><strong>{selected ? "视频正在生成" : "生成结果会显示在这里"}</strong><span>{selected ? `当前进度 ${selected.progress}%` : "上传素材并填写提示词，创建第一段视频"}</span></>}</div>}
+            {selected && (selected.status === "queued" || selected.status === "processing") && <div className="character-generating studio-video-generating"><LoaderCircle className="spin" size={28} /><strong>{selected.status === "queued" ? "任务正在排队" : "正在生成视频"}</strong><span>{selected.progress}% · 完成后自动保存到本地</span><div><i style={{ width: `${Math.max(3, selected.progress)}%` }} /></div></div>}
+            {selected?.status === "failed" && <div className="studio-video-failed"><X size={24} /><strong>生成未完成</strong><span>{selected.errorMessage || "请调整参数后重新生成"}</span></div>}
+            {selected?.outputUrl && <div className="character-preview-actions"><span>{selected.ratio} · {selected.duration}s</span><a className="icon-button" href={selected.outputUrl} download={`${videoType}-${selected.id}.mp4`} aria-label="下载生成视频" title="下载生成视频"><Download size={17} /></a></div>}
+          </div>
+          <aside className="character-history studio-video-history" aria-label="最近生成"><div><strong>最近生成</strong><span>{results.length ? `${results.length} 个` : "暂无记录"}</span></div>{results.length ? <div className="character-history-strip studio-video-history-strip">{results.map((item, index) => <button type="button" key={item.id} className={`${item.id === selected?.id ? "selected" : ""} ${item.status}`} onClick={() => setSelectedId(item.id)} aria-label={`查看第 ${index + 1} 个视频`}>{item.outputUrl ? <video src={item.outputUrl} muted preload="metadata" /> : <span className="studio-video-history-state">{item.status === "failed" ? <X size={15} /> : <LoaderCircle className="spin" size={15} />}</span>}<b>{item.status === "completed" ? `${item.duration}s` : item.status === "failed" ? "失败" : `${item.progress}%`}</b></button>)}</div> : <div className="character-history-empty"><Film size={18} /><span>生成后显示</span></div>}</aside>
         </div>
       </section>
     </div>

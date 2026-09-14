@@ -28,6 +28,9 @@ const characterImageDirectory = resolve(generatedDirectory, "characters");
 const sceneImageDirectory = resolve(generatedDirectory, "scenes");
 const propImageDirectory = resolve(generatedDirectory, "props");
 const studioImageDirectories = { character: characterImageDirectory, scene: sceneImageDirectory, prop: propImageDirectory } as const;
+const referenceVideoDirectory = resolve(generatedDirectory, "reference-videos");
+const keyframeVideoDirectory = resolve(generatedDirectory, "keyframe-videos");
+const studioVideoDirectories = { "reference-video": referenceVideoDirectory, "keyframe-video": keyframeVideoDirectory } as const;
 const continuityFrameDirectory = resolve(generatedDirectory, "continuity");
 const generatedVideoDirectory = resolve(generatedDirectory, "videos");
 const videoMergeDirectory = resolve(generatedDirectory, "merges");
@@ -36,11 +39,32 @@ const videoGeneration = new VideoGenerationService();
 const renderJobStreams = new Set<Response>();
 const continuityFrameCache = new Map<string, string>();
 
+type StudioVideoType = keyof typeof studioVideoDirectories;
+type StudioVideoStatus = "queued" | "processing" | "completed" | "failed";
+interface StoredStudioVideo {
+  id: string;
+  videoType: StudioVideoType;
+  status: StudioVideoStatus;
+  progress: number;
+  outputUrl: string | null;
+  errorMessage: string | null;
+  prompt: string;
+  model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+  ratio: "16:9" | "9:16" | "1:1";
+  duration: number;
+  createdAt: string;
+  updatedAt: string;
+  providerTaskId?: string;
+}
+const studioVideoTasks = new Map<string, StoredStudioVideo>();
+
 mkdirSync(logDirectory, { recursive: true });
 mkdirSync(subjectImageDirectory, { recursive: true });
 mkdirSync(characterImageDirectory, { recursive: true });
 mkdirSync(sceneImageDirectory, { recursive: true });
 mkdirSync(propImageDirectory, { recursive: true });
+mkdirSync(referenceVideoDirectory, { recursive: true });
+mkdirSync(keyframeVideoDirectory, { recursive: true });
 mkdirSync(continuityFrameDirectory, { recursive: true });
 mkdirSync(generatedVideoDirectory, { recursive: true });
 mkdirSync(videoMergeDirectory, { recursive: true });
@@ -125,6 +149,98 @@ async function persistGeneratedVideo(jobId: string, sourceUrl: string) {
     throw new Error(`视频生成成功，但保存到本地失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+function studioVideoKey(videoType: StudioVideoType, id: string) {
+  return `${videoType}:${id}`;
+}
+
+async function writeStudioVideoRecord(record: StoredStudioVideo) {
+  await writeFile(resolve(studioVideoDirectories[record.videoType], `${record.id}.json`), JSON.stringify(record, null, 2), "utf8");
+}
+
+async function persistStudioVideo(record: StoredStudioVideo, sourceUrl: string) {
+  const directory = studioVideoDirectories[record.videoType];
+  const fileName = `${record.id}.mp4`;
+  const outputPath = resolve(directory, fileName);
+  const temporaryPath = resolve(directory, `.${record.id}-${randomUUID()}.tmp`);
+  try {
+    const result = await fetch(sourceUrl, { signal: AbortSignal.timeout(300000) });
+    if (!result.ok) throw new Error(`HTTP ${result.status}`);
+    const bytes = Buffer.from(await result.arrayBuffer());
+    if (!bytes.length) throw new Error("平台返回了空文件");
+    await writeFile(temporaryPath, bytes);
+    await unlink(outputPath).catch(() => undefined);
+    await rename(temporaryPath, outputPath);
+    return `/api/generated/${basename(directory)}/${fileName}`;
+  } catch (error) {
+    throw new Error(`视频生成成功，但保存到本地失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
+async function updateStudioVideo(record: StoredStudioVideo, patch: Partial<StoredStudioVideo>) {
+  const next = { ...record, ...patch, updatedAt: new Date().toISOString() };
+  studioVideoTasks.set(studioVideoKey(next.videoType, next.id), next);
+  await writeStudioVideoRecord(next);
+  return next;
+}
+
+async function pollStudioVideo(record: StoredStudioVideo) {
+  const providerTaskId = record.providerTaskId;
+  if (!providerTaskId) return;
+  try {
+    for (let attempt = 0; attempt < 120; attempt += 1) {
+      const task = await videoGeneration.getTask(providerTaskId);
+      if (task.status === "completed" && task.videoUrl) {
+        const outputUrl = await persistStudioVideo(record, task.videoUrl);
+        await updateStudioVideo(record, { status: "completed", progress: 100, outputUrl, errorMessage: null });
+        return;
+      }
+      if (task.status === "failed") {
+        await updateStudioVideo(record, { status: "failed", progress: task.progress, errorMessage: task.errorMessage ?? "视频平台任务失败" });
+        return;
+      }
+      record = await updateStudioVideo(record, { status: task.status, progress: task.progress });
+      await wait(5000);
+    }
+    await updateStudioVideo(record, { status: "failed", progress: 0, errorMessage: "视频任务轮询超时" });
+  } catch (error) {
+    await updateStudioVideo(record, { status: "failed", progress: 0, errorMessage: error instanceof Error ? error.message : String(error) }).catch(() => undefined);
+  }
+}
+
+async function readStudioVideoRecord(videoType: StudioVideoType, id: string) {
+  const active = studioVideoTasks.get(studioVideoKey(videoType, id));
+  if (active) return active;
+  try {
+    const value = JSON.parse(await readFile(resolve(studioVideoDirectories[videoType], `${id}.json`), "utf8")) as StoredStudioVideo;
+    return value.videoType === videoType && value.id === id ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+async function listStudioVideos(videoType: StudioVideoType) {
+  const directory = studioVideoDirectories[videoType];
+  const names = await readdir(directory).catch(() => [] as string[]);
+  const stored = (await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readStudioVideoRecord(videoType, basename(name, ".json")))))
+    .filter((item): item is StoredStudioVideo => Boolean(item));
+  const merged = new Map(stored.map((item) => [item.id, item]));
+  for (const item of studioVideoTasks.values()) if (item.videoType === videoType) merged.set(item.id, item);
+  return [...merged.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 24);
+}
+
+async function resumeStudioVideoTasks() {
+  for (const videoType of Object.keys(studioVideoDirectories) as StudioVideoType[]) {
+    const records = await listStudioVideos(videoType);
+    for (const record of records) {
+      if ((record.status !== "queued" && record.status !== "processing") || !record.providerTaskId) continue;
+      studioVideoTasks.set(studioVideoKey(videoType, record.id), record);
+      void pollStudioVideo(record);
+    }
   }
 }
 
@@ -225,7 +341,7 @@ const app = express();
 app.disable("x-powered-by");
 app.use(cors({ origin: clientOrigin }));
 app.use("/api/generated", express.static(generatedDirectory, { maxAge: "1h" }));
-app.use(express.json({ limit: "12mb" }));
+app.use(express.json({ limit: "22mb" }));
 app.use((request, response, next) => {
   const startedAt = Date.now();
   writeLog("INFO", "[api] 请求开始", { method: request.method, path: request.originalUrl });
@@ -285,6 +401,17 @@ const subjectImageSchema = z.object({
   aspectRatio: z.enum(["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4"]),
   referenceImage: z.string().max(11_500_000).regex(/^data:image\/[a-z0-9.+-]+;base64,/i, "参考图格式无效").optional(),
   watermark: z.boolean().optional(),
+});
+const studioVideoSchema = z.object({
+  prompt: z.string().trim().min(10, "视频提示词至少需要 10 个字").max(16000),
+  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]),
+  ratio: z.enum(["16:9", "9:16", "1:1"]),
+  duration: z.coerce.number().int().min(2).max(12),
+  generateAudio: z.boolean().default(true),
+  watermark: z.boolean().default(false),
+  referenceImages: z.array(z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "参考图格式无效")).max(3).optional(),
+  firstFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "首帧格式无效").optional(),
+  lastFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "尾帧格式无效").optional(),
 });
 const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
@@ -769,6 +896,56 @@ app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) =>
   response.json({ data: result });
 }));
 
+app.get("/api/tools/:videoType-videos", asyncRoute(async (request, response) => {
+  const videoType = String(request.params.videoType) as StudioVideoType;
+  if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
+  response.json({ data: await listStudioVideos(videoType) });
+}));
+
+app.get("/api/tools/:videoType-videos/:id", asyncRoute(async (request, response) => {
+  const videoType = String(request.params.videoType) as StudioVideoType;
+  if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
+  const item = await readStudioVideoRecord(videoType, String(request.params.id));
+  if (!item) return response.status(404).json({ error: "视频任务不存在" });
+  response.json({ data: item });
+}));
+
+app.post("/api/tools/:videoType-videos", asyncRoute(async (request, response) => {
+  const videoType = String(request.params.videoType) as StudioVideoType;
+  if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
+  if (!videoGeneration.enabled) return response.status(503).json({ error: "尚未配置视频生成 API Key，请先打开模型设置" });
+  const input = studioVideoSchema.parse(request.body ?? {});
+  if (videoType === "reference-video" && !input.referenceImages?.length) return response.status(400).json({ error: "请至少添加一张参考图" });
+  if (videoType === "keyframe-video" && !input.firstFrame) return response.status(400).json({ error: "请添加首帧图片" });
+
+  const task = await videoGeneration.createTask({
+    prompt: input.prompt,
+    model: input.model,
+    referenceImageUrls: videoType === "reference-video" ? input.referenceImages : undefined,
+    firstFrameUrl: videoType === "keyframe-video" ? input.firstFrame : undefined,
+    lastFrameUrl: videoType === "keyframe-video" ? input.lastFrame : undefined,
+    ratio: input.ratio,
+    duration: input.duration,
+    generateAudio: input.generateAudio,
+    watermark: input.watermark,
+  });
+  const now = new Date().toISOString();
+  let record: StoredStudioVideo = {
+    id: randomUUID(), videoType, status: task.status, progress: task.progress, outputUrl: null, errorMessage: null,
+    prompt: input.prompt, model: input.model, ratio: input.ratio, duration: input.duration, createdAt: now, updatedAt: now, providerTaskId: task.taskId,
+  };
+  studioVideoTasks.set(studioVideoKey(videoType, record.id), record);
+  await writeStudioVideoRecord(record);
+  if (task.status === "completed" && task.videoUrl) {
+    const outputUrl = await persistStudioVideo(record, task.videoUrl);
+    record = await updateStudioVideo(record, { status: "completed", progress: 100, outputUrl });
+  } else {
+    void pollStudioVideo(record);
+  }
+  writeLog("INFO", "[studio-video] 已提交", { videoType, id: record.id, providerTaskId: task.taskId });
+  response.status(202).json({ data: record });
+}));
+
 app.get("/api/dashboard", asyncRoute(async (_request, response) => {
   const [projects, jobs, localVideos] = await Promise.all([db.listProjects(), db.listJobs(), localVideoStorageStats()]);
   const completed = projects.filter((project) => project.status === "completed").length;
@@ -1174,6 +1351,7 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
 
 await db.initialize();
 await resumeVideoTasks();
+await resumeStudioVideoTasks();
 app.listen(port, () => {
   writeLog("INFO", "[server] 启动完成", { url: `http://localhost:${port}`, database: databaseUrl.startsWith("mysql://") ? "mysql" : "sqlite", logFile });
 });

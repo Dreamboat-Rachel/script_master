@@ -151,14 +151,16 @@ export class VideoGenerationService {
     return payload;
   }
 
-  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; firstFrameUrl?: string; ratio: string; duration: number; generateAudio?: boolean; watermark?: boolean }) {
+  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; firstFrameUrl?: string; lastFrameUrl?: string; ratio: string; duration: number; generateAudio?: boolean; watermark?: boolean }) {
     const referenceItems = (input.referenceImageUrls ?? []).filter(Boolean).map((url) => ({ type: "image_url", image_url: { url }, role: "reference_image" }));
     const firstFrameItem = input.firstFrameUrl ? { type: "image_url", image_url: { url: input.firstFrameUrl }, role: "first_frame" } : undefined;
-    const body = (withReferences: boolean, withFirstFrame: boolean) => JSON.stringify({
+    const lastFrameItem = input.lastFrameUrl ? { type: "image_url", image_url: { url: input.lastFrameUrl }, role: "last_frame" } : undefined;
+    const frameItems = [firstFrameItem, lastFrameItem].filter(Boolean);
+    const body = (withReferences: boolean, withFrames: boolean) => JSON.stringify({
       model: input.model ?? runtimeModel,
       content: [
         { type: "text", text: input.prompt },
-        ...(withFirstFrame && firstFrameItem ? [firstFrameItem] : []),
+        ...(withFrames ? frameItems : []),
         ...(withReferences ? referenceItems : []),
       ],
       generate_audio: input.generateAudio ?? true,
@@ -168,15 +170,15 @@ export class VideoGenerationService {
     });
     // Seedance rejects first/last-frame media mixed with reference media. A real
     // first frame is the stronger continuity constraint, so it takes priority.
-    let referenceFallback = Boolean(firstFrameItem && referenceItems.length);
+    let referenceFallback = Boolean(frameItems.length && referenceItems.length);
     let continuityFrameFallback = false;
     let payload: Record<string, unknown>;
     try {
-      payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(!firstFrameItem, true) });
+      payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(!frameItems.length, true) });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (!/(real person|真人|真实人物|may contain real)/i.test(message)) throw error;
-      if (firstFrameItem) {
+      if (frameItems.length) {
         continuityFrameFallback = true;
         if (!referenceItems.length) {
           payload = await this.request(taskEndpoint(runtimeApiBase), { method: "POST", body: body(false, false) });

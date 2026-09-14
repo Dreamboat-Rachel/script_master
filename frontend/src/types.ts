@@ -145,6 +145,8 @@ export interface SubjectImageInput {
 }
 
 export type StudioAssetType = "character" | "scene" | "prop";
+export type StudioVideoType = "reference-video" | "keyframe-video";
+export type HomeToolType = StudioAssetType | StudioVideoType;
 
 export interface CharacterImageResult {
   id: string;
@@ -153,6 +155,33 @@ export interface CharacterImageResult {
   size: string;
   prompt: string;
   createdAt: string;
+}
+
+export interface StudioVideoInput {
+  prompt: string;
+  model: VideoSettings["model"];
+  ratio: "16:9" | "9:16" | "1:1";
+  duration: number;
+  generateAudio: boolean;
+  watermark: boolean;
+  referenceImages?: string[];
+  firstFrame?: string;
+  lastFrame?: string;
+}
+
+export interface StudioVideoResult {
+  id: string;
+  videoType: StudioVideoType;
+  status: "queued" | "processing" | "completed" | "failed";
+  progress: number;
+  outputUrl: string | null;
+  errorMessage: string | null;
+  prompt: string;
+  model: VideoSettings["model"];
+  ratio: StudioVideoInput["ratio"];
+  duration: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Shot {
