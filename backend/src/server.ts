@@ -2,7 +2,7 @@ import "dotenv/config";
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { appendFileSync, mkdirSync } from "node:fs";
-import { readFile, readdir, rm, unlink, writeFile } from "node:fs/promises";
+import { readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { basename, resolve } from "node:path";
@@ -24,7 +24,12 @@ const logDirectory = resolve(process.cwd(), "logs");
 const logFile = resolve(logDirectory, "backend.log");
 const generatedDirectory = resolve(process.cwd(), "data", "generated");
 const subjectImageDirectory = resolve(generatedDirectory, "subjects");
+const characterImageDirectory = resolve(generatedDirectory, "characters");
+const sceneImageDirectory = resolve(generatedDirectory, "scenes");
+const propImageDirectory = resolve(generatedDirectory, "props");
+const studioImageDirectories = { character: characterImageDirectory, scene: sceneImageDirectory, prop: propImageDirectory } as const;
 const continuityFrameDirectory = resolve(generatedDirectory, "continuity");
+const generatedVideoDirectory = resolve(generatedDirectory, "videos");
 const videoMergeDirectory = resolve(generatedDirectory, "merges");
 const projectCoverDirectory = resolve(generatedDirectory, "covers");
 const videoGeneration = new VideoGenerationService();
@@ -33,7 +38,11 @@ const continuityFrameCache = new Map<string, string>();
 
 mkdirSync(logDirectory, { recursive: true });
 mkdirSync(subjectImageDirectory, { recursive: true });
+mkdirSync(characterImageDirectory, { recursive: true });
+mkdirSync(sceneImageDirectory, { recursive: true });
+mkdirSync(propImageDirectory, { recursive: true });
 mkdirSync(continuityFrameDirectory, { recursive: true });
+mkdirSync(generatedVideoDirectory, { recursive: true });
 mkdirSync(videoMergeDirectory, { recursive: true });
 mkdirSync(projectCoverDirectory, { recursive: true });
 
@@ -58,6 +67,14 @@ async function broadcastRenderJobs() {
       renderJobStreams.delete(stream);
     }
   }
+}
+
+async function localVideoStorageStats() {
+  const names = await readdir(generatedVideoDirectory).catch(() => [] as string[]);
+  const sizes = await Promise.all(names
+    .filter((name) => name.toLowerCase().endsWith(".mp4"))
+    .map((name) => stat(resolve(generatedVideoDirectory, name)).then((file) => file.isFile() ? file.size : 0).catch(() => 0)));
+  return { videoCount: sizes.filter((size) => size > 0).length, bytes: sizes.reduce((total, size) => total + size, 0) };
 }
 
 function publicMediaUrl(value: string, requestBase: string) {
@@ -85,13 +102,40 @@ async function referenceImageSource(value: string, requestBase: string) {
   }
 }
 
+async function persistGeneratedVideo(jobId: string, sourceUrl: string) {
+  if (sourceUrl.startsWith("/api/generated/videos/")) return sourceUrl;
+  const fileName = `${jobId}.mp4`;
+  const outputPath = resolve(generatedVideoDirectory, fileName);
+  const existingFile = await stat(outputPath).catch(() => null);
+  if (existingFile?.isFile() && existingFile.size > 0) return `/api/generated/videos/${fileName}`;
+
+  const temporaryPath = resolve(generatedVideoDirectory, `.${jobId}-${randomUUID()}.tmp`);
+  try {
+    const result = await fetch(sourceUrl, { signal: AbortSignal.timeout(300000) });
+    if (!result.ok) throw new Error(`HTTP ${result.status}`);
+    const bytes = Buffer.from(await result.arrayBuffer());
+    if (!bytes.length) throw new Error("平台返回了空文件");
+    await writeFile(temporaryPath, bytes);
+    await unlink(outputPath).catch(() => undefined);
+    await rename(temporaryPath, outputPath);
+    const outputUrl = `/api/generated/videos/${fileName}`;
+    writeLog("INFO", "[render] 视频已保存到本地", { jobId, outputUrl, bytes: bytes.length });
+    return outputUrl;
+  } catch (error) {
+    throw new Error(`视频生成成功，但保存到本地失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    await unlink(temporaryPath).catch(() => undefined);
+  }
+}
+
 async function extractStableTailFrame(videoUrl: string, projectId: string, shotId: string) {
   const outputPath = resolve(continuityFrameDirectory, `${projectId}-${shotId}-${Date.now()}.jpg`);
+  const videoSource = videoUrl.startsWith("/api/generated/videos/") ? resolve(generatedVideoDirectory, basename(videoUrl)) : videoUrl;
   const ffmpegPath = process.env.FFMPEG_PATH?.trim() || "ffmpeg";
   try {
     await new Promise<void>((resolveFrame, rejectFrame) => {
       const child = spawn(ffmpegPath, [
-        "-hide_banner", "-loglevel", "error", "-sseof", "-0.16", "-i", videoUrl,
+        "-hide_banner", "-loglevel", "error", "-sseof", "-0.16", "-i", videoSource,
         "-frames:v", "1", "-q:v", "2", "-y", outputPath,
       ], { windowsHide: true });
       let stderr = "";
@@ -135,10 +179,13 @@ async function pollVideoTask(jobId: string, projectId: string, taskId: string): 
   try {
     for (let attempt = 0; attempt < 120; attempt += 1) {
       const task = await videoGeneration.getTask(taskId);
+      const outputUrl = task.status === "completed" && task.videoUrl
+        ? await persistGeneratedVideo(jobId, task.videoUrl)
+        : null;
       await db.updateRenderJob(jobId, {
         status: task.status,
         progress: task.progress,
-        outputUrl: task.videoUrl ?? null,
+        outputUrl,
         errorMessage: task.errorMessage ?? null,
       });
       await broadcastRenderJobs();
@@ -146,7 +193,7 @@ async function pollVideoTask(jobId: string, projectId: string, taskId: string): 
         const jobs = (await db.listJobs()).filter((job) => job.projectId === projectId);
         const active = jobs.some((job) => job.status === "queued" || job.status === "processing");
         if (!active) await db.updateProject(projectId, { status: jobs.some((job) => job.status === "failed") ? "failed" : "completed", progress: jobs.some((job) => job.status === "failed") ? 76 : 100 });
-        return task.status === "completed" ? task.videoUrl ?? null : null;
+        return task.status === "completed" ? outputUrl : null;
       }
       await wait(5000);
     }
@@ -237,6 +284,7 @@ const subjectImageSchema = z.object({
   resolution: z.enum(["2K", "4K"]),
   aspectRatio: z.enum(["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4"]),
   referenceImage: z.string().max(11_500_000).regex(/^data:image\/[a-z0-9.+-]+;base64,/i, "参考图格式无效").optional(),
+  watermark: z.boolean().optional(),
 });
 const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
@@ -518,9 +566,13 @@ async function processRenderSequence(input: {
         referenceSubjectIds: referenceSubjects.map((subject) => subject.id),
       });
 
-      let outputUrl = task.status === "completed" ? task.videoUrl ?? null : await pollVideoTask(job.id, project.id, task.taskId);
-      if (task.status === "completed" && task.videoUrl) {
-        await db.updateRenderJob(job.id, { status: "completed", progress: 100, outputUrl: task.videoUrl });
+      let outputUrl = task.status === "completed" && task.videoUrl
+        ? await persistGeneratedVideo(job.id, task.videoUrl)
+        : task.status === "completed"
+          ? null
+          : await pollVideoTask(job.id, project.id, task.taskId);
+      if (task.status === "completed" && outputUrl) {
+        await db.updateRenderJob(job.id, { status: "completed", progress: 100, outputUrl });
         await broadcastRenderJobs();
       }
       if (!outputUrl) throw new Error("当前镜头生成失败，后续镜头已停止，以免失去连续性");
@@ -681,8 +733,44 @@ app.put("/api/settings/video", asyncRoute(async (request, response) => {
   response.json({ data: configureVideo(input) });
 }));
 
+app.get("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
+  const assetType = String(request.params.assetType) as keyof typeof studioImageDirectories;
+  const directory = studioImageDirectories[assetType];
+  if (!directory) return response.status(404).json({ error: "不支持的资产类型" });
+  const names = await readdir(directory).catch(() => [] as string[]);
+  const images = (await Promise.all(names
+    .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
+    .map(async (name) => {
+      const file = await stat(resolve(directory, name)).catch(() => null);
+      if (!file?.isFile()) return null;
+      return { id: name, imageUrl: `/api/generated/${basename(directory)}/${name}`, model: "", size: "", prompt: "", createdAt: file.mtime.toISOString() };
+    })))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    .slice(0, 24);
+  response.json({ data: images });
+}));
+
+app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
+  const startedAt = Date.now();
+  const assetType = String(request.params.assetType) as keyof typeof studioImageDirectories;
+  const directory = studioImageDirectories[assetType];
+  if (!directory) return response.status(404).json({ error: "不支持的资产类型" });
+  if (!imageGeneration.enabled) return response.status(503).json({ error: "尚未配置图片生成 API Key，请先打开模型设置" });
+  const input = subjectImageSchema.parse(request.body);
+  const generated = await imageGeneration.generate(input);
+  if (!generated.bytes.length) throw new Error("图片平台返回了空文件");
+  if (generated.bytes.length > 25 * 1024 * 1024) throw new Error("生成图片超过 25MB，无法保存到本地");
+  const extension = generated.mimeType === "image/jpeg" ? "jpg" : generated.mimeType === "image/webp" ? "webp" : "png";
+  const fileName = `${randomUUID()}.${extension}`;
+  await writeFile(resolve(directory, fileName), generated.bytes);
+  const result = { id: fileName, imageUrl: `/api/generated/${basename(directory)}/${fileName}`, model: input.model, size: generated.size, prompt: input.prompt, createdAt: new Date().toISOString() };
+  writeLog("INFO", "[generate-studio-asset] 完成", { assetType, imageUrl: result.imageUrl, model: input.model, size: generated.size, elapsedMs: Date.now() - startedAt });
+  response.json({ data: result });
+}));
+
 app.get("/api/dashboard", asyncRoute(async (_request, response) => {
-  const [projects, jobs] = await Promise.all([db.listProjects(), db.listJobs()]);
+  const [projects, jobs, localVideos] = await Promise.all([db.listProjects(), db.listJobs(), localVideoStorageStats()]);
   const completed = projects.filter((project) => project.status === "completed").length;
   response.json({
     stats: {
@@ -690,6 +778,8 @@ app.get("/api/dashboard", asyncRoute(async (_request, response) => {
       completedCount: completed,
       activeRenders: jobs.filter((job) => ["queued", "processing"].includes(job.status)).length,
       generatedSeconds: projects.reduce((sum, project) => sum + (project.status === "completed" ? project.durationSeconds : 0), 0),
+      localVideoCount: localVideos.videoCount,
+      localVideoBytes: localVideos.bytes,
     },
     projects: projects.slice(0, 6),
     jobs: jobs.slice(0, 4),

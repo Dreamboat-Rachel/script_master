@@ -1,11 +1,11 @@
-import { ChangeEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft, ArrowRight, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Combine, Download, FileText, Film, FolderOpen, Layers3,
-  Eye, ImagePlus, ListChecks, LoaderCircle, Menu, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
-  RefreshCw, Search, ListFilter, Trash2, Upload, UsersRound, WandSparkles, X,
+  Eye, EyeOff, ImagePlus, ListChecks, LoaderCircle, LockKeyhole, LogOut, Mail, Menu, Moon, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
+  RefreshCw, Search, ListFilter, Sun, Trash2, Upload, UserRound, UsersRound, WandSparkles, X,
 } from "lucide-react";
 import { api } from "./api";
-import type { DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
+import type { CharacterImageResult, DashboardData, Episode, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
 type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
@@ -31,6 +31,29 @@ const sampleScript = `午夜车站
 林默打开信，车站深处传来列车启动的声音。`;
 const MAX_SCRIPT_LENGTH = 200000;
 const MIN_LOGLINE_LENGTH = 50;
+const LOGIN_SESSION_KEY = "script-master-local-session-v1";
+const USER_PROFILE_KEY = "script-master-local-profile-v1";
+const THEME_STORAGE_KEY = "script-master-theme-v1";
+const fallbackLoginCover = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1800&q=88";
+const readSavedSession = () => window.localStorage.getItem(LOGIN_SESSION_KEY) ?? window.sessionStorage.getItem(LOGIN_SESSION_KEY) ?? "";
+type ThemeMode = "dark" | "light";
+const readSavedTheme = (): ThemeMode => {
+  const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+  if (saved === "dark" || saved === "light") return saved;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+};
+type LocalUserProfile = { displayName: string; email: string; avatarDataUrl: string };
+type AccountDialogKind = "profile" | "avatar" | "email" | "logout";
+const emptyUserProfile = (): LocalUserProfile => ({ displayName: "", email: "", avatarDataUrl: "" });
+const readSavedUserProfile = (account: string): LocalUserProfile => {
+  if (!account) return emptyUserProfile();
+  try {
+    const saved = JSON.parse(window.localStorage.getItem(`${USER_PROFILE_KEY}:${account}`) ?? "null") as Partial<LocalUserProfile> | null;
+    return { displayName: saved?.displayName ?? "", email: saved?.email ?? "", avatarDataUrl: saved?.avatarDataUrl ?? "" };
+  } catch {
+    return emptyUserProfile();
+  }
+};
 const imageProviderDefaults: Record<ImageSettings["provider"], string> = {
   volcengine: "https://ark.cn-beijing.volces.com/api/v3",
   aliyun: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -117,6 +140,14 @@ const submittedVideoPrompt = (generationPrompt: string | null) => {
 };
 
 function App() {
+  const [sessionUser, setSessionUser] = useState(readSavedSession);
+  const [theme, setTheme] = useState<ThemeMode>(readSavedTheme);
+  const [userProfile, setUserProfile] = useState<LocalUserProfile>(() => readSavedUserProfile(readSavedSession()));
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+  const [accountDialog, setAccountDialog] = useState<AccountDialogKind | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
+  const [homeSection, setHomeSection] = useState<"home" | "pipeline">("home");
+  const [homeTool, setHomeTool] = useState<StudioAssetType | null>(null);
   const [dashboard, setDashboard] = useState<DashboardData | null>(null);
   const [renderJobs, setRenderJobs] = useState<RenderJob[]>([]);
   const [project, setProject] = useState<Project | null>(null);
@@ -180,6 +211,10 @@ function App() {
     finally { setManagerLoading(false); }
   };
   useEffect(() => { void refresh(); void api.videoSettings().then(setVideoSettings).catch(() => undefined); }, []);
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem(THEME_STORAGE_KEY, theme);
+  }, [theme]);
   const hasActiveRender = Boolean(project?.id && renderJobs.some((job) => job.projectId === project.id && (job.status === "queued" || job.status === "processing")));
   useEffect(() => {
     if (!hasActiveRender) return;
@@ -308,11 +343,49 @@ function App() {
   };
   const handleFile = (event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { const content = String(reader.result ?? ""); setScriptText(content.slice(0, MAX_SCRIPT_LENGTH)); if (content.length > MAX_SCRIPT_LENGTH) setToast("文件内容超过 200000 字符，已截取前 200000 字符"); }; reader.readAsText(file, "utf-8"); event.target.value = ""; };
   const navigate = (nextStage: Stage) => { if (sourceScriptMode && nextStage === "setup") return; const required: Record<Stage, boolean> = { setup: true, format: Boolean(project), episodes: pipeline.document?.formatStatus === "formatted", subjects: pipeline.episodes.length > 0, shots: pipeline.subjects.length > 0, render: pipeline.shots.length > 0 }; if (!required[nextStage]) { setToast(`请先完成「${stages[Math.max(0, stages.findIndex((item) => item.id === nextStage) - 1)].label}」`); return; } setStage(nextStage); setMobileNavOpen(false); };
-  const newWorkflow = () => { setProjectManagerVisible(false); setNewProjectDialogOpen(true); };
-  const openProjectManager = () => { setProjectManagerVisible(true); void refreshProjectManager(); };
+  const newWorkflow = () => { setHomeTool(null); setProjectManagerVisible(false); setNewProjectDialogOpen(true); };
+  const login = (account: string, remember: boolean) => {
+    window.localStorage.removeItem(LOGIN_SESSION_KEY);
+    window.sessionStorage.removeItem(LOGIN_SESSION_KEY);
+    (remember ? window.localStorage : window.sessionStorage).setItem(LOGIN_SESSION_KEY, account);
+    setSessionUser(account);
+    setUserProfile(readSavedUserProfile(account));
+  };
+  const saveUserProfile = (next: LocalUserProfile, message: string) => {
+    try {
+      window.localStorage.setItem(`${USER_PROFILE_KEY}:${sessionUser}`, JSON.stringify(next));
+    } catch {
+      setToast("保存失败，请更换更小的头像后重试");
+      return;
+    }
+    setUserProfile(next);
+    setAccountDialog(null);
+    setToast(message);
+  };
+  const logout = () => {
+    window.localStorage.removeItem(LOGIN_SESSION_KEY);
+    window.sessionStorage.removeItem(LOGIN_SESSION_KEY);
+    setSessionUser("");
+    setProject(null);
+    setHomeVisible(true);
+    setProjectManagerVisible(false);
+    setHomeTool(null);
+    setSettingsOpen(false);
+    setAccountMenuOpen(false);
+    setAccountDialog(null);
+    setUserProfile(emptyUserProfile());
+    window.scrollTo(0, 0);
+  };
+  const openProjectManager = () => { setHomeTool(null); setHomeSection("home"); setProjectManagerVisible(true); void refreshProjectManager(); };
+  const openAssetStudio = (assetType: StudioAssetType) => {
+    setProjectManagerVisible(false);
+    setHomeTool(assetType);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    void api.imageSettings().then(setImageSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
+  };
   const chooseNewProjectMode = (hasScript: boolean) => { setNewProjectDialogOpen(false); setProject(null); setSourceScriptMode(hasScript); setPipeline(emptyPipeline()); setScriptText(""); setSetupDraft({ title: hasScript ? "已有剧本项目" : "", logline: "", genre: "悬疑", style: "电影写实", aspectRatio: "16:9", durationSeconds: 60, targetEpisodeCount: 3 }); setMobileNavOpen(false); if (hasScript) { setExistingScriptSetupOpen(true); return; } setHomeVisible(false); setStage("setup"); };
   const confirmExistingScriptSetup = () => run("setup", async () => { const next = await api.createProject(projectInput(setupDraft)); setProject(next); setHomeVisible(false); setExistingScriptSetupOpen(false); setStage("format"); setDashboard(await api.dashboard()); }, "项目设定已保存，请导入剧本");
-  const goHome = () => { setProject(null); setSourceScriptMode(false); setHomeVisible(true); setProjectManagerVisible(false); window.scrollTo(0, 0); setStage("setup"); setMobileNavOpen(false); };
+  const goHome = () => { setProject(null); setSourceScriptMode(false); setHomeVisible(true); setProjectManagerVisible(false); setHomeTool(null); setHomeSection("home"); window.scrollTo(0, 0); setStage("setup"); setMobileNavOpen(false); };
   const saveShotEdits = async (shot: Shot, input: { location: string; action: string; visualPrompt: string }) => {
     try {
       const updated = await api.updateShot(shot.projectId, shot.id, input);
@@ -335,37 +408,451 @@ function App() {
   const subjectDeleteDialog = deleteSubjectTarget && <DeleteSubjectDialog subject={deleteSubjectTarget} busy={workingAction === "deleteSubject"} onConfirm={confirmDeleteSubject} onClose={() => { if (workingAction !== "deleteSubject") setDeleteSubjectTarget(null); }} />;
 
   if (loading) return <div className="loading-screen"><LoaderCircle className="spin" size={24} /><span>正在载入工作区</span></div>;
-  if (homeVisible) return <div className="app-shell home-shell"><header className="topbar home-topbar"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }}><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span><span className="brand-code">/ SCRIPT TO VIDEO</span></a><div className="home-topbar-title" aria-hidden="true" /> <div className="top-actions"><button className="text-button home-manager-button" onClick={openProjectManager}><FolderOpen size={15} />项目管理</button><span className="connection"><i />LOCAL WORKSPACE</span><button className="icon-button" aria-label="模型设置" onClick={openSettings}><Settings2 size={17} /></button><span className="avatar">M</span></div></header>{error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onBack={goHome} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} projectCount={dashboard?.stats.projectCount ?? 0} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}{newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}{existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}{deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={workingAction === "delete"} onConfirm={confirmDeleteProject} onClose={() => setDeleteTarget(null)} />}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}</div>;
+  if (!sessionUser) return <LoginScreen coverUrl={dashboard?.projects.find((item) => item.coverUrl)?.coverUrl ?? fallbackLoginCover} onLogin={login} />;
+  const openAccountDialog = (kind: AccountDialogKind) => { setAccountMenuOpen(false); setAccountDialog(kind); };
+  const accountMenu = <AccountMenu account={sessionUser} profile={userProfile} open={accountMenuOpen} onToggle={() => setAccountMenuOpen((current) => !current)} onClose={() => setAccountMenuOpen(false)} onSelect={openAccountDialog} />;
+  const accountDialogNode = accountDialog && <AccountDialog kind={accountDialog} account={sessionUser} profile={userProfile} onSave={saveUserProfile} onLogout={logout} onClose={() => setAccountDialog(null)} />;
+  const themeButton = <button type="button" className="icon-button theme-toggle" aria-label={theme === "dark" ? "当前为夜间模式，点击切换到日间模式" : "当前为日间模式，点击切换到夜间模式"} title={theme === "dark" ? "夜间模式" : "日间模式"} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Moon size={17} /> : <Sun size={17} />}</button>;
+  const showHomeSection = (sectionId?: string) => {
+    setHomeTool(null);
+    setHomeSection(sectionId === "pipeline" ? "pipeline" : "home");
+    setProjectManagerVisible(false);
+    window.requestAnimationFrame(() => sectionId ? document.getElementById(sectionId)?.scrollIntoView({ behavior: "smooth", block: "start" }) : window.scrollTo({ top: 0, behavior: "smooth" }));
+  };
+  if (homeVisible) return <div className="app-shell home-shell">
+    <header className="topbar home-topbar">
+      <a className="brand" href="#home" onClick={(event) => { event.preventDefault(); showHomeSection(); }}><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a>
+      <HomeNavigation active={homeTool ? "tools" : projectManagerVisible ? "assets" : homeSection} onHome={() => showHomeSection()} onPipeline={() => showHomeSection("pipeline")} onAssets={openProjectManager} onSelectTool={openAssetStudio} onCreate={newWorkflow} onHelp={() => setHelpOpen(true)} />
+      <div className="top-actions">{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div>
+    </header>
+    {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onBack={() => showHomeSection()} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
+    {newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}
+    {existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}
+    {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={workingAction === "delete"} onConfirm={confirmDeleteProject} onClose={() => setDeleteTarget(null)} />}
+    {helpOpen && <HelpDialog onCreate={newWorkflow} onAssets={openProjectManager} onClose={() => setHelpOpen(false)} />}
+    {settingsDialog}{accountDialogNode}{toast && <div className="toast"><Check size={16} />{toast}</div>}
+  </div>;
   return <div className="app-shell project-shell">
-    <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "新建项目"}</span><button className="icon-button" aria-label="模型设置" onClick={openSettings}><Settings2 size={17} /></button><span className="avatar">M</span></div></header>
+    <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "新建项目"}</span>{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div></header>
     <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}
+    {accountDialogNode}
   </div>;
 }
 
 type ProjectDraft = { title: string; logline: string; genre: string; style: string; aspectRatio: string; durationSeconds: number; targetEpisodeCount: number };
 type SelectOption = { value: string; label: string };
 
-function HomeStage({ projects, projectCount, onNew, onManage, onOpen, onDelete }: { projects: Project[]; projectCount: number; onNew: () => void; onManage: () => void; onOpen: (project: Project, stage?: Stage) => void; onDelete: (project: Project) => void }) {
-  const featured = projects[0];
+type HomeNavigationProps = {
+  active: "home" | "pipeline" | "tools" | "assets";
+  onHome: () => void;
+  onPipeline: () => void;
+  onAssets: () => void;
+  onSelectTool: (assetType: StudioAssetType) => void;
+  onCreate: () => void;
+  onHelp: () => void;
+};
+
+function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, onCreate, onHelp }: HomeNavigationProps) {
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const navigationRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!toolsOpen) return;
+    const closeOnOutsideClick = (event: MouseEvent) => { if (navigationRef.current && !navigationRef.current.contains(event.target as Node)) setToolsOpen(false); };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") setToolsOpen(false); };
+    document.addEventListener("mousedown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => { document.removeEventListener("mousedown", closeOnOutsideClick); document.removeEventListener("keydown", closeOnEscape); };
+  }, [toolsOpen]);
+  const runAndClose = (action: () => void) => { setToolsOpen(false); action(); };
+  const toolButton = (label: string) => {
+    const assetType = ({ "角色": "character", "场景": "scene", "物品": "prop" } as Partial<Record<string, StudioAssetType>>)[label];
+    return <button type="button" key={label} onClick={() => runAndClose(assetType ? () => onSelectTool(assetType) : onCreate)}>{label}</button>;
+  };
+
+  return <div className="home-nav-shell" ref={navigationRef}>
+    <nav className="home-nav" aria-label="首页导航">
+      <button type="button" className={active === "home" && !toolsOpen ? "active" : ""} onClick={() => runAndClose(onHome)}>首页</button>
+      <button type="button" className={active === "pipeline" && !toolsOpen ? "active" : ""} onClick={() => runAndClose(onPipeline)}>流水线</button>
+      <button type="button" className={`home-tools-trigger ${toolsOpen || active === "tools" ? "active" : ""}`} aria-haspopup="menu" aria-expanded={toolsOpen} onClick={() => setToolsOpen((current) => !current)}>更多工具<ChevronDown size={14} /></button>
+      <button type="button" className={active === "assets" ? "active" : ""} onClick={() => runAndClose(onAssets)}>资产</button>
+      <button type="button" onClick={() => runAndClose(onHelp)}>帮助文档</button>
+    </nav>
+    {toolsOpen && <section className="home-nav-mega" aria-label="更多创作工具">
+      <div className="mega-column">
+        <div><span>创作</span><div className="mega-tool-list">{["角色", "场景", "物品", "分镜图"].map(toolButton)}</div></div>
+        <div><span>AI 视频</span><div className="mega-tool-list">{["参考生视频", "首尾帧视频"].map(toolButton)}</div></div>
+        <div><span>配音</span><div className="mega-tool-list">{["声音克隆", "文转语音"].map(toolButton)}</div></div>
+      </div>
+      <div className="mega-column">
+        <div><span>更多工具</span><div className="mega-tool-list">{["一键高清", "多角度图片", "无限画布"].map(toolButton)}</div></div>
+        <div className="mega-separated"><span>对口型创作</span><div className="mega-tool-list">{["文本对口型", "音频对口型", "角色替换", "分镜替换", "真人素材", "角色固定", "提示词工坊"].map(toolButton)}</div></div>
+      </div>
+    </section>}
+  </div>;
+}
+
+function HelpDialog({ onCreate, onAssets, onClose }: { onCreate: () => void; onAssets: () => void; onClose: () => void }) {
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  const runAndClose = (action: () => void) => { onClose(); action(); };
+  return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <section className="settings-dialog help-dialog" role="dialog" aria-modal="true" aria-labelledby="help-title">
+      <div className="settings-dialog-head"><div><span className="panel-eyebrow">HELP CENTER</span><h2 id="help-title">帮助文档</h2><p>从剧本开始，按流水线完成一部视频。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭帮助文档"><X size={18} /></button></div>
+      <div className="help-steps">
+        <div><span>01</span><strong>建立项目</strong><p>选择已有剧本，或让模型先生成剧本草案。</p></div>
+        <div><span>02</span><strong>完成流水线</strong><p>依次整理剧本、提取主体、生成分镜和视频。</p></div>
+        <div><span>03</span><strong>管理资产</strong><p>在资产页面查找、继续编辑或删除本地项目。</p></div>
+      </div>
+      <div className="settings-actions"><button className="secondary-button" onClick={() => runAndClose(onAssets)}><FolderOpen size={15} />查看资产</button><button className="primary-button" onClick={() => runAndClose(onCreate)}><Plus size={15} />开始创作</button></div>
+    </section>
+  </div>;
+}
+
+function UserAvatar({ account, profile, large = false }: { account: string; profile: LocalUserProfile; large?: boolean }) {
+  const initial = (profile.displayName || account).trim().slice(0, 1).toLocaleUpperCase() || "M";
+  return <span className={`user-avatar-face ${large ? "large" : ""}`}>{profile.avatarDataUrl ? <img src={profile.avatarDataUrl} alt="用户头像" /> : initial}</span>;
+}
+
+function AccountMenu({ account, profile, open, onToggle, onClose, onSelect }: { account: string; profile: LocalUserProfile; open: boolean; onToggle: () => void; onClose: () => void; onSelect: (kind: AccountDialogKind) => void }) {
+  const menuRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const closeMenu = (event: MouseEvent) => { if (menuRef.current && !menuRef.current.contains(event.target as Node)) onClose(); };
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("mousedown", closeMenu);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => { document.removeEventListener("mousedown", closeMenu); document.removeEventListener("keydown", closeOnEscape); };
+  }, [open, onClose]);
+  const name = profile.displayName || account;
+
+  return <div className="account-control" ref={menuRef}>
+    <button type="button" className={`avatar ${open ? "active" : ""}`} aria-label="打开账户菜单" aria-haspopup="menu" aria-expanded={open} title={`${name} · 账户菜单`} onClick={onToggle}><UserAvatar account={account} profile={profile} /></button>
+    {open && <div className="account-menu" role="menu" aria-label="账户菜单">
+      <div className="account-menu-profile"><UserAvatar account={account} profile={profile} /><span><strong>{name}</strong><small>{profile.email || account}</small></span></div>
+      <div className="account-menu-items">
+        <button type="button" role="menuitem" onClick={() => onSelect("profile")}><UserRound size={16} /><span><strong>个人信息</strong><small>查看账号并修改昵称</small></span></button>
+        <button type="button" role="menuitem" onClick={() => onSelect("avatar")}><ImagePlus size={16} /><span><strong>修改头像</strong><small>使用本地图片作为头像</small></span></button>
+        <button type="button" role="menuitem" onClick={() => onSelect("email")}><Mail size={16} /><span><strong>{profile.email ? "更换邮箱" : "绑定邮箱"}</strong><small>{profile.email || "尚未绑定邮箱"}</small></span></button>
+      </div>
+      <div className="account-menu-items account-menu-danger"><button type="button" role="menuitem" onClick={() => onSelect("logout")}><LogOut size={16} /><span><strong>退出登录</strong><small>返回登录页面</small></span></button></div>
+    </div>}
+  </div>;
+}
+
+function AccountDialog({ kind, account, profile, onSave, onLogout, onClose }: { kind: AccountDialogKind; account: string; profile: LocalUserProfile; onSave: (profile: LocalUserProfile, message: string) => void; onLogout: () => void; onClose: () => void }) {
+  const [displayName, setDisplayName] = useState(profile.displayName || account);
+  const [email, setEmail] = useState(profile.email);
+  const [avatarDataUrl, setAvatarDataUrl] = useState(profile.avatarDataUrl);
+  const [error, setError] = useState("");
+  const avatarInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [onClose]);
+  const selectAvatar = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setError("请选择图片文件"); return; }
+    if (file.size > 2 * 1024 * 1024) { setError("头像图片不能超过 2MB"); return; }
+    const reader = new FileReader();
+    reader.onload = () => { setAvatarDataUrl(String(reader.result ?? "")); setError(""); };
+    reader.onerror = () => setError("头像读取失败，请重新选择");
+    reader.readAsDataURL(file);
+    event.target.value = "";
+  };
+  const backdropProps = { className: "settings-backdrop", role: "presentation", onMouseDown: (event: React.MouseEvent<HTMLDivElement>) => { if (event.target === event.currentTarget) onClose(); } };
+
+  if (kind === "logout") return <div {...backdropProps}><section className="settings-dialog account-dialog logout-dialog" role="dialog" aria-modal="true" aria-labelledby="logout-title">
+    <div className="settings-dialog-head"><div><span className="panel-eyebrow">ACCOUNT</span><h2 id="logout-title">确定退出登录吗？</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭退出确认"><X size={18} /></button></div>
+    <div className="account-logout-copy"><LogOut size={19} /><div><strong>将结束当前登录状态</strong><p>你的项目和个人资料仍会保存在当前设备中。</p></div></div>
+    <div className="settings-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="danger-button" onClick={onLogout}><LogOut size={15} />退出登录</button></div>
+  </section></div>;
+
+  if (kind === "avatar") return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="avatar-title">
+    <div className="settings-dialog-head"><div><span className="panel-eyebrow">PROFILE IMAGE</span><h2 id="avatar-title">修改头像</h2><p>图片只会保存在当前设备。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭头像设置"><X size={18} /></button></div>
+    <div className="avatar-editor"><UserAvatar account={account} profile={{ ...profile, avatarDataUrl }} large /><div><button className="secondary-button" type="button" onClick={() => avatarInput.current?.click()}><Upload size={15} />选择图片</button>{avatarDataUrl && <button className="text-button" type="button" onClick={() => setAvatarDataUrl("")}>移除头像</button>}<input ref={avatarInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={selectAvatar} /></div><small>支持 JPG、PNG、WebP，最大 2MB</small></div>
+    {error && <p className="account-dialog-error" role="alert">{error}</p>}
+    <div className="settings-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={() => onSave({ ...profile, avatarDataUrl }, "头像已更新")}><Check size={15} />保存头像</button></div>
+  </section></div>;
+
+  if (kind === "email") {
+    const emailReady = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
+    const submitEmail = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (emailReady) onSave({ ...profile, email: email.trim() }, profile.email ? "邮箱已更新" : "邮箱已绑定"); else setError("请输入有效的邮箱地址"); };
+    return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="email-title">
+      <div className="settings-dialog-head"><div><span className="panel-eyebrow">EMAIL</span><h2 id="email-title">{profile.email ? "更换绑定邮箱" : "绑定邮箱"}</h2><p>用于完善当前设备上的个人资料。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭邮箱设置"><X size={18} /></button></div>
+      <form onSubmit={submitEmail}><label className="account-dialog-field"><span>邮箱地址</span><div><Mail size={16} /><input type="email" value={email} onChange={(event) => { setEmail(event.target.value); setError(""); }} autoComplete="email" placeholder="name@example.com" autoFocus /></div></label>{error && <p className="account-dialog-error" role="alert">{error}</p>}<div className="settings-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="submit" disabled={!email.trim()}><Check size={15} />确认绑定</button></div></form>
+    </section></div>;
+  }
+
+  const submitProfile = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const nextName = displayName.trim(); if (nextName.length < 2) { setError("昵称至少需要 2 个字符"); return; } onSave({ ...profile, displayName: nextName }, "个人信息已保存"); };
+  return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="profile-title">
+    <div className="settings-dialog-head"><div><span className="panel-eyebrow">PERSONAL PROFILE</span><h2 id="profile-title">个人信息</h2><p>查看账号信息并设置显示昵称。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭个人信息"><X size={18} /></button></div>
+    <div className="account-profile-lead"><UserAvatar account={account} profile={profile} large /><div><strong>{profile.displayName || account}</strong><small>{profile.email || "邮箱未绑定"}</small></div></div>
+    <form onSubmit={submitProfile}><label className="account-dialog-field"><span>登录账号</span><div className="readonly"><UserRound size={16} /><input value={account} readOnly /></div></label><label className="account-dialog-field"><span>显示昵称</span><div><Pencil size={16} /><input value={displayName} onChange={(event) => { setDisplayName(event.target.value); setError(""); }} maxLength={24} placeholder="请输入昵称" autoFocus /></div></label>{error && <p className="account-dialog-error" role="alert">{error}</p>}<div className="settings-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="submit" disabled={!displayName.trim()}><Check size={15} />保存资料</button></div></form>
+  </section></div>;
+}
+
+function LoginScreen({ coverUrl, onLogin }: { coverUrl: string; onLogin: (account: string, remember: boolean) => void }) {
+  const [account, setAccount] = useState("");
+  const [password, setPassword] = useState("");
+  const [remember, setRemember] = useState(true);
+  const [passwordVisible, setPasswordVisible] = useState(false);
+  const [attempted, setAttempted] = useState(false);
+  const ready = account.trim().length >= 2 && password.length >= 4;
+  const authenticate = () => {
+    setAttempted(true);
+    if (ready) onLogin(account.trim(), remember);
+  };
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    authenticate();
+  };
+
+  return <main className="login-screen">
+    <section className="login-visual" aria-label="作品画面">
+      <img src={coverUrl} alt="" />
+      <div className="login-visual-shade" />
+      <div className="login-brand"><span className="brand-mark"><Film size={18} /></span><span><strong>拥抱世界</strong><small>SCRIPT TO VIDEO</small></span></div>
+      <div className="login-story"><strong>让每一个镜头，<br />都从好故事开始。</strong></div>
+    </section>
+    <section className="login-panel">
+      <div className="login-form-wrap">
+        <span className="panel-eyebrow">LOCAL WORKSPACE ACCESS</span>
+        <h1>欢迎回来</h1>
+        <p>登录后继续你的剧本到视频创作。</p>
+        <form className="login-form" onSubmit={submit} noValidate>
+          <label className="login-field"><span>账号</span><div><UserRound size={17} /><input value={account} onChange={(event) => setAccount(event.target.value)} autoComplete="username" placeholder="请输入账号" aria-invalid={attempted && account.trim().length < 2} /></div></label>
+          <label className="login-field"><span>密码</span><div><LockKeyhole size={17} /><input type={passwordVisible ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="请输入密码" aria-invalid={attempted && password.length < 4} /><button type="button" aria-label={passwordVisible ? "隐藏密码" : "显示密码"} title={passwordVisible ? "隐藏密码" : "显示密码"} onClick={() => setPasswordVisible((current) => !current)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
+          <div className="login-options"><label><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} /><span>下次自动进入</span></label><small>仅保存在当前设备</small></div>
+          {attempted && !ready && <p className="login-error" role="alert">请输入至少 2 位账号和 4 位密码</p>}
+          <div className="login-actions">
+            <button className="login-submit" type="submit" disabled={!account.trim() || !password}>登录</button>
+            <button className="login-register" type="button" disabled={!account.trim() || !password} onClick={authenticate}>注册</button>
+          </div>
+        </form>
+        <div className="login-note"><LogOut size={14} /><span>密码不会保存，登录状态可随时从右上角退出。</span></div>
+      </div>
+      <footer><span>拥抱世界 AI</span><small>LOCAL FIRST · PRIVATE BY DEFAULT</small></footer>
+    </section>
+  </main>;
+}
+
+type CharacterStudioDraft = {
+  name: string;
+  description: string;
+  referenceImage?: string;
+  referenceName: string;
+  style: string;
+  model: string;
+  resolution: ImageResolution;
+  aspectRatio: ImageAspectRatio;
+  watermark: boolean;
+};
+
+const studioAssetConfig: Record<StudioAssetType, {
+  title: string;
+  englishTitle: string;
+  nameLabel: string;
+  descriptionLabel: string;
+  description: string;
+  namePlaceholder: string;
+  descriptionPlaceholder: string;
+  exampleName: string;
+  examplePrompt: string;
+  requirement: string;
+  defaultRatio: ImageAspectRatio;
+}> = {
+  character: {
+    title: "角色生成", englishTitle: "CHARACTER STUDIO", nameLabel: "角色名称", descriptionLabel: "角色描述",
+    description: "定义角色的外观与气质，生成结果会自动保存在本地。", namePlaceholder: "例如：林默",
+    descriptionPlaceholder: "描述年龄、五官、发型、服装、体态、气质和关键识别特征",
+    exampleName: "林默",
+    examplePrompt: "28岁亚洲男性，短黑发，眉眼锋利，身形修长，穿深灰色长风衣与黑色高领衫，沉静克制，左眉尾有一道浅疤。角色四视图设定，同一画布依次展示正面、左侧、背面、右侧，全身完整，四个视图的人物比例、脸型、发型、服装和配饰完全一致。",
+    requirement: "角色四视图设定图，在同一画布按顺序展示正面、左侧、背面、右侧；同一人物、同一年龄、同一服装，四个视图等高等比例，全身完整，背景纯净；禁止额外人物、动作场景和文字。",
+    defaultRatio: "3:2",
+  },
+  scene: {
+    title: "场景生成", englishTitle: "SCENE STUDIO", nameLabel: "场景名称", descriptionLabel: "场景描述",
+    description: "固定空间结构、材质与光线，为后续镜头提供一致的场景参考。", namePlaceholder: "例如：雨夜旧车站",
+    descriptionPlaceholder: "描述空间布局、建筑结构、材质、时间、天气、灯光和关键陈设",
+    exampleName: "雨夜旧车站",
+    examplePrompt: "废弃的欧式小镇车站，拱形铁架屋顶，湿润石质站台，左侧旧售票亭，右侧两条生锈铁轨，尽头有红色信号灯，深夜细雨与冷蓝月光。场景四视图设定，同一画布展示入口视角、正向全景、反向全景、侧向全景，空间结构、门窗、轨道和固定陈设的位置完全一致。",
+    requirement: "场景四视图设定图，在同一画布展示入口视角、正向全景、反向全景、侧向全景；保持建筑结构、空间尺度、门窗、出入口和固定陈设完全一致；空置无人，禁止人物、拼接错误、漂浮物和文字。",
+    defaultRatio: "16:9",
+  },
+  prop: {
+    title: "物品生成", englishTitle: "PROP STUDIO", nameLabel: "物品名称", descriptionLabel: "物品描述",
+    description: "明确物品的结构、材质和识别细节，生成可复用的设定参考。", namePlaceholder: "例如：黄铜怀表",
+    descriptionPlaceholder: "描述形状、尺寸、材质、颜色、纹理、接口和开合结构",
+    exampleName: "黄铜怀表",
+    examplePrompt: "掌心大小的旧黄铜机械怀表，圆形表壳，表盖刻有放射状花纹，边缘轻微磨损，白色珐琅表盘，黑色罗马数字，顶部连接细链。物品四视图设定，同一画布依次展示正面、左侧、背面、右侧，四个视图尺寸一致，并补充表盖打开状态的结构细节。",
+    requirement: "物品四视图设定图，在同一画布按顺序展示正面、左侧、背面、右侧；同一物品、等比例、完整不裁切，准确呈现材质、纹理、接口和开合部件；纯净背景，禁止人物、手、使用场景和文字。",
+    defaultRatio: "3:2",
+  },
+};
+
+function CharacterStudio({ assetType, imageSettings, onConfigure, onToast }: { assetType: StudioAssetType; imageSettings: ImageSettings | null; onConfigure: () => void; onToast: (message: string) => void }) {
+  const config = studioAssetConfig[assetType];
+  const [draft, setDraft] = useState<CharacterStudioDraft>({ name: "", description: "", referenceName: "", style: "电影写实", model: imageModelOptions[0], resolution: "2K", aspectRatio: config.defaultRatio, watermark: false });
+  const [results, setResults] = useState<CharacterImageResult[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [generating, setGenerating] = useState(false);
+  const [pageError, setPageError] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    void api.assetImages(assetType)
+      .then((items) => {
+        if (!active) return;
+        setResults(items);
+        setSelectedId(items[0]?.id ?? null);
+      })
+      .catch((caught) => { if (active) setPageError(caught instanceof Error ? caught.message : "生成记录读取失败"); })
+      .finally(() => { if (active) setHistoryLoading(false); });
+    return () => { active = false; };
+  }, [assetType]);
+
+  useEffect(() => {
+    if (imageSettings?.model) setDraft((current) => ({ ...current, model: imageSettings.model }));
+  }, [imageSettings?.model]);
+
+  const selected = results.find((item) => item.id === selectedId) ?? results[0] ?? null;
+  const ready = Boolean(imageSettings?.configured && draft.name.trim() && draft.description.trim().length >= 8 && draft.model.trim());
+  const modelOptions = Array.from(new Set([imageSettings?.model, draft.model, ...imageModelOptions].filter(Boolean) as string[])).map((value) => ({ value, label: value }));
+  const change = <K extends keyof CharacterStudioDraft>(key: K, value: CharacterStudioDraft[K]) => setDraft((current) => ({ ...current, [key]: value }));
+  const selectReference = (file: File | undefined) => {
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { setPageError("请选择 PNG、JPG 或 WebP 图片"); return; }
+    if (file.size > 8 * 1024 * 1024) { setPageError("参考图不能超过 8MB"); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setDraft((current) => ({ ...current, referenceImage: String(reader.result ?? ""), referenceName: file.name }));
+      setPageError("");
+    };
+    reader.onerror = () => setPageError("参考图读取失败，请重新选择");
+    reader.readAsDataURL(file);
+  };
+  const generate = async () => {
+    if (generating) return;
+    if (!imageSettings?.configured) { onConfigure(); return; }
+    if (!ready) { setPageError(`请填写${config.nameLabel}，并至少用 8 个字补充${config.descriptionLabel}`); return; }
+    setGenerating(true);
+    setPageError("");
+    const prompt = [
+      `${config.nameLabel}：${draft.name.trim()}`,
+      `${config.descriptionLabel}：${draft.description.trim()}`,
+      `视觉风格：${draft.style}`,
+      `生成要求：${config.requirement}`,
+      draft.watermark ? "水印要求：允许图片平台添加水印。" : "水印要求：画面中不要出现任何水印。",
+    ].join("\n");
+    try {
+      const result = await api.generateAssetImage(assetType, { prompt, model: draft.model.trim(), resolution: draft.resolution, aspectRatio: draft.aspectRatio, referenceImage: draft.referenceImage, watermark: draft.watermark });
+      setResults((current) => [result, ...current.filter((item) => item.id !== result.id)]);
+      setSelectedId(result.id);
+      onToast(`“${draft.name.trim()}”已生成并保存到本地`);
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : `${config.title}失败`);
+    } finally {
+      setGenerating(false);
+    }
+  };
+
+  return <main className="character-studio-content">
+    <header className="character-studio-head">
+      <div><span className="panel-eyebrow">{config.englishTitle}</span><h1>{config.title}</h1><p>{config.description}</p></div>
+      <span className={`character-config-state ${imageSettings?.configured ? "configured" : ""}`}><i />{imageSettings?.configured ? "图片模型已连接" : "图片模型未配置"}</span>
+    </header>
+    <div className="character-studio-layout">
+      <section className="character-controls" aria-label={`${config.title}参数`}>
+        <div className="character-section-title"><span>生成参数</span><small>01 / INPUT</small></div>
+        <label className="character-field"><span>{config.nameLabel}</span><input value={draft.name} maxLength={40} onChange={(event) => change("name", event.target.value)} placeholder={config.namePlaceholder} /></label>
+        <div className="character-field character-prompt-field"><div className="character-field-label"><span>{config.descriptionLabel}</span><button type="button" className="character-example-button" onClick={() => setDraft((current) => ({ ...current, name: config.exampleName, description: config.examplePrompt }))}><Sparkles size={13} />四视图示例</button></div><textarea aria-label={config.descriptionLabel} value={draft.description} maxLength={1200} onChange={(event) => change("description", event.target.value)} placeholder={config.descriptionPlaceholder} /><small>{draft.description.length} / 1200</small></div>
+        <div className="character-field character-reference-field">
+          <span>参考图</span>
+          <div className="character-reference-row">
+            <div className="character-reference-tile">
+              <label className={`character-reference-picker ${draft.referenceImage ? "has-preview" : ""}`} title={draft.referenceImage ? `更换参考图：${draft.referenceName}` : "添加参考图，支持 PNG、JPG、WebP，最大 8MB"}>
+                <input type="file" accept="image/png,image/jpeg,image/webp" disabled={generating} onChange={(event) => { selectReference(event.target.files?.[0]); event.target.value = ""; }} />
+                {draft.referenceImage ? <img src={draft.referenceImage} alt="参考图预览" /> : <><Plus size={19} /><strong>{config.nameLabel.replace("名称", "图片")}</strong></>}
+              </label>
+              {draft.referenceImage && <button type="button" className="character-reference-remove" disabled={generating} onClick={() => setDraft((current) => ({ ...current, referenceImage: undefined, referenceName: "" }))} aria-label="移除参考图" title="移除参考图"><X size={12} /></button>}
+            </div>
+          </div>
+        </div>
+        <div className="character-field"><span>视觉风格</span><SmoothSelect value={draft.style} onChange={(value) => change("style", value)} ariaLabel="视觉风格" options={["电影写实", "胶片人像", "日系动画", "国风水墨", "赛博电影", "3D 渲染"].map((value) => ({ value, label: value }))} /></div>
+        <div className="character-parameter-row">
+          <div className="character-field"><span>画面比例</span><SmoothSelect value={draft.aspectRatio} onChange={(value) => change("aspectRatio", value as ImageAspectRatio)} ariaLabel="画面比例" options={imageRatioOptions} /></div>
+          <div className="character-field"><span>分辨率</span><SmoothSelect value={draft.resolution} onChange={(value) => change("resolution", value as ImageResolution)} ariaLabel="分辨率" options={[{ value: "2K", label: "2K" }, { value: "4K", label: "4K" }]} /></div>
+        </div>
+        <div className="character-field"><span>图片模型</span><SmoothSelect value={draft.model} onChange={(value) => change("model", value)} ariaLabel="图片模型" options={modelOptions} /></div>
+        <button type="button" className={`video-toggle character-watermark-toggle ${draft.watermark ? "on" : ""}`} onClick={() => change("watermark", !draft.watermark)} aria-pressed={draft.watermark}><span>添加水印</span><i /></button>
+        {pageError && <div className="character-error" role="alert">{pageError}</div>}
+        {!imageSettings?.configured ? <button type="button" className="primary-button character-generate" onClick={onConfigure}><Settings2 size={17} />前往模型设置</button> : <button type="button" className="primary-button character-generate" onClick={() => void generate()} disabled={!ready || generating}>{generating ? <LoaderCircle className="spin" size={18} /> : <WandSparkles size={18} />}{generating ? `正在${config.title}` : config.title}</button>}
+      </section>
+      <section className="character-results" aria-label={`${config.title}结果`}>
+        <div className="character-section-title"><span>生成结果</span><small>{results.length ? `${results.length} 张已保存` : "02 / OUTPUT"}</small></div>
+        <div className="character-results-body">
+          <div className={`character-preview ${generating ? "is-generating" : ""}`}>
+            {selected ? <img src={selected.imageUrl} alt={`已生成的${config.nameLabel.replace("名称", "")}`} /> : <div className="character-empty">{historyLoading ? <><LoaderCircle className="spin" size={26} /><strong>正在读取本地作品</strong></> : <><ImagePlus size={31} /><strong>生成结果会显示在这里</strong><span>填写左侧参数，创建第一张四视图设定图</span></>}</div>}
+            {generating && <div className="character-generating"><LoaderCircle className="spin" size={28} /><strong>正在生成四视图</strong><span>生成完成后会自动保存并显示</span></div>}
+            {selected && !generating && <div className="character-preview-actions"><span>{selected.size || imageSizeLabels[draft.resolution][draft.aspectRatio]}</span><a className="icon-button" href={selected.imageUrl} download={`${assetType}-${selected.id}`} aria-label="下载生成图片" title="下载生成图片"><Download size={17} /></a></div>}
+          </div>
+          <aside className="character-history" aria-label="最近生成"><div><strong>最近生成</strong><span>{results.length ? `${results.length} 张` : "暂无记录"}</span></div>{results.length ? <div className="character-history-strip">{results.map((item, index) => <button type="button" key={item.id} className={item.id === selected?.id ? "selected" : ""} onClick={() => setSelectedId(item.id)} aria-label={`查看第 ${index + 1} 张图片`}><img src={item.imageUrl} alt="" /><span>{String(index + 1).padStart(2, "0")}</span></button>)}</div> : <div className="character-history-empty"><ImagePlus size={18} /><span>生成后显示</span></div>}</aside>
+        </div>
+      </section>
+    </div>
+  </main>;
+}
+
+function HomeStage({ projects, stats, onNew, onManage, onOpen, onDelete }: { projects: Project[]; stats?: DashboardData["stats"]; onNew: () => void; onManage: () => void; onOpen: (project: Project, stage?: Stage) => void; onDelete: (project: Project) => void }) {
+  const projectsWithCovers = projects.filter((item) => item.coverUrl);
+  const slides = (projectsWithCovers.length ? projectsWithCovers : projects).slice(0, 5);
+  const [slideIndex, setSlideIndex] = useState(0);
+  const [carouselPaused, setCarouselPaused] = useState(false);
+  const featured = slides[slideIndex];
+
+  useEffect(() => {
+    setSlideIndex((current) => slides.length ? current % slides.length : 0);
+  }, [slides.length]);
+
+  useEffect(() => {
+    if (slides.length <= 1 || carouselPaused) return;
+    const timer = window.setInterval(() => setSlideIndex((current) => (current + 1) % slides.length), 5200);
+    return () => window.clearInterval(timer);
+  }, [carouselPaused, slides.length]);
+
   return <main id="home" className="home-content">
     <section className="home-hero">
-      <div className="hero-copy"><span className="panel-eyebrow">SCRIPT TO VIDEO / LOCAL AI WORKSPACE</span><h1>把剧本，变成<br /><em>可见的故事。</em></h1><p>从项目设定开始，经过剧本格式化、分集解析、主体生成和故事板，一条流水线完成视频创作准备。</p><div className="hero-actions"><button className="primary-button" onClick={onNew}>新建项目</button></div></div>
-      <div className="hero-showcase">{featured?.coverUrl ? <img src={featured.coverUrl} alt="" /> : <div className="showcase-placeholder"><Film size={42} /><span>YOUR NEXT FILM</span></div>}<div className="showcase-shade" /><div className="showcase-copy"><span>FEATURED PROJECT</span><strong>{featured?.title ?? "YOUR NEXT FILM"}</strong><small>{featured?.style ?? "从一份剧本开始"}</small></div><div className="showcase-index">01 <i /> 05</div></div>
+      <div className="hero-copy"><span className="panel-eyebrow"></span><h1>把剧本，变成<br /><em>可见的故事。</em></h1><p>从项目设定开始，经过剧本格式化、分集解析、主体生成和故事板，一条流水线完成视频创作准备。</p><div className="hero-actions"><button className="primary-button" onClick={onNew}>新建项目</button></div></div>
+      <div className="hero-showcase" aria-roledescription="轮播图" aria-label="最近项目" onMouseEnter={() => setCarouselPaused(true)} onMouseLeave={() => setCarouselPaused(false)}>
+        <div className="showcase-media" key={featured?.id ?? "empty"}>{featured?.coverUrl ? <img src={featured.coverUrl} alt="" /> : <div className="showcase-placeholder"><Film size={42} /><span>YOUR NEXT FILM</span></div>}</div>
+        <div className="showcase-shade" />
+        <div className="showcase-copy" aria-live="polite"><span>{featured ? `${featured.genre} / ${featured.status === "completed" ? "已完成" : `制作中 ${featured.progress}%`}` : "FEATURED PROJECT"}</span><strong>{featured?.title ?? "YOUR NEXT FILM"}</strong><small>{featured?.logline || featured?.style || "从一份剧本开始"}</small></div>
+      </div>
     </section>
     <section className="home-section">
       <div className="home-section-head">
         <div><span className="panel-eyebrow">YOUR PROJECTS</span><h2>最近的项目</h2></div>
         <div className="home-section-tools">
-          <span className="project-count">{projectCount} 个项目</span>
+          <span className="project-count">{stats?.projectCount ?? 0} 个项目</span>
           <div className="home-section-actions">
             <button className="text-button" onClick={onManage}><FolderOpen size={14} />项目管理</button>
-            {projectCount > 6 && <button className="text-button home-more-button" onClick={onManage}>查看更多...</button>}
+            {(stats?.projectCount ?? 0) > 6 && <button className="text-button home-more-button" onClick={onManage}>查看更多...</button>}
           </div>
         </div>
       </div>
       {projects.length ? <div className="home-project-grid">{projects.slice(0, 6).map((item) => <ProjectCard key={item.id} project={item} onOpen={onOpen} onDelete={onDelete} />)}</div> : <div className="home-empty"><Film size={26} /><p>还没有项目，从一份剧本开始。</p><button className="secondary-button" onClick={onNew}><Plus size={16} /> 新建第一个项目</button></div>}
     </section>
-    <section className="home-pipeline"><div><span className="panel-eyebrow">PIPELINE</span><h2>一条清晰的创作路径</h2></div><div className="pipeline-cards">{stages.slice(0, 5).map((item, index) => { const Icon = item.icon; return <div className="pipeline-card" key={item.id}><span>0{index + 1}</span><Icon size={19} /><strong>{item.label}</strong><small>{item.description}</small></div>; })}</div></section>
+    <section id="pipeline" className="home-pipeline"><div><span className="panel-eyebrow">PIPELINE</span><h2>一条清晰的创作路径</h2></div><div className="pipeline-cards">{stages.map((item, index) => { const Icon = item.icon; return <div className="pipeline-card" key={item.id}><span>0{index + 1}</span><Icon size={19} /><strong>{item.label}</strong><small>{item.description}</small></div>; })}</div></section>
+    <footer className="home-footer">
+      <div className="home-footer-brand"><strong>拥抱世界 AI</strong><small>Copyright © 2026 拥抱世界</small></div>
+      <div className="home-footer-info"><span>本地创作工作区</span><i /><span>项目数据保存在当前设备</span><i /><span>剧本到视频一体化创作</span></div>
+    </footer>
   </main>;
 }
 
@@ -734,14 +1221,23 @@ function SubjectImageDialog({ subject, draft, configured, busy, onDraftChange, o
   </section></div>;
 }
 
+function ApiKeyInput({ value, placeholder, ariaLabel, onChange }: { value: string; placeholder: string; ariaLabel: string; onChange: (value: string) => void }) {
+  const [visible, setVisible] = useState(false);
+  const toggleLabel = `${visible ? "隐藏" : "显示"}${ariaLabel}`;
+  return <div className="settings-key-input">
+    <input type={visible ? "text" : "password"} value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} aria-label={ariaLabel} autoComplete="off" />
+    <button type="button" aria-label={toggleLabel} title={toggleLabel} onClick={() => setVisible((current) => !current)}>{visible ? <EyeOff size={16} /> : <Eye size={16} />}</button>
+  </div>;
+}
+
 function SettingsDialog({ settings, imageSettings, videoSettings, draft, imageDraft, videoDraft, busy, onDraftChange, onImageDraftChange, onVideoDraftChange, onSave, onClose }: { settings: LlmSettings | null; imageSettings: ImageSettings | null; videoSettings: VideoSettings | null; draft: string; imageDraft: ImageSettingsDraft; videoDraft: VideoSettingsDraft; busy: boolean; onDraftChange: (value: string) => void; onImageDraftChange: React.Dispatch<React.SetStateAction<ImageSettingsDraft>>; onVideoDraftChange: React.Dispatch<React.SetStateAction<VideoSettingsDraft>>; onSave: () => void; onClose: () => void }) {
   const changeImageProvider = (provider: ImageSettings["provider"]) => onImageDraftChange((current) => ({ ...current, provider, apiBase: imageProviderDefaults[provider] }));
   const changeVideoProvider = (provider: VideoSettings["provider"]) => onVideoDraftChange((current) => ({ ...current, provider, apiBase: imageProviderDefaults[provider] }));
   const configuredModelOptions = imageModelOptions.includes(imageDraft.model) ? imageModelOptions : [imageDraft.model, ...imageModelOptions].filter(Boolean);
   return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="settings-dialog model-settings-dialog" role="dialog" aria-modal="true" aria-labelledby="settings-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">MODEL SETTINGS</span><h2 id="settings-title">模型配置</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭模型设置"><X size={18} /></button></div>{busy && !settings && !imageSettings ? <div className="settings-loading"><LoaderCircle className="spin" size={19} />正在读取本地配置</div> : <div className="model-settings-content">
-    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>剧本处理</strong><small>DEEPSEEK</small></div><span className={`compact-config-state ${settings?.configured ? "configured" : ""}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><label className="settings-field">API Key<input type="password" value={draft} onChange={(event) => onDraftChange(event.target.value)} placeholder={settings?.configured ? "已配置，输入新 Key 可替换" : "粘贴 DeepSeek API Key"} autoComplete="off" /></label><div className="settings-field-row"><label className="settings-field">模型<input value={settings?.model ?? "deepseek-v4-flash"} readOnly /></label><label className="settings-field">API 地址<input value={settings?.apiBase ?? "https://api.deepseek.com"} readOnly /></label></div></section>
-    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>主体图片</strong><small>OPENAI COMPATIBLE</small></div><span className={`compact-config-state ${imageSettings?.configured ? "configured" : ""}`}>{imageSettings?.configured ? "已配置" : "未配置"}</span></div><div className="settings-field-row"><div className="settings-field"><span>平台</span><SmoothSelect value={imageDraft.provider} options={[{ value: "volcengine", label: "火山方舟" }, { value: "aliyun", label: "阿里云百炼" }, { value: "openai", label: "OpenAI 官方" }, { value: "custom", label: "自定义兼容平台" }]} disabled={busy} ariaLabel="平台" onChange={(value) => changeImageProvider(value as ImageSettings["provider"])} /></div><label className="settings-field">API Key<input type="password" value={imageDraft.apiKey} onChange={(event) => onImageDraftChange((current) => ({ ...current, apiKey: event.target.value }))} placeholder={imageSettings?.configured ? "已配置，输入新 Key 可替换" : "填写图片平台 API Key"} autoComplete="off" /></label></div><div className="settings-field"><span>模型</span><SmoothSelect value={imageDraft.model} options={configuredModelOptions.map((model) => ({ value: model, label: model }))} disabled={busy} ariaLabel="图片模型" onChange={(value) => onImageDraftChange((current) => ({ ...current, model: value }))} /></div><label className="settings-field">API 地址<input value={imageDraft.apiBase} onChange={(event) => onImageDraftChange((current) => ({ ...current, apiBase: event.target.value }))} placeholder="https://.../v1" /></label></section>
-    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>视频生成</strong><small>VIDEO API</small></div><span className={`compact-config-state ${videoSettings?.configured ? "configured" : ""}`}>{videoSettings?.configured ? "已配置" : "未配置"}</span></div><div className="settings-field-row"><div className="settings-field"><span>平台</span><SmoothSelect value={videoDraft.provider} options={[{ value: "volcengine", label: "火山方舟" }, { value: "aliyun", label: "阿里云百炼" }, { value: "openai", label: "OpenAI 官方" }, { value: "custom", label: "自定义兼容平台" }]} disabled={busy} ariaLabel="视频平台" onChange={(value) => changeVideoProvider(value as VideoSettings["provider"])} /></div><label className="settings-field">API Key<input type="password" value={videoDraft.apiKey} onChange={(event) => onVideoDraftChange((current) => ({ ...current, apiKey: event.target.value }))} placeholder={videoSettings?.configured ? "已配置，输入新 Key 可替换" : "填写视频平台 API Key"} autoComplete="off" /></label></div><div className="settings-field"><span>模型</span><SmoothSelect value={videoDraft.model} options={videoModelOptions.map((model) => ({ value: model, label: videoModelLabels[model] }))} disabled={busy} ariaLabel="视频模型" onChange={(value) => onVideoDraftChange((current) => ({ ...current, model: value as VideoSettings["model"] }))} /></div><label className="settings-field">API 地址<input value={videoDraft.apiBase} onChange={(event) => onVideoDraftChange((current) => ({ ...current, apiBase: event.target.value }))} placeholder="https://.../v1" /></label></section>
+    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>剧本处理</strong><small>DEEPSEEK</small></div><span className={`compact-config-state ${settings?.configured ? "configured" : ""}`}>{settings?.configured ? "已配置" : "未配置"}</span></div><div className="settings-field"><span>API Key</span><ApiKeyInput value={draft} onChange={onDraftChange} placeholder={settings?.configured ? "已配置，输入新 Key 可替换" : "粘贴 DeepSeek API Key"} ariaLabel="剧本处理 API Key" /></div><div className="settings-field-row"><label className="settings-field">模型<input value={settings?.model ?? "deepseek-v4-flash"} readOnly /></label><label className="settings-field">API 地址<input value={settings?.apiBase ?? "https://api.deepseek.com"} readOnly /></label></div></section>
+    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>主体图片</strong><small>OPENAI COMPATIBLE</small></div><span className={`compact-config-state ${imageSettings?.configured ? "configured" : ""}`}>{imageSettings?.configured ? "已配置" : "未配置"}</span></div><div className="settings-field-row"><div className="settings-field"><span>平台</span><SmoothSelect value={imageDraft.provider} options={[{ value: "volcengine", label: "火山方舟" }, { value: "aliyun", label: "阿里云百炼" }, { value: "openai", label: "OpenAI 官方" }, { value: "custom", label: "自定义兼容平台" }]} disabled={busy} ariaLabel="平台" onChange={(value) => changeImageProvider(value as ImageSettings["provider"])} /></div><div className="settings-field"><span>API Key</span><ApiKeyInput value={imageDraft.apiKey} onChange={(value) => onImageDraftChange((current) => ({ ...current, apiKey: value }))} placeholder={imageSettings?.configured ? "已配置，输入新 Key 可替换" : "填写图片平台 API Key"} ariaLabel="图片平台 API Key" /></div></div><div className="settings-field"><span>模型</span><SmoothSelect value={imageDraft.model} options={configuredModelOptions.map((model) => ({ value: model, label: model }))} disabled={busy} ariaLabel="图片模型" onChange={(value) => onImageDraftChange((current) => ({ ...current, model: value }))} /></div><label className="settings-field">API 地址<input value={imageDraft.apiBase} onChange={(event) => onImageDraftChange((current) => ({ ...current, apiBase: event.target.value }))} placeholder="https://.../v1" /></label></section>
+    <section className="model-settings-section"><div className="model-settings-heading"><div><strong>视频生成</strong><small>VIDEO API</small></div><span className={`compact-config-state ${videoSettings?.configured ? "configured" : ""}`}>{videoSettings?.configured ? "已配置" : "未配置"}</span></div><div className="settings-field-row"><div className="settings-field"><span>平台</span><SmoothSelect value={videoDraft.provider} options={[{ value: "volcengine", label: "火山方舟" }, { value: "aliyun", label: "阿里云百炼" }, { value: "openai", label: "OpenAI 官方" }, { value: "custom", label: "自定义兼容平台" }]} disabled={busy} ariaLabel="视频平台" onChange={(value) => changeVideoProvider(value as VideoSettings["provider"])} /></div><div className="settings-field"><span>API Key</span><ApiKeyInput value={videoDraft.apiKey} onChange={(value) => onVideoDraftChange((current) => ({ ...current, apiKey: value }))} placeholder={videoSettings?.configured ? "已配置，输入新 Key 可替换" : "填写视频平台 API Key"} ariaLabel="视频平台 API Key" /></div></div><div className="settings-field"><span>模型</span><SmoothSelect value={videoDraft.model} options={videoModelOptions.map((model) => ({ value: model, label: videoModelLabels[model] }))} disabled={busy} ariaLabel="视频模型" onChange={(value) => onVideoDraftChange((current) => ({ ...current, model: value as VideoSettings["model"] }))} /></div><label className="settings-field">API 地址<input value={videoDraft.apiBase} onChange={(event) => onVideoDraftChange((current) => ({ ...current, apiBase: event.target.value }))} placeholder="https://.../v1" /></label></section>
     <p className="settings-note">密钥仅保存在本机后端的 <code>backend/.env</code>。默认使用 Seedream 生图模型；也可以配置当前平台支持的其他 OpenAI 兼容图片模型。</p><div className="settings-actions"><button className="primary-button" onClick={onSave} disabled={busy || !imageDraft.model.trim() || !imageDraft.apiBase.trim()}>{busy ? "保存中..." : "保存配置"}</button></div></div>}</section></div>;
 }
 export default App;

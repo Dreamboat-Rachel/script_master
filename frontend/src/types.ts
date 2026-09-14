@@ -141,6 +141,18 @@ export interface SubjectImageInput {
   resolution: ImageResolution;
   aspectRatio: ImageAspectRatio;
   referenceImage?: string;
+  watermark?: boolean;
+}
+
+export type StudioAssetType = "character" | "scene" | "prop";
+
+export interface CharacterImageResult {
+  id: string;
+  imageUrl: string;
+  model: string;
+  size: string;
+  prompt: string;
+  createdAt: string;
 }
 
 export interface Shot {
@@ -175,6 +187,8 @@ export interface DashboardData {
     completedCount: number;
     activeRenders: number;
     generatedSeconds: number;
+    localVideoCount: number;
+    localVideoBytes: number;
   };
   projects: Project[];
   jobs: RenderJob[];

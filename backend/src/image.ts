@@ -116,7 +116,7 @@ export const imageConfig = {
 export class ImageGenerationService {
   get enabled() { return Boolean(runtimeApiKey); }
 
-  async generate(input: { prompt: string; model?: string; resolution: ImageResolution; aspectRatio: ImageAspectRatio; referenceImage?: string }) {
+  async generate(input: { prompt: string; model?: string; resolution: ImageResolution; aspectRatio: ImageAspectRatio; referenceImage?: string; watermark?: boolean }) {
     if (!runtimeApiKey) throw new Error("尚未配置图片生成 API Key，请先打开模型设置");
     const model = input.model?.trim() || runtimeModel;
     const size = imageSizes[input.resolution][input.aspectRatio];
@@ -132,6 +132,7 @@ export class ImageGenerationService {
           size,
           response_format: "url",
           ...(input.referenceImage ? { image: input.referenceImage } : {}),
+          ...(input.watermark !== undefined ? { watermark: input.watermark } : {}),
         }),
         signal: AbortSignal.timeout(300000),
       });

@@ -1,4 +1,4 @@
-import type { DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
+import type { CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, {
@@ -64,5 +64,7 @@ export const api = {
   extractSubjects: async (id: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${id}/subjects/extract`, { method: "POST", body: "{}" })).data,
   deleteSubject: async (projectId: string, subjectId: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${projectId}/subjects/${subjectId}`, { method: "DELETE" })).data,
   generateSubjectImage: async (projectId: string, subjectId: string, input: SubjectImageInput) => (await request<{ data: { subject: Subject; provider: string; model: string; size: string } }>(`/api/projects/${projectId}/subjects/${subjectId}/image`, { method: "POST", body: JSON.stringify(input) })).data,
+  assetImages: async (assetType: StudioAssetType) => (await request<{ data: CharacterImageResult[] }>(`/api/tools/${assetType}-images`)).data,
+  generateAssetImage: async (assetType: StudioAssetType, input: SubjectImageInput) => (await request<{ data: CharacterImageResult }>(`/api/tools/${assetType}-images`, { method: "POST", body: JSON.stringify(input) })).data,
   extractShots: async (id: string) => (await request<{ data: { project: Project; shots: PipelineData["shots"] } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: "{}" })).data,
 };
