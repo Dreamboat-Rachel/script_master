@@ -325,6 +325,7 @@ async function pollVideoTask(jobId: string, projectId: string, taskId: string): 
   }
 }
 
+
 async function resumeVideoTasks() {
   const jobs = await db.listJobs();
   for (const job of jobs) {
