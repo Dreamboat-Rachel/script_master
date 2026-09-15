@@ -146,7 +146,7 @@ export interface SubjectImageInput {
 
 export type StudioAssetType = "character" | "scene" | "prop";
 export type StudioVideoType = "reference-video" | "keyframe-video";
-export type HomeToolType = StudioAssetType | StudioVideoType;
+export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop";
 
 export interface CharacterImageResult {
   id: string;
@@ -182,6 +182,79 @@ export interface StudioVideoResult {
   duration: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface VoiceCloneInput {
+  name: string;
+  language: "zh-CN" | "zh-HK" | "en-US" | "ja-JP";
+  useCase: string;
+  duration: number;
+  previewText: string;
+  sampleText?: string;
+}
+
+export interface VoiceCloneResult extends VoiceCloneInput {
+  id: string;
+  voiceId: string;
+  audioUrl: string;
+  model: string;
+  createdAt: string;
+}
+
+export interface VoiceCloneList {
+  data: VoiceCloneResult[];
+  settings: { configured: boolean; model: string };
+}
+
+export type SpeechEmotion = "neutral" | "happy" | "sad" | "angry" | "fearful" | "surprised";
+export type SpeechLanguageBoost = "Chinese" | "Chinese,Yue" | "English" | "Japanese";
+
+export interface TextToSpeechInput {
+  text: string;
+  voiceId: string;
+  voiceName: string;
+  speed: number;
+  volume: number;
+  pitch: number;
+  emotion: SpeechEmotion;
+  languageBoost: SpeechLanguageBoost;
+  format: "mp3" | "flac";
+  sampleRate: 32000 | 44100;
+}
+
+export interface TextToSpeechResult extends TextToSpeechInput {
+  id: string;
+  audioUrl: string;
+  duration: number | null;
+  model: string;
+  createdAt: string;
+}
+
+export interface TextToSpeechList {
+  data: TextToSpeechResult[];
+  settings: { configured: boolean; model: string };
+}
+
+export type AssetLibraryKind = "character" | "scene" | "prop" | "audio" | "video";
+
+export interface AssetLibraryItem {
+  id: string;
+  kind: AssetLibraryKind;
+  source: "project" | "tool";
+  mediaType: "image" | "audio" | "video";
+  title: string;
+  description: string;
+  mediaUrl: string;
+  thumbnailUrl: string | null;
+  projectId: string | null;
+  projectTitle: string | null;
+  detail: string;
+  createdAt: string;
+}
+
+export interface AssetLibraryData {
+  items: AssetLibraryItem[];
+  counts: Record<AssetLibraryKind, number>;
 }
 
 export interface Shot {

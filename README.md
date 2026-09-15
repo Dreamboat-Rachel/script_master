@@ -18,7 +18,7 @@ npm run dev
 - API: <http://localhost:8787/api>
 - Health: <http://localhost:8787/api/health>
 
-打开 Web 首页后，点击“新建项目”会进入项目设定；也可以在已有项目卡片上点击“剧本解析”直接进入解析步骤。项目内部顶部导航固定为：项目设定 → 剧本格式化 → 剧本解析 → 主体生成 → 故事板。
+打开 Web 首页后，点击“开始创作”会进入项目设定；也可以在已有项目卡片上点击“剧本解析”直接进入解析步骤。项目内部顶部导航固定为：项目设定 → 剧本格式化 → 剧本解析 → 主体生成 → 故事板。
 
 当前配置使用本机 MySQL：`script_master` 数据库，连接地址为 `localhost:3306`。如果需要回退到 SQLite，可将 `DATABASE_URL` 改为 `sqlite://./data/script-master.db`。
 
@@ -33,6 +33,18 @@ DEEPSEEK_API_BASE=https://api.deepseek.com
 ```
 
 格式化接口会要求模型返回原文逐字审计结果；服务端会校验审计文本与输入完全一致，并将原文归档到格式化结果中。未配置 Key 时，模型步骤会停止并提示配置，不会静默生成示例结果。如需离线演示，可在 `backend/.env` 增加 `LOCAL_FALLBACK=true`。
+
+## MiniMax 声音克隆
+
+首页“更多工具 → 声音克隆”会由后端先上传声音样本，再调用 MiniMax 声音克隆接口。Token 只保存在后端，在 `backend/.env` 中配置：
+
+```env
+MINIMAX_API_KEY=你的 MiniMax Token
+MINIMAX_API_BASE=https://api.minimax.cn/v1
+MINIMAX_VOICE_MODEL=speech-2.8-hd
+```
+
+克隆生成的试听音频和最近记录会保存在 `backend/data/generated/voices`。样本文本是可选项；填写与参考音频完全一致的逐字稿后，后端会同时提交 `clone_prompt` 和 `text_validation`。“更多工具 → 文转语音”复用相同的 MiniMax 配置，可选择系统声音或已克隆声音，生成结果保存在 `backend/data/generated/speech`。
 
 在“剧本解析”中，每集可以展开查看完整结构：开场钩子、本集原文、情节节点、参与人物，以及每个人物的介绍、穿着、性格、表情/状态和连续性备注。以上字段由 DeepSeek 返回后保存到本地数据库，缺失信息会标记为“未设定”，不会由服务端臆造。
 
@@ -57,6 +69,10 @@ DATABASE_URL=mysql://script_master:script_master@localhost:3306/script_master
 - `GET /api/health` 服务状态
 - `GET /api/dashboard` 首页数据
 - `GET /api/projects` 项目列表
+- `GET /api/tools/voice-clones` 声音克隆记录与配置状态
+- `POST /api/tools/voice-clones` 上传样本并创建 MiniMax 克隆声音
+- `GET /api/tools/text-to-speech` 文转语音历史与配置状态
+- `POST /api/tools/text-to-speech` 使用 MiniMax 生成语音
 - `POST /api/projects` 创建项目
 - `GET /api/projects/:id` 项目与分镜详情
 - `GET /api/projects/:id/pipeline` 流水线全部产物

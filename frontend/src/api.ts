@@ -1,8 +1,9 @@
-import type { CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate } from "./types";
+import type { AssetLibraryData, CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechInput, TextToSpeechList, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneInput, VoiceCloneList, VoiceCloneResult } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
+  const isFormData = options?.body instanceof FormData;
   const response = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...options?.headers },
+    headers: { ...(!isFormData ? { "Content-Type": "application/json" } : {}), ...options?.headers },
     ...options,
   });
   let payload: any = null;
@@ -30,6 +31,7 @@ export const api = {
   videoSettings: async () => (await request<{ data: VideoSettings }>("/api/settings/video")).data,
   saveVideoSettings: async (input: { provider: VideoSettings["provider"]; apiKey?: string; model: VideoSettings["model"]; apiBase: string }) => (await request<{ data: VideoSettings }>("/api/settings/video", { method: "PUT", body: JSON.stringify(input) })).data,
   dashboard: () => request<DashboardData>("/api/dashboard"),
+  assets: () => request<AssetLibraryData>("/api/assets"),
   jobs: async () => (await request<{ data: RenderJob[] }>("/api/jobs")).data,
   projects: async () => (await request<{ data: Project[] }>("/api/projects")).data,
   project: async (id: string) => (await request<{ data: ProjectDetail }>(`/api/projects/${id}`)).data,
@@ -69,5 +71,14 @@ export const api = {
   studioVideos: async (videoType: StudioVideoType) => (await request<{ data: StudioVideoResult[] }>(`/api/tools/${videoType}-videos`)).data,
   generateStudioVideo: async (videoType: StudioVideoType, input: StudioVideoInput) => (await request<{ data: StudioVideoResult }>(`/api/tools/${videoType}-videos`, { method: "POST", body: JSON.stringify(input) })).data,
   studioVideo: async (videoType: StudioVideoType, id: string) => (await request<{ data: StudioVideoResult }>(`/api/tools/${videoType}-videos/${id}`)).data,
+  voiceClones: () => request<VoiceCloneList>("/api/tools/voice-clones"),
+  cloneVoice: async (file: File, input: VoiceCloneInput) => {
+    const body = new FormData();
+    body.append("metadata", JSON.stringify(input));
+    body.append("file", file);
+    return (await request<{ data: VoiceCloneResult }>("/api/tools/voice-clones", { method: "POST", body })).data;
+  },
+  speechGenerations: () => request<TextToSpeechList>("/api/tools/text-to-speech"),
+  generateSpeech: async (input: TextToSpeechInput) => (await request<{ data: TextToSpeechResult }>("/api/tools/text-to-speech", { method: "POST", body: JSON.stringify(input) })).data,
   extractShots: async (id: string) => (await request<{ data: { project: Project; shots: PipelineData["shots"] } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: "{}" })).data,
 };

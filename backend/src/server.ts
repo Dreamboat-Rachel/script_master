@@ -10,6 +10,7 @@ import { z } from "zod";
 import { createDatabaseStore } from "./database.js";
 import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
 import { configureVideo, getVideoSettings, VideoGenerationService } from "./video.js";
+import { MiniMaxVoiceCloneService } from "./voice.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
 import type { Project, RenderJob, Shot, Subject } from "./types.js";
 
@@ -35,12 +36,24 @@ const continuityFrameDirectory = resolve(generatedDirectory, "continuity");
 const generatedVideoDirectory = resolve(generatedDirectory, "videos");
 const videoMergeDirectory = resolve(generatedDirectory, "merges");
 const projectCoverDirectory = resolve(generatedDirectory, "covers");
+const voiceCloneDirectory = resolve(generatedDirectory, "voices");
+const textToSpeechDirectory = resolve(generatedDirectory, "speech");
 const videoGeneration = new VideoGenerationService();
+const voiceCloning = new MiniMaxVoiceCloneService();
 const renderJobStreams = new Set<Response>();
 const continuityFrameCache = new Map<string, string>();
 
 type StudioVideoType = keyof typeof studioVideoDirectories;
+type StudioAssetType = keyof typeof studioImageDirectories;
 type StudioVideoStatus = "queued" | "processing" | "completed" | "failed";
+interface StoredStudioImage {
+  id: string;
+  imageUrl: string;
+  model: string;
+  size: string;
+  prompt: string;
+  createdAt: string;
+}
 interface StoredStudioVideo {
   id: string;
   videoType: StudioVideoType;
@@ -56,6 +69,35 @@ interface StoredStudioVideo {
   updatedAt: string;
   providerTaskId?: string;
 }
+interface StoredVoiceClone {
+  id: string;
+  voiceId: string;
+  name: string;
+  language: "zh-CN" | "zh-HK" | "en-US" | "ja-JP";
+  useCase: string;
+  audioUrl: string;
+  duration: number;
+  previewText: string;
+  model: string;
+  createdAt: string;
+}
+interface StoredSpeechGeneration {
+  id: string;
+  voiceId: string;
+  voiceName: string;
+  text: string;
+  audioUrl: string;
+  duration: number | null;
+  model: string;
+  speed: number;
+  volume: number;
+  pitch: number;
+  emotion: "neutral" | "happy" | "sad" | "angry" | "fearful" | "surprised";
+  languageBoost: "Chinese" | "Chinese,Yue" | "English" | "Japanese";
+  format: "mp3" | "flac";
+  sampleRate: 32000 | 44100;
+  createdAt: string;
+}
 const studioVideoTasks = new Map<string, StoredStudioVideo>();
 
 mkdirSync(logDirectory, { recursive: true });
@@ -69,6 +111,8 @@ mkdirSync(continuityFrameDirectory, { recursive: true });
 mkdirSync(generatedVideoDirectory, { recursive: true });
 mkdirSync(videoMergeDirectory, { recursive: true });
 mkdirSync(projectCoverDirectory, { recursive: true });
+mkdirSync(voiceCloneDirectory, { recursive: true });
+mkdirSync(textToSpeechDirectory, { recursive: true });
 
 function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Record<string, unknown>) {
   const line = `${new Date().toISOString()} [${level}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`;
@@ -223,14 +267,14 @@ async function readStudioVideoRecord(videoType: StudioVideoType, id: string) {
   }
 }
 
-async function listStudioVideos(videoType: StudioVideoType) {
+async function listStudioVideos(videoType: StudioVideoType, limit = 24) {
   const directory = studioVideoDirectories[videoType];
   const names = await readdir(directory).catch(() => [] as string[]);
   const stored = (await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readStudioVideoRecord(videoType, basename(name, ".json")))))
     .filter((item): item is StoredStudioVideo => Boolean(item));
   const merged = new Map(stored.map((item) => [item.id, item]));
   for (const item of studioVideoTasks.values()) if (item.videoType === videoType) merged.set(item.id, item);
-  return [...merged.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, 24);
+  return [...merged.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
 }
 
 async function resumeStudioVideoTasks() {
@@ -242,6 +286,95 @@ async function resumeStudioVideoTasks() {
       void pollStudioVideo(record);
     }
   }
+}
+
+async function readLimitedRequestBody(request: Request, maximumBytes: number) {
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  for await (const chunk of request) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    totalBytes += bytes.length;
+    if (totalBytes > maximumBytes) throw new Error("VOICE_UPLOAD_TOO_LARGE");
+    chunks.push(bytes);
+  }
+  return Buffer.concat(chunks);
+}
+
+async function saveVoicePreview(voiceId: string, source: string) {
+  let bytes: Buffer;
+  let mimeType = "audio/mpeg";
+  if (/^https?:\/\//i.test(source)) {
+    const result = await fetch(source, { signal: AbortSignal.timeout(120_000) });
+    if (!result.ok) throw new Error(`MiniMax 试听音频下载失败（HTTP ${result.status}）`);
+    bytes = Buffer.from(await result.arrayBuffer());
+    mimeType = result.headers.get("content-type")?.split(";")[0]?.trim() || mimeType;
+  } else if (/^data:audio\/[a-z0-9.+-]+;base64,/i.test(source)) {
+    const matched = source.match(/^data:(audio\/[a-z0-9.+-]+);base64,(.+)$/i);
+    if (!matched) throw new Error("MiniMax 返回的试听音频格式无效");
+    mimeType = matched[1].toLowerCase();
+    bytes = Buffer.from(matched[2], "base64");
+  } else if (/^[0-9a-f]+$/i.test(source) && source.length % 2 === 0) {
+    bytes = Buffer.from(source, "hex");
+  } else {
+    bytes = Buffer.from(source, "base64");
+  }
+  if (!bytes.length) throw new Error("MiniMax 返回了空的试听音频");
+  if (bytes.length > 25 * 1024 * 1024) throw new Error("MiniMax 试听音频超过 25MB，无法保存到本地");
+  const extension = mimeType.includes("wav") ? "wav" : mimeType.includes("mp4") || mimeType.includes("m4a") ? "m4a" : "mp3";
+  const fileName = `${voiceId}.${extension}`;
+  await writeFile(resolve(voiceCloneDirectory, fileName), bytes);
+  return `/api/generated/voices/${fileName}`;
+}
+
+async function listVoiceClones(limit = 24) {
+  const names = await readdir(voiceCloneDirectory).catch(() => [] as string[]);
+  const records = (await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+    try {
+      const record = JSON.parse(await readFile(resolve(voiceCloneDirectory, name), "utf8")) as StoredVoiceClone;
+      return record.id && record.audioUrl ? record : null;
+    } catch {
+      return null;
+    }
+  }))).filter((item): item is StoredVoiceClone => Boolean(item));
+  return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
+}
+
+async function listSpeechGenerations(limit = 30) {
+  const names = await readdir(textToSpeechDirectory).catch(() => [] as string[]);
+  const records = (await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
+    try {
+      const record = JSON.parse(await readFile(resolve(textToSpeechDirectory, name), "utf8")) as StoredSpeechGeneration;
+      return record.id && record.audioUrl ? record : null;
+    } catch {
+      return null;
+    }
+  }))).filter((item): item is StoredSpeechGeneration => Boolean(item));
+  return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
+}
+
+async function listStudioImages(assetType: StudioAssetType, limit = 24) {
+  const directory = studioImageDirectories[assetType];
+  const names = await readdir(directory).catch(() => [] as string[]);
+  const images = (await Promise.all(names
+    .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
+    .map(async (name) => {
+      const file = await stat(resolve(directory, name)).catch(() => null);
+      if (!file?.isFile()) return null;
+      const stored = await readFile(resolve(directory, `${name}.json`), "utf8")
+        .then((value) => JSON.parse(value) as Partial<StoredStudioImage>)
+        .catch(() => null);
+      return {
+        id: name,
+        imageUrl: `/api/generated/${basename(directory)}/${name}`,
+        model: typeof stored?.model === "string" ? stored.model : "",
+        size: typeof stored?.size === "string" ? stored.size : "",
+        prompt: typeof stored?.prompt === "string" ? stored.prompt : "",
+        createdAt: typeof stored?.createdAt === "string" ? stored.createdAt : file.mtime.toISOString(),
+      };
+    })))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return images.slice(0, limit);
 }
 
 async function extractStableTailFrame(videoUrl: string, projectId: string, shotId: string) {
@@ -413,6 +546,26 @@ const studioVideoSchema = z.object({
   referenceImages: z.array(z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "参考图格式无效")).max(3).optional(),
   firstFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "首帧格式无效").optional(),
   lastFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "尾帧格式无效").optional(),
+});
+const voiceCloneMetadataSchema = z.object({
+  name: z.string().trim().min(1, "请填写声音名称").max(30),
+  language: z.enum(["zh-CN", "zh-HK", "en-US", "ja-JP"]),
+  useCase: z.string().trim().min(1).max(30),
+  duration: z.coerce.number().finite().min(3).max(1800),
+  previewText: z.string().trim().min(1, "请填写试听文本").max(2000),
+  sampleText: z.string().trim().max(2000).optional(),
+});
+const textToSpeechSchema = z.object({
+  text: z.string().trim().min(1, "请输入需要朗读的文本").max(10000),
+  voiceId: z.string().trim().min(1, "请选择声音").max(256).regex(/^[A-Za-z0-9_-]+$/, "声音 ID 格式无效"),
+  voiceName: z.string().trim().min(1).max(100),
+  speed: z.number().min(0.5).max(2),
+  volume: z.number().min(0.1).max(10),
+  pitch: z.number().int().min(-12).max(12),
+  emotion: z.enum(["neutral", "happy", "sad", "angry", "fearful", "surprised"]),
+  languageBoost: z.enum(["Chinese", "Chinese,Yue", "English", "Japanese"]),
+  format: z.enum(["mp3", "flac"]),
+  sampleRate: z.union([z.literal(32000), z.literal(44100)]),
 });
 const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
@@ -861,22 +1014,131 @@ app.put("/api/settings/video", asyncRoute(async (request, response) => {
   response.json({ data: configureVideo(input) });
 }));
 
+app.get("/api/tools/voice-clones", asyncRoute(async (_request, response) => {
+  response.json({
+    data: await listVoiceClones(),
+    settings: { configured: voiceCloning.enabled, model: voiceCloning.model },
+  });
+}));
+
+app.post("/api/tools/voice-clones", asyncRoute(async (request, response) => {
+  if (!voiceCloning.enabled) return response.status(503).json({ error: "尚未配置 MiniMax Token，请在后端设置 MINIMAX_API_KEY" });
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
+    return response.status(415).json({ error: "请使用 multipart/form-data 上传声音文件" });
+  }
+  const declaredLength = Number(request.headers["content-length"] ?? 0);
+  if (Number.isFinite(declaredLength) && declaredLength > 21 * 1024 * 1024) {
+    return response.status(413).json({ error: "音频文件不能超过 20MB" });
+  }
+
+  let multipartBody: Buffer;
+  try {
+    multipartBody = await readLimitedRequestBody(request, 21 * 1024 * 1024);
+  } catch (error) {
+    if (error instanceof Error && error.message === "VOICE_UPLOAD_TOO_LARGE") {
+      return response.status(413).json({ error: "音频文件不能超过 20MB" });
+    }
+    throw error;
+  }
+  if (!multipartBody.length) return response.status(400).json({ error: "请选择声音样本" });
+
+  let form: FormData;
+  try {
+    form = await new globalThis.Request("http://localhost/voice-clone-upload", {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: new Uint8Array(multipartBody),
+    }).formData();
+  } catch {
+    return response.status(400).json({ error: "无法读取上传表单，请重新选择声音文件" });
+  }
+  const file = form.get("file");
+  if (!(file instanceof Blob)) return response.status(400).json({ error: "请选择声音样本" });
+  if (file.size > 20 * 1024 * 1024) return response.status(413).json({ error: "音频文件不能超过 20MB" });
+  const fileName = "name" in file && typeof file.name === "string" ? file.name : "reference.wav";
+  if (!/\.(mp3|wav|m4a)$/i.test(fileName) && !["audio/mpeg", "audio/wav", "audio/x-wav", "audio/mp4", "audio/x-m4a"].includes(file.type)) {
+    return response.status(400).json({ error: "请选择 MP3、WAV 或 M4A 音频文件" });
+  }
+  const metadataRaw = form.get("metadata");
+  if (typeof metadataRaw !== "string") return response.status(400).json({ error: "缺少声音克隆参数" });
+  let metadataValue: unknown;
+  try {
+    metadataValue = JSON.parse(metadataRaw);
+  } catch {
+    return response.status(400).json({ error: "声音克隆参数格式无效" });
+  }
+  const metadata = voiceCloneMetadataSchema.parse(metadataValue);
+  const voiceId = `script_master_${Date.now()}_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  const startedAt = Date.now();
+  const cloned = await voiceCloning.clone({
+    file,
+    fileName,
+    voiceId,
+    previewText: metadata.previewText,
+    sampleText: metadata.sampleText || undefined,
+  });
+  const audioUrl = await saveVoicePreview(voiceId, cloned.demoAudio);
+  const record: StoredVoiceClone = {
+    id: voiceId,
+    voiceId,
+    name: metadata.name,
+    language: metadata.language,
+    useCase: metadata.useCase,
+    audioUrl,
+    duration: metadata.duration,
+    previewText: metadata.previewText,
+    model: cloned.model,
+    createdAt: new Date().toISOString(),
+  };
+  await writeFile(resolve(voiceCloneDirectory, `${voiceId}.json`), JSON.stringify(record, null, 2), "utf8");
+  writeLog("INFO", "[voice-clone] 完成", { voiceId, model: cloned.model, elapsedMs: Date.now() - startedAt });
+  response.status(201).json({ data: record });
+}));
+
+app.get("/api/tools/text-to-speech", asyncRoute(async (_request, response) => {
+  response.json({
+    data: await listSpeechGenerations(),
+    settings: { configured: voiceCloning.enabled, model: voiceCloning.model },
+  });
+}));
+
+app.post("/api/tools/text-to-speech", asyncRoute(async (request, response) => {
+  if (!voiceCloning.enabled) return response.status(503).json({ error: "尚未配置 MiniMax Token，请在后端设置 MINIMAX_API_KEY" });
+  const input = textToSpeechSchema.parse(request.body);
+  const startedAt = Date.now();
+  const generated = await voiceCloning.synthesize(input);
+  if (generated.audio.length > 50 * 1024 * 1024) throw new Error("MiniMax 语音合成音频超过 50MB，无法保存到本地");
+  const id = `tts_${Date.now()}_${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+  const fileName = `${id}.${input.format}`;
+  await writeFile(resolve(textToSpeechDirectory, fileName), generated.audio);
+  const record: StoredSpeechGeneration = {
+    id,
+    voiceId: input.voiceId,
+    voiceName: input.voiceName,
+    text: input.text,
+    audioUrl: `/api/generated/speech/${fileName}`,
+    duration: generated.durationMs === null ? null : generated.durationMs / 1000,
+    model: generated.model,
+    speed: input.speed,
+    volume: input.volume,
+    pitch: input.pitch,
+    emotion: input.emotion,
+    languageBoost: input.languageBoost,
+    format: input.format,
+    sampleRate: input.sampleRate,
+    createdAt: new Date().toISOString(),
+  };
+  await writeFile(resolve(textToSpeechDirectory, `${id}.json`), JSON.stringify(record, null, 2), "utf8");
+  writeLog("INFO", "[text-to-speech] 完成", { id, voiceId: input.voiceId, model: generated.model, textLength: input.text.length, bytes: generated.audio.length, elapsedMs: Date.now() - startedAt });
+  response.status(201).json({ data: record });
+}));
+
 app.get("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
-  const assetType = String(request.params.assetType) as keyof typeof studioImageDirectories;
+  const assetType = String(request.params.assetType) as StudioAssetType;
   const directory = studioImageDirectories[assetType];
   if (!directory) return response.status(404).json({ error: "不支持的资产类型" });
-  const names = await readdir(directory).catch(() => [] as string[]);
-  const images = (await Promise.all(names
-    .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
-    .map(async (name) => {
-      const file = await stat(resolve(directory, name)).catch(() => null);
-      if (!file?.isFile()) return null;
-      return { id: name, imageUrl: `/api/generated/${basename(directory)}/${name}`, model: "", size: "", prompt: "", createdAt: file.mtime.toISOString() };
-    })))
-    .filter((item): item is NonNullable<typeof item> => Boolean(item))
-    .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
-    .slice(0, 24);
-  response.json({ data: images });
+  response.json({ data: await listStudioImages(assetType) });
 }));
 
 app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
@@ -893,6 +1155,7 @@ app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) =>
   const fileName = `${randomUUID()}.${extension}`;
   await writeFile(resolve(directory, fileName), generated.bytes);
   const result = { id: fileName, imageUrl: `/api/generated/${basename(directory)}/${fileName}`, model: input.model, size: generated.size, prompt: input.prompt, createdAt: new Date().toISOString() };
+  await writeFile(resolve(directory, `${fileName}.json`), JSON.stringify(result, null, 2), "utf8");
   writeLog("INFO", "[generate-studio-asset] 完成", { assetType, imageUrl: result.imageUrl, model: input.model, size: generated.size, elapsedMs: Date.now() - startedAt });
   response.json({ data: result });
 }));
@@ -962,6 +1225,84 @@ app.get("/api/dashboard", asyncRoute(async (_request, response) => {
     projects: projects.slice(0, 6),
     jobs: jobs.slice(0, 4),
   });
+}));
+
+app.get("/api/assets", asyncRoute(async (_request, response) => {
+  const projects = await db.listProjects();
+  const [projectBundles, jobs, characterImages, sceneImages, propImages, voiceClones, speechGenerations, referenceVideos, keyframeVideos] = await Promise.all([
+    Promise.all(projects.map(async (project) => {
+      const [subjects, shots, merges] = await Promise.all([db.listSubjects(project.id), db.listShots(project.id), listVideoMerges(project.id)]);
+      return { project, subjects, shots, merges };
+    })),
+    db.listJobs(),
+    listStudioImages("character", 200),
+    listStudioImages("scene", 200),
+    listStudioImages("prop", 200),
+    listVoiceClones(200),
+    listSpeechGenerations(300),
+    listStudioVideos("reference-video", 200),
+    listStudioVideos("keyframe-video", 200),
+  ]);
+  const projectById = new Map(projects.map((project) => [project.id, project]));
+  const shotById = new Map(projectBundles.flatMap(({ shots }) => shots.map((shot) => [`${shot.projectId}:${shot.id}`, shot] as const)));
+  const roleKind = { character: "character", location: "scene", prop: "prop" } as const;
+  const roleName = { character: "角色", location: "场景", prop: "道具" } as const;
+  const standaloneName = { character: "独立角色图", scene: "独立场景图", prop: "独立道具图" } as const;
+
+  const projectImages = projectBundles.flatMap(({ project, subjects }) => subjects
+    .filter((subject) => Boolean(subject.imageUrl))
+    .map((subject) => ({
+      id: `subject:${subject.id}`, kind: roleKind[subject.role], source: "project" as const, mediaType: "image" as const,
+      title: subject.name, description: subject.visualPrompt || subject.description || `${roleName[subject.role]}主体图`, mediaUrl: subject.imageUrl!, thumbnailUrl: subject.imageUrl,
+      projectId: project.id, projectTitle: project.title, detail: `${roleName[subject.role]} · 项目主体`, createdAt: subject.updatedAt,
+    })));
+  const standaloneImages = ([
+    ["character", characterImages], ["scene", sceneImages], ["prop", propImages],
+  ] as const).flatMap(([kind, images]) => images.map((image) => ({
+    id: `tool-${kind}:${image.id}`, kind, source: "tool" as const, mediaType: "image" as const,
+    title: standaloneName[kind], description: image.prompt || "提示词未记录", mediaUrl: image.imageUrl, thumbnailUrl: image.imageUrl,
+    projectId: null, projectTitle: null, detail: "更多工具", createdAt: image.createdAt,
+  })));
+  const audioAssets = [
+    ...voiceClones.map((voice) => ({
+      id: `voice:${voice.id}`, kind: "audio" as const, source: "tool" as const, mediaType: "audio" as const,
+      title: voice.name, description: voice.previewText || voice.useCase || "克隆声音试听", mediaUrl: voice.audioUrl, thumbnailUrl: null,
+      projectId: null, projectTitle: null, detail: `克隆声音 · ${voice.language}`, createdAt: voice.createdAt,
+    })),
+    ...speechGenerations.map((speech) => ({
+      id: `speech:${speech.id}`, kind: "audio" as const, source: "tool" as const, mediaType: "audio" as const,
+      title: speech.voiceName, description: speech.text, mediaUrl: speech.audioUrl, thumbnailUrl: null,
+      projectId: null, projectTitle: null, detail: `文转语音 · ${speech.format.toUpperCase()}`, createdAt: speech.createdAt,
+    })),
+  ];
+  const projectVideos = jobs
+    .filter((job) => job.status === "completed" && Boolean(job.outputUrl))
+    .map((job) => {
+      const project = projectById.get(job.projectId);
+      const shot = job.shotId ? shotById.get(`${job.projectId}:${job.shotId}`) : undefined;
+      return {
+        id: `render:${job.id}`, kind: "video" as const, source: "project" as const, mediaType: "video" as const,
+        title: shot?.title || `${project?.title || job.projectTitle}镜头`, description: job.generationPrompt || "流水线生成的视频镜头", mediaUrl: job.outputUrl!, thumbnailUrl: null,
+        projectId: job.projectId, projectTitle: project?.title || job.projectTitle, detail: shot ? `第 ${shot.episodeNumber} 集 · 镜头 ${shot.shotOrder}` : "项目视频", createdAt: job.createdAt,
+      };
+    });
+  const mergedVideos = projectBundles.flatMap(({ project, merges }) => merges.map((merge) => ({
+    id: `merge:${merge.id}`, kind: "video" as const, source: "project" as const, mediaType: "video" as const,
+    title: `${project.title} · 合成视频`, description: `由 ${merge.shotIds.length} 个镜头合成`, mediaUrl: merge.outputUrl, thumbnailUrl: merge.coverUrl ?? project.coverUrl,
+    projectId: project.id, projectTitle: project.title, detail: `${merge.durationSeconds} 秒 · 成片`, createdAt: merge.createdAt,
+  })));
+  const standaloneVideos = [...referenceVideos, ...keyframeVideos]
+    .filter((video) => video.status === "completed" && Boolean(video.outputUrl))
+    .map((video) => ({
+      id: `tool-video:${video.id}`, kind: "video" as const, source: "tool" as const, mediaType: "video" as const,
+      title: video.videoType === "reference-video" ? "参考生视频" : "首尾帧视频", description: video.prompt, mediaUrl: video.outputUrl!, thumbnailUrl: null,
+      projectId: null, projectTitle: null, detail: `${video.ratio} · ${video.duration} 秒`, createdAt: video.createdAt,
+    }));
+  const items = [...projectImages, ...standaloneImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  const counts = { character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
+  for (const item of items) counts[item.kind] += 1;
+  response.json({ items, counts });
 }));
 
 app.get("/api/projects", asyncRoute(async (_request, response) => {
@@ -1347,7 +1688,8 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
   const modelResponseIssue = detail.includes("DeepSeek 返回空内容") || detail.includes("DeepSeek 返回了无法解析的 JSON");
   const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务");
   const videoResponseIssue = detail.includes("视频平台") || detail.includes("视频任务") || detail.includes("视频生成") || detail.includes("视频合并") || detail.includes("FFmpeg") || detail.includes("镜头视频");
-  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || videoResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : "服务器内部错误", details: detail });
+  const voiceResponseIssue = detail.includes("MiniMax") || detail.includes("声音克隆") || detail.includes("试听音频");
+  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || videoResponseIssue || voiceResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : voiceResponseIssue ? "声音克隆失败" : "服务器内部错误", details: detail });
 });
 
 await db.initialize();
