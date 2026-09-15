@@ -1,6 +1,6 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowLeft, ArrowRight, AudioLines, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Combine, Copy, Download, FileAudio, FileText, Film, FolderOpen, Headphones, Layers3,
+  ArrowLeft, ArrowLeftRight, ArrowRight, AudioLines, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Combine, Copy, Download, FileAudio, FileText, Film, FolderOpen, Headphones, Layers3,
   Eye, EyeOff, ImagePlus, ListChecks, LoaderCircle, LockKeyhole, LogOut, Mail, Menu, Mic2, Moon, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
   RefreshCw, Search, ListFilter, Sun, Trash2, Upload, UserRound, UsersRound, WandSparkles, X,
 } from "lucide-react";
@@ -398,7 +398,7 @@ function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
     if (toolType === "reference-video" || toolType === "keyframe-video") {
       void api.videoSettings().then(setVideoSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "视频模型设置读取失败"));
-    } else if (toolType !== "voice-clone" && toolType !== "text-to-speech" && toolType !== "prompt-workshop") {
+    } else if (toolType !== "voice-clone" && toolType !== "text-to-speech" && toolType !== "prompt-workshop" && toolType !== "image-upscale") {
       void api.imageSettings().then(setImageSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
     }
   };
@@ -448,7 +448,7 @@ function App() {
       <div className="top-actions">{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div>
     </header>
     <div key={homeViewKey} className="home-view-transition">
-      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
+      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "image-upscale" ? <ImageUpscaleStudio onToast={setToast} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
     </div>
     {newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}
     {existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}
@@ -488,7 +488,7 @@ function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, on
   }, [toolsOpen]);
   const runAndClose = (action: () => void) => { setToolsOpen(false); action(); };
   const toolButton = (label: string) => {
-    const toolType = ({ "角色": "character", "场景": "scene", "物品": "prop", "参考生视频": "reference-video", "首尾帧视频": "keyframe-video", "声音克隆": "voice-clone", "文转语音": "text-to-speech", "提示词工坊": "prompt-workshop" } as Partial<Record<string, HomeToolType>>)[label];
+    const toolType = ({ "角色": "character", "场景": "scene", "物品": "prop", "参考生视频": "reference-video", "首尾帧视频": "keyframe-video", "声音克隆": "voice-clone", "文转语音": "text-to-speech", "提示词工坊": "prompt-workshop", "一键高清": "image-upscale" } as Partial<Record<string, HomeToolType>>)[label];
     return <button type="button" key={label} onClick={() => runAndClose(toolType ? () => onSelectTool(toolType) : onCreate)}>{label}</button>;
   };
 
@@ -762,6 +762,175 @@ const studioAssetConfig: Record<StudioAssetType, {
     defaultRatio: "3:2",
   },
 };
+
+type UpscaleMode = "balanced" | "detail" | "portrait";
+type UpscaleSource = { name: string; size: number; width: number; height: number; url: string };
+
+const formatFileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+const loadPreviewImage = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
+  const image = new Image();
+  image.onload = () => resolve(image);
+  image.onerror = () => reject(new Error("图片读取失败，请重新选择"));
+  image.src = url;
+});
+const nextPaint = () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
+
+function ImageUpscaleStudio({ onToast }: { onToast: (message: string) => void }) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const sourceUrlRef = useRef("");
+  const outputUrlRef = useRef("");
+  const [source, setSource] = useState<UpscaleSource | null>(null);
+  const [outputUrl, setOutputUrl] = useState("");
+  const [outputBytes, setOutputBytes] = useState(0);
+  const [scale, setScale] = useState<2 | 4>(2);
+  const [mode, setMode] = useState<UpscaleMode>("balanced");
+  const [comparison, setComparison] = useState(50);
+  const [dragging, setDragging] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [pageError, setPageError] = useState("");
+
+  useEffect(() => () => {
+    if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
+    if (outputUrlRef.current) URL.revokeObjectURL(outputUrlRef.current);
+  }, []);
+
+  const resetOutput = () => {
+    if (outputUrlRef.current) URL.revokeObjectURL(outputUrlRef.current);
+    outputUrlRef.current = "";
+    setOutputUrl("");
+    setOutputBytes(0);
+    setProgress(0);
+    setComparison(50);
+  };
+  const selectFile = async (file: File | undefined) => {
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { setPageError("请选择 PNG、JPG 或 WebP 图片"); return; }
+    if (file.size > 20 * 1024 * 1024) { setPageError("图片不能超过 20 MB"); return; }
+    const url = URL.createObjectURL(file);
+    try {
+      const image = await loadPreviewImage(url);
+      if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
+      resetOutput();
+      sourceUrlRef.current = url;
+      setSource({ name: file.name, size: file.size, width: image.naturalWidth, height: image.naturalHeight, url });
+      setPageError("");
+    } catch (caught) {
+      URL.revokeObjectURL(url);
+      setPageError(caught instanceof Error ? caught.message : "图片读取失败，请重新选择");
+    }
+  };
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    setDragging(false);
+    void selectFile(event.dataTransfer.files[0]);
+  };
+  const clearSource = () => {
+    if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
+    sourceUrlRef.current = "";
+    resetOutput();
+    setSource(null);
+    setPageError("");
+    if (inputRef.current) inputRef.current.value = "";
+  };
+  const upscale = async () => {
+    if (!source || processing) return;
+    const targetWidth = source.width * scale;
+    const targetHeight = source.height * scale;
+    if (targetWidth > 10000 || targetHeight > 10000 || targetWidth * targetHeight > 42_000_000) {
+      setPageError(`输出尺寸 ${targetWidth} × ${targetHeight} 过大，请选择 2× 或更小的原图`);
+      return;
+    }
+    setProcessing(true);
+    setPageError("");
+    resetOutput();
+    try {
+      setProgress(12);
+      await nextPaint();
+      const image = await loadPreviewImage(source.url);
+      const canvas = document.createElement("canvas");
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+      const context = canvas.getContext("2d", { alpha: true });
+      if (!context) throw new Error("当前浏览器无法处理这张图片");
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+      context.filter = mode === "detail" ? "contrast(1.05) saturate(1.03)" : mode === "portrait" ? "contrast(1.015) saturate(1.01) brightness(1.01)" : "contrast(1.025) saturate(1.02)";
+      setProgress(38);
+      await nextPaint();
+      context.drawImage(image, 0, 0, targetWidth, targetHeight);
+      setProgress(78);
+      await nextPaint();
+      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("高清图片导出失败")), "image/png"));
+      const nextUrl = URL.createObjectURL(blob);
+      outputUrlRef.current = nextUrl;
+      setOutputUrl(nextUrl);
+      setOutputBytes(blob.size);
+      setComparison(50);
+      setProgress(100);
+      onToast("高清图片已生成");
+    } catch (caught) {
+      setPageError(caught instanceof Error ? caught.message : "高清处理失败，请重新尝试");
+      setProgress(0);
+    } finally {
+      setProcessing(false);
+    }
+  };
+  const downloadResult = () => {
+    if (!outputUrl || !source) return;
+    const link = document.createElement("a");
+    const baseName = source.name.replace(/\.[^.]+$/, "");
+    link.href = outputUrl;
+    link.download = `${baseName}-${scale}x-HD.png`;
+    link.click();
+    onToast("高清图片已下载");
+  };
+  const changeScale = (nextScale: 2 | 4) => { setScale(nextScale); resetOutput(); setPageError(""); };
+  const changeMode = (nextMode: UpscaleMode) => { setMode(nextMode); resetOutput(); setPageError(""); };
+  const modes: Array<{ id: UpscaleMode; title: string; description: string }> = [
+    { id: "balanced", title: "自然清晰", description: "画面均衡，适合多数素材" },
+    { id: "detail", title: "细节增强", description: "加强纹理与明暗层次" },
+    { id: "portrait", title: "柔和人像", description: "降低锐化感，保留肤质" },
+  ];
+
+  return <main className="upscale-content">
+    <header className="upscale-head">
+      <div><span className="panel-eyebrow">IMAGE UPSCALER</span><h1>一键高清</h1><p>提升图片尺寸与画面清晰度，保留原始构图和色彩。</p></div>
+      {source && <button type="button" className="secondary-button upscale-replace" onClick={() => inputRef.current?.click()}><Upload size={15} />更换图片</button>}
+    </header>
+    <input ref={inputRef} className="upscale-file-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void selectFile(event.target.files?.[0])} />
+    {!source ? <div className={`upscale-dropzone ${dragging ? "dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setDragging(false)} onDrop={handleDrop}>
+      <div className="upscale-drop-icon"><ImagePlus size={28} /></div>
+      <strong>上传需要变清晰的图片</strong>
+      <span>PNG、JPG、WebP · 最大 20 MB</span>
+      <button type="button" className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} />选择图片</button>
+    </div> : <section className="upscale-workspace">
+      <div className="upscale-preview-panel">
+        <div className="upscale-preview-toolbar">
+          <div><strong>{source.name}</strong><span>{source.width} × {source.height} · {formatFileSize(source.size)}</span></div>
+          <button type="button" className="icon-button" aria-label="移除图片" title="移除图片" disabled={processing} onClick={clearSource}><Trash2 size={16} /></button>
+        </div>
+        <div className="upscale-preview-stage">
+          <div className={`upscale-comparison ${outputUrl ? "ready" : ""}`}>
+            <img src={source.url} alt="原始图片" />
+            {outputUrl && <><img className="upscale-result-layer" src={outputUrl} alt="高清图片" style={{ clipPath: `inset(0 ${100 - comparison}% 0 0)` }} /><span className="upscale-label original">原图</span><span className="upscale-label result">高清</span><div className="upscale-divider" style={{ left: `${comparison}%` }}><span><ArrowLeftRight size={14} /></span></div><input className="upscale-compare-range" aria-label="拖动查看原图与高清图对比" type="range" min="0" max="100" value={comparison} onChange={(event) => setComparison(Number(event.target.value))} /></>}
+            {!outputUrl && !processing && <div className="upscale-awaiting"><ScanSearch size={23} /><span>等待高清处理</span></div>}
+            {processing && <div className="upscale-processing"><LoaderCircle className="spin" size={25} /><strong>正在提升清晰度</strong><span>{progress}%</span><div><i style={{ width: `${progress}%` }} /></div></div>}
+          </div>
+        </div>
+      </div>
+      <aside className="upscale-settings">
+        <div className="upscale-settings-head"><div><span>OUTPUT</span><h2>输出设置</h2></div><Settings2 size={18} /></div>
+        <section className="upscale-setting-group"><div className="upscale-setting-title"><strong>放大倍数</strong><span>输出尺寸</span></div><div className="upscale-scale-tabs">{([2, 4] as const).map((value) => <button type="button" key={value} className={scale === value ? "selected" : ""} onClick={() => changeScale(value)} disabled={processing}><strong>{value}×</strong><span>{source.width * value} × {source.height * value}</span></button>)}</div></section>
+        <section className="upscale-setting-group"><div className="upscale-setting-title"><strong>增强模式</strong><span>画面倾向</span></div><div className="upscale-mode-list">{modes.map((item) => <button type="button" key={item.id} className={mode === item.id ? "selected" : ""} onClick={() => changeMode(item.id)} disabled={processing}><span className="upscale-mode-check">{mode === item.id && <Check size={11} />}</span><span><strong>{item.title}</strong><small>{item.description}</small></span></button>)}</div></section>
+        <div className="upscale-output-summary"><div><span>原始尺寸</span><strong>{source.width} × {source.height}</strong></div><ArrowRight size={15} /><div><span>输出尺寸</span><strong>{source.width * scale} × {source.height * scale}</strong></div></div>
+        {pageError && <div className="upscale-error">{pageError}</div>}
+        <div className="upscale-actions">{outputUrl ? <><button type="button" className="primary-button" onClick={downloadResult}><Download size={16} />下载高清图片</button><button type="button" className="secondary-button" onClick={() => void upscale()}><RefreshCw size={15} />重新处理</button><span>{formatFileSize(outputBytes)} · PNG</span></> : <button type="button" className="primary-button" disabled={processing} onClick={() => void upscale()}>{processing ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{processing ? "正在处理" : "生成高清图片"}</button>}</div>
+      </aside>
+    </section>}
+    {!source && pageError && <div className="upscale-empty-error">{pageError}</div>}
+  </main>;
+}
 
 type PromptTemplateCategory = "design" | "single-image" | "three-view" | "four-view" | "nine-grid" | "video" | "storyboard";
 type PromptTemplate = {
