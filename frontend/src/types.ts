@@ -156,7 +156,7 @@ export interface SubjectImageInput {
 
 export type StudioAssetType = "character" | "scene" | "prop";
 export type StudioVideoType = "reference-video" | "keyframe-video";
-export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop" | "image-upscale" | "digital-human";
+export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop" | "image-upscale" | "digital-human" | "infinite-canvas";
 
 export interface CharacterImageResult {
   id: string;
