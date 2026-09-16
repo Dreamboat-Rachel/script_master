@@ -114,6 +114,16 @@ export interface ImageSettings {
   configured: boolean;
 }
 
+export type ImageUpscaleResolution = "4k" | "8k";
+
+export interface ImageUpscaleResult {
+  id: string;
+  imageUrl: string;
+  resolution: ImageUpscaleResolution;
+  bytes: number;
+  taskId: string;
+}
+
 export interface VideoSettings {
   provider: ImageSettings["provider"];
   model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
@@ -146,7 +156,7 @@ export interface SubjectImageInput {
 
 export type StudioAssetType = "character" | "scene" | "prop";
 export type StudioVideoType = "reference-video" | "keyframe-video";
-export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop" | "image-upscale";
+export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop" | "image-upscale" | "digital-human";
 
 export interface CharacterImageResult {
   id: string;
@@ -235,7 +245,20 @@ export interface TextToSpeechList {
   settings: { configured: boolean; model: string };
 }
 
-export type AssetLibraryKind = "character" | "scene" | "prop" | "audio" | "video";
+export interface DigitalHumanServiceStatus {
+  configured: boolean;
+  mediaProvider: "AliRTC";
+}
+
+export interface DigitalHumanLiveSession {
+  liveId: string;
+  rtc: {
+    token: string;
+    userId: string;
+  };
+}
+
+export type AssetLibraryKind = "image" | "character" | "scene" | "prop" | "audio" | "video";
 
 export interface AssetLibraryItem {
   id: string;

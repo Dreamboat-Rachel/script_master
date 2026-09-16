@@ -1,11 +1,12 @@
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { AliRtcAudioTrack as AliRtcAudioTrackType, AliRtcVideoTrack as AliRtcVideoTrackType } from "aliyun-rtc-sdk";
 import {
-  ArrowLeft, ArrowLeftRight, ArrowRight, AudioLines, Check, ChevronDown, ChevronLeft, ChevronRight, Clapperboard, Combine, Copy, Download, FileAudio, FileText, Film, FolderOpen, Headphones, Layers3,
-  Eye, EyeOff, ImagePlus, ListChecks, LoaderCircle, LockKeyhole, LogOut, Mail, Menu, Mic2, Moon, MoreHorizontal, Pencil, Play, Plus, ScanSearch, Settings2, Sparkles,
-  RefreshCw, Search, ListFilter, Sun, Trash2, Upload, UserRound, UsersRound, WandSparkles, X,
+  ArrowLeft, ArrowLeftRight, ArrowRight, AudioLines, Check, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, Clapperboard, Combine, Copy, Download, FileAudio, FileText, Film, FolderOpen, Headphones, Layers3,
+  Camera, CameraOff, Eye, EyeOff, ImagePlus, ListChecks, LoaderCircle, LockKeyhole, LogOut, Mail, Maximize2, Menu, Mic, Mic2, MicOff, Moon, MoreHorizontal, Pencil, PhoneCall, PhoneOff, Play, Plus, Radio, ScanSearch, Settings2, Sparkles,
+  RefreshCw, Search, ListFilter, Sun, Trash2, Upload, UserRound, UsersRound, WandSparkles, Wifi, X,
 } from "lucide-react";
 import { api } from "./api";
-import type { AssetLibraryData, AssetLibraryItem, AssetLibraryKind, CharacterImageResult, DashboardData, Episode, HomeToolType, ImageAspectRatio, ImageResolution, ImageSettings, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, SpeechEmotion, SpeechLanguageBoost, StudioAssetType, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneResult } from "./types";
+import type { AssetLibraryData, AssetLibraryItem, AssetLibraryKind, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, Episode, HomeToolType, ImageAspectRatio, ImageResolution, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, SpeechEmotion, SpeechLanguageBoost, StudioAssetType, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneResult } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
 type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
@@ -160,7 +161,9 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [workingAction, setWorkingAction] = useState<WorkingAction | null>(null);
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
-  const [toast, setToast] = useState("");
+  const [toast, setToastNotice] = useState<{ id: number; message: string; tone: "default" | "error" } | null>(null);
+  const setToast = (message: string) => setToastNotice(message ? { id: Date.now(), message, tone: "default" } : null);
+  const setErrorToast = (message: string) => setToastNotice(message ? { id: Date.now(), message, tone: "error" } : null);
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<LlmSettings | null>(null);
@@ -244,7 +247,7 @@ function App() {
       setSubmittedRenderJobId(null);
     }
   }, [renderJobs, submittedRenderJobId]);
-  useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToast(""), 3400); return () => window.clearTimeout(timer); }, [toast]);
+  useEffect(() => { if (!toast) return; const timer = window.setTimeout(() => setToastNotice(null), 3400); return () => window.clearTimeout(timer); }, [toast]);
   useEffect(() => {
     const handlePreview = (event: Event) => setSubjectImagePreview((event as CustomEvent<Subject>).detail);
     window.addEventListener("subject-image-preview", handlePreview);
@@ -398,7 +401,7 @@ function App() {
     window.scrollTo({ top: 0, behavior: "smooth" });
     if (toolType === "reference-video" || toolType === "keyframe-video") {
       void api.videoSettings().then(setVideoSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "视频模型设置读取失败"));
-    } else if (toolType !== "voice-clone" && toolType !== "text-to-speech" && toolType !== "prompt-workshop" && toolType !== "image-upscale") {
+    } else if (toolType !== "voice-clone" && toolType !== "text-to-speech" && toolType !== "prompt-workshop" && toolType !== "image-upscale" && toolType !== "digital-human") {
       void api.imageSettings().then(setImageSettings).catch((caught) => setToast(caught instanceof Error ? caught.message : "图片模型设置读取失败"));
     }
   };
@@ -448,16 +451,16 @@ function App() {
       <div className="top-actions">{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div>
     </header>
     <div key={homeViewKey} className="home-view-transition">
-      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "image-upscale" ? <ImageUpscaleStudio onToast={setToast} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
+      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "digital-human" ? <DigitalHumanStudio onToast={setToast} onError={setErrorToast} /> : homeTool === "image-upscale" ? <ImageUpscaleStudio onToast={setToast} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
     </div>
     {newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}
     {existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}
     {deleteTarget && <DeleteProjectDialog project={deleteTarget} busy={workingAction === "delete"} onConfirm={confirmDeleteProject} onClose={() => setDeleteTarget(null)} />}
-    {settingsDialog}{accountDialogNode}{toast && <div className="toast"><Check size={16} />{toast}</div>}
+    {settingsDialog}{accountDialogNode}{toast && <div key={toast.id} className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>{toast.tone === "error" ? <CircleAlert size={17} /> : <Check size={16} />}<span>{toast.message}</span></div>}
   </div>;
   return <div className="app-shell project-shell">
     <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "开始创作"}</span>{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div></header>
-    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div className="toast"><Check size={16} />{toast}</div>}
+    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div key={toast.id} className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>{toast.tone === "error" ? <CircleAlert size={17} /> : <Check size={16} />}<span>{toast.message}</span></div>}
     {accountDialogNode}
   </div>;
 }
@@ -488,7 +491,7 @@ function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, on
   }, [toolsOpen]);
   const runAndClose = (action: () => void) => { setToolsOpen(false); action(); };
   const toolButton = (label: string) => {
-    const toolType = ({ "角色": "character", "场景": "scene", "物品": "prop", "参考生视频": "reference-video", "首尾帧视频": "keyframe-video", "声音克隆": "voice-clone", "文转语音": "text-to-speech", "提示词工坊": "prompt-workshop", "一键高清": "image-upscale" } as Partial<Record<string, HomeToolType>>)[label];
+    const toolType = ({ "角色": "character", "场景": "scene", "物品": "prop", "参考生视频": "reference-video", "首尾帧视频": "keyframe-video", "声音克隆": "voice-clone", "文转语音": "text-to-speech", "提示词工坊": "prompt-workshop", "一键高清": "image-upscale", "数字人": "digital-human" } as Partial<Record<string, HomeToolType>>)[label];
     return <button type="button" key={label} onClick={() => runAndClose(toolType ? () => onSelectTool(toolType) : onCreate)}>{label}</button>;
   };
 
@@ -507,7 +510,7 @@ function HomeNavigation({ active, onHome, onPipeline, onAssets, onSelectTool, on
         <div><span>配音</span><div className="mega-tool-list">{["声音克隆", "文转语音"].map(toolButton)}</div></div>
       </div>
       <div className="mega-column">
-        <div><span>更多工具</span><div className="mega-tool-list">{["一键高清", "多角度图片", "无限画布"].map(toolButton)}</div></div>
+        <div><span>更多工具</span><div className="mega-tool-list">{["一键高清", "数字人", "无限画布"].map(toolButton)}</div></div>
         <div className="mega-separated"><span>对口型创作</span><div className="mega-tool-list">{["文本对口型", "音频对口型", "角色替换", "分镜替换", "真人素材", "角色固定", "提示词工坊"].map(toolButton)}</div></div>
       </div>
     </section>}
@@ -564,13 +567,13 @@ function HelpStage({ onSelectTool }: { onSelectTool: (toolType: HomeToolType) =>
             <div className="help-tip"><Check size={16} /><p><strong>提示词写清主体、动作、环境和摄影。</strong>需要稳定角色时，优先提供清晰且风格一致的参考图。</p></div>
           </article>}
           {activeTopic === "voice" && <article className="help-article">
-            <header className="help-article-head"><span>VOICE WORKFLOW</span><h3>创建声音并生成配音</h3><p>声音克隆和文转语音共用 MiniMax 语音服务。页面右上角状态会显示服务是否已连接。</p></header>
+            <header className="help-article-head"><span>VOICE WORKFLOW</span><h3>创建声音并生成配音</h3><p>声音克隆和文转语音共用后台配置的 MiniMax 语音服务。</p></header>
             <div className="help-voice-grid"><section><div className="help-voice-heading"><span><Mic2 size={19} /></span><div><small>STEP 01</small><h4>声音克隆</h4></div></div><ol><li><strong>命名声音</strong><span>填写便于识别的名称和主要语言。</span></li><li><strong>上传样本</strong><span>支持 MP3、WAV、M4A，最大 20MB，时长至少 3 秒。</span></li><li><strong>填写文本</strong><span>试听文本用于生成预览；准确填写样本逐字稿可提升克隆效果。</span></li><li><strong>确认授权</strong><span>仅上传已获得明确授权的声音并开始克隆。</span></li></ol><button type="button" className="secondary-button" onClick={() => openTool("voice-clone")}>打开声音克隆</button></section><section><div className="help-voice-heading"><span><Headphones size={19} /></span><div><small>STEP 02</small><h4>文转语音</h4></div></div><ol><li><strong>输入朗读文本</strong><span>支持对白、旁白与播报文本，单次最多 10,000 字符。</span></li><li><strong>选择声音</strong><span>可使用系统声音或已经创建的克隆声音。</span></li><li><strong>调整表达</strong><span>设置语言、情绪、语速、音量、音高、格式和采样率。</span></li><li><strong>试听并下载</strong><span>生成后可在线播放，并下载 MP3 或 FLAC 文件。</span></li></ol><button type="button" className="secondary-button" onClick={() => openTool("text-to-speech")}>打开文转语音</button></section></div>
             <div className="help-tip warning"><AudioLines size={16} /><p><strong>样本质量决定克隆效果。</strong>使用单人、无背景音乐、无混响且音量稳定的清晰人声。</p></div>
           </article>}
           {activeTopic === "settings" && <article className="help-article">
             <header className="help-article-head"><span>SETTINGS & SUPPORT</span><h3>模型配置与常见问题</h3><p>右上角设置入口用于管理剧本、图片和视频生成服务；声音服务由部署环境统一配置。</p></header>
-            <section className="help-section"><div className="help-section-title"><span>01</span><div><h4>开始前检查</h4><p>各工作区顶部的连接状态会提示当前服务是否可用。</p></div></div><div className="help-config-list"><div><FileText size={17} /><span><strong>剧本模型</strong><small>用于生成、格式化和解析剧本内容。</small></span></div><div><ImagePlus size={17} /><span><strong>图片模型</strong><small>用于角色、场景、物品和主体图片。</small></span></div><div><Clapperboard size={17} /><span><strong>视频模型</strong><small>用于参考图、关键帧和故事板镜头。</small></span></div><div><Mic2 size={17} /><span><strong>MiniMax 语音</strong><small>需要部署者配置 MINIMAX_API_KEY。</small></span></div></div></section>
+            <section className="help-section"><div className="help-section-title"><span>01</span><div><h4>开始前检查</h4><p>生成服务由工作区后台统一配置，异常时页面会显示对应提示。</p></div></div><div className="help-config-list"><div><FileText size={17} /><span><strong>剧本模型</strong><small>用于生成、格式化和解析剧本内容。</small></span></div><div><ImagePlus size={17} /><span><strong>图片模型</strong><small>用于角色、场景、物品和主体图片。</small></span></div><div><Clapperboard size={17} /><span><strong>视频模型</strong><small>用于参考图、关键帧和故事板镜头。</small></span></div><div><Mic2 size={17} /><span><strong>MiniMax 语音</strong><small>需要部署者配置 MINIMAX_API_KEY。</small></span></div></div></section>
             <section className="help-section"><div className="help-section-title"><span>02</span><div><h4>常见问题</h4><p>遇到异常时先根据页面状态提示检查以下项目。</p></div></div><div className="help-faq"><details open><summary>生成按钮为什么不可用？<ChevronDown size={15} /></summary><p>通常是必填内容、参考素材或授权确认尚未完成，也可能是对应模型服务未配置。检查页面顶部连接状态和输入区提示。</p></details><details><summary>项目和生成记录保存在哪里？<ChevronDown size={15} /></summary><p>项目数据保存在当前设备的本地工作区；已生成的图片、声音和视频可在“资产”中统一查看。</p></details><details><summary>如何继续之前的项目？<ChevronDown size={15} /></summary><p>打开“创作台”，使用项目名称、简介、类型或风格搜索，然后点击项目卡片继续进入创作流程。</p></details><details><summary>生成失败或等待时间过长怎么办？<ChevronDown size={15} /></summary><p>先确认模型配置和网络连接。视频生成通常比文本和图片更久；若页面返回错误，按提示调整素材或稍后重试。</p></details></div></section>
           </article>}
         </div>
@@ -763,8 +766,7 @@ const studioAssetConfig: Record<StudioAssetType, {
   },
 };
 
-type UpscaleMode = "balanced" | "detail" | "portrait";
-type UpscaleSource = { name: string; size: number; width: number; height: number; url: string };
+type UpscaleSource = { file: File; name: string; size: number; width: number; height: number; url: string };
 
 const formatFileSize = (bytes: number) => bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
 const loadPreviewImage = (url: string) => new Promise<HTMLImageElement>((resolve, reject) => {
@@ -773,17 +775,12 @@ const loadPreviewImage = (url: string) => new Promise<HTMLImageElement>((resolve
   image.onerror = () => reject(new Error("图片读取失败，请重新选择"));
   image.src = url;
 });
-const nextPaint = () => new Promise<void>((resolve) => window.requestAnimationFrame(() => resolve()));
-
 function ImageUpscaleStudio({ onToast }: { onToast: (message: string) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const sourceUrlRef = useRef("");
-  const outputUrlRef = useRef("");
   const [source, setSource] = useState<UpscaleSource | null>(null);
-  const [outputUrl, setOutputUrl] = useState("");
-  const [outputBytes, setOutputBytes] = useState(0);
-  const [scale, setScale] = useState<2 | 4>(2);
-  const [mode, setMode] = useState<UpscaleMode>("balanced");
+  const [result, setResult] = useState<ImageUpscaleResult | null>(null);
+  const [resolution, setResolution] = useState<ImageUpscaleResolution>("4k");
   const [comparison, setComparison] = useState(50);
   const [dragging, setDragging] = useState(false);
   const [processing, setProcessing] = useState(false);
@@ -792,28 +789,29 @@ function ImageUpscaleStudio({ onToast }: { onToast: (message: string) => void })
 
   useEffect(() => () => {
     if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
-    if (outputUrlRef.current) URL.revokeObjectURL(outputUrlRef.current);
   }, []);
 
   const resetOutput = () => {
-    if (outputUrlRef.current) URL.revokeObjectURL(outputUrlRef.current);
-    outputUrlRef.current = "";
-    setOutputUrl("");
-    setOutputBytes(0);
+    setResult(null);
     setProgress(0);
     setComparison(50);
   };
   const selectFile = async (file: File | undefined) => {
     if (!file) return;
-    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { setPageError("请选择 PNG、JPG 或 WebP 图片"); return; }
-    if (file.size > 20 * 1024 * 1024) { setPageError("图片不能超过 20 MB"); return; }
+    if (!["image/png", "image/jpeg"].includes(file.type)) { setPageError("请选择 PNG 或 JPG 图片"); return; }
+    if (file.size > 4.7 * 1024 * 1024) { setPageError("图片不能超过 4.7 MB"); return; }
     const url = URL.createObjectURL(file);
     try {
       const image = await loadPreviewImage(url);
+      if (image.naturalWidth > 4096 || image.naturalHeight > 4096) {
+        URL.revokeObjectURL(url);
+        setPageError("图片宽高不能超过 4096 px");
+        return;
+      }
       if (sourceUrlRef.current) URL.revokeObjectURL(sourceUrlRef.current);
       resetOutput();
       sourceUrlRef.current = url;
-      setSource({ name: file.name, size: file.size, width: image.naturalWidth, height: image.naturalHeight, url });
+      setSource({ file, name: file.name, size: file.size, width: image.naturalWidth, height: image.naturalHeight, url });
       setPageError("");
     } catch (caught) {
       URL.revokeObjectURL(url);
@@ -835,74 +833,47 @@ function ImageUpscaleStudio({ onToast }: { onToast: (message: string) => void })
   };
   const upscale = async () => {
     if (!source || processing) return;
-    const targetWidth = source.width * scale;
-    const targetHeight = source.height * scale;
-    if (targetWidth > 10000 || targetHeight > 10000 || targetWidth * targetHeight > 42_000_000) {
-      setPageError(`输出尺寸 ${targetWidth} × ${targetHeight} 过大，请选择 2× 或更小的原图`);
-      return;
-    }
     setProcessing(true);
     setPageError("");
     resetOutput();
+    setProgress(6);
+    const progressTimer = window.setInterval(() => setProgress((current) => current >= 92 ? current : Math.min(92, current + Math.max(1, Math.round((94 - current) / 11)))), 1800);
     try {
-      setProgress(12);
-      await nextPaint();
-      const image = await loadPreviewImage(source.url);
-      const canvas = document.createElement("canvas");
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-      const context = canvas.getContext("2d", { alpha: true });
-      if (!context) throw new Error("当前浏览器无法处理这张图片");
-      context.imageSmoothingEnabled = true;
-      context.imageSmoothingQuality = "high";
-      context.filter = mode === "detail" ? "contrast(1.05) saturate(1.03)" : mode === "portrait" ? "contrast(1.015) saturate(1.01) brightness(1.01)" : "contrast(1.025) saturate(1.02)";
-      setProgress(38);
-      await nextPaint();
-      context.drawImage(image, 0, 0, targetWidth, targetHeight);
-      setProgress(78);
-      await nextPaint();
-      const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob((value) => value ? resolve(value) : reject(new Error("高清图片导出失败")), "image/png"));
-      const nextUrl = URL.createObjectURL(blob);
-      outputUrlRef.current = nextUrl;
-      setOutputUrl(nextUrl);
-      setOutputBytes(blob.size);
+      const nextResult = await api.upscaleImage(source.file, resolution);
+      setResult(nextResult);
       setComparison(50);
       setProgress(100);
-      onToast("高清图片已生成");
+      onToast(`${resolution.toUpperCase()} 高清图片已生成`);
     } catch (caught) {
       setPageError(caught instanceof Error ? caught.message : "高清处理失败，请重新尝试");
       setProgress(0);
     } finally {
+      window.clearInterval(progressTimer);
       setProcessing(false);
     }
   };
   const downloadResult = () => {
-    if (!outputUrl || !source) return;
+    if (!result || !source) return;
     const link = document.createElement("a");
     const baseName = source.name.replace(/\.[^.]+$/, "");
-    link.href = outputUrl;
-    link.download = `${baseName}-${scale}x-HD.png`;
+    const extension = result.imageUrl.match(/\.([a-z0-9]+)(?:\?|$)/i)?.[1] ?? "png";
+    link.href = result.imageUrl;
+    link.download = `${baseName}-${result.resolution.toUpperCase()}-HD.${extension}`;
     link.click();
     onToast("高清图片已下载");
   };
-  const changeScale = (nextScale: 2 | 4) => { setScale(nextScale); resetOutput(); setPageError(""); };
-  const changeMode = (nextMode: UpscaleMode) => { setMode(nextMode); resetOutput(); setPageError(""); };
-  const modes: Array<{ id: UpscaleMode; title: string; description: string }> = [
-    { id: "balanced", title: "自然清晰", description: "画面均衡，适合多数素材" },
-    { id: "detail", title: "细节增强", description: "加强纹理与明暗层次" },
-    { id: "portrait", title: "柔和人像", description: "降低锐化感，保留肤质" },
-  ];
+  const changeResolution = (value: ImageUpscaleResolution) => { setResolution(value); resetOutput(); setPageError(""); };
 
   return <main className="upscale-content">
     <header className="upscale-head">
       <div><span className="panel-eyebrow">IMAGE UPSCALER</span><h1>一键高清</h1><p>提升图片尺寸与画面清晰度，保留原始构图和色彩。</p></div>
       {source && <button type="button" className="secondary-button upscale-replace" onClick={() => inputRef.current?.click()}><Upload size={15} />更换图片</button>}
     </header>
-    <input ref={inputRef} className="upscale-file-input" type="file" accept="image/png,image/jpeg,image/webp" onChange={(event) => void selectFile(event.target.files?.[0])} />
+    <input ref={inputRef} className="upscale-file-input" type="file" accept="image/png,image/jpeg" onChange={(event) => { void selectFile(event.target.files?.[0]); event.currentTarget.value = ""; }} />
     {!source ? <div className={`upscale-dropzone ${dragging ? "dragging" : ""}`} onDragEnter={(event) => { event.preventDefault(); setDragging(true); }} onDragOver={(event) => event.preventDefault()} onDragLeave={() => setDragging(false)} onDrop={handleDrop}>
       <div className="upscale-drop-icon"><ImagePlus size={28} /></div>
       <strong>上传需要变清晰的图片</strong>
-      <span>PNG、JPG、WebP · 最大 20 MB</span>
+      <span>PNG、JPG · 最大 4.7 MB · 宽高不超过 4096 px</span>
       <button type="button" className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} />选择图片</button>
     </div> : <section className="upscale-workspace">
       <div className="upscale-preview-panel">
@@ -911,24 +882,575 @@ function ImageUpscaleStudio({ onToast }: { onToast: (message: string) => void })
           <button type="button" className="icon-button" aria-label="移除图片" title="移除图片" disabled={processing} onClick={clearSource}><Trash2 size={16} /></button>
         </div>
         <div className="upscale-preview-stage">
-          <div className={`upscale-comparison ${outputUrl ? "ready" : ""}`}>
+          <div className={`upscale-comparison ${result ? "ready" : ""}`}>
             <img src={source.url} alt="原始图片" />
-            {outputUrl && <><img className="upscale-result-layer" src={outputUrl} alt="高清图片" style={{ clipPath: `inset(0 ${100 - comparison}% 0 0)` }} /><span className="upscale-label original">原图</span><span className="upscale-label result">高清</span><div className="upscale-divider" style={{ left: `${comparison}%` }}><span><ArrowLeftRight size={14} /></span></div><input className="upscale-compare-range" aria-label="拖动查看原图与高清图对比" type="range" min="0" max="100" value={comparison} onChange={(event) => setComparison(Number(event.target.value))} /></>}
-            {!outputUrl && !processing && <div className="upscale-awaiting"><ScanSearch size={23} /><span>等待高清处理</span></div>}
-            {processing && <div className="upscale-processing"><LoaderCircle className="spin" size={25} /><strong>正在提升清晰度</strong><span>{progress}%</span><div><i style={{ width: `${progress}%` }} /></div></div>}
+            {result && <><img className="upscale-result-layer" src={result.imageUrl} alt="高清图片" style={{ clipPath: `inset(0 ${100 - comparison}% 0 0)` }} /><span className="upscale-label original">原图</span><span className="upscale-label result">{result.resolution.toUpperCase()}</span><div className="upscale-divider" style={{ left: `${comparison}%` }}><span><ArrowLeftRight size={14} /></span></div><input className="upscale-compare-range" aria-label="拖动查看原图与高清图对比" type="range" min="0" max="100" value={comparison} onChange={(event) => setComparison(Number(event.target.value))} /></>}
+            {!result && !processing && <div className="upscale-awaiting"><ScanSearch size={23} /><span>等待高清处理</span></div>}
+            {processing && <div className="upscale-processing"><LoaderCircle className="spin" size={25} /><strong>正在生成 {resolution.toUpperCase()} 图片</strong><span>{progress}%</span><div><i style={{ width: `${progress}%` }} /></div><small>云端处理通常需要一段时间，请勿关闭页面</small></div>}
           </div>
         </div>
       </div>
       <aside className="upscale-settings">
         <div className="upscale-settings-head"><div><span>OUTPUT</span><h2>输出设置</h2></div><Settings2 size={18} /></div>
-        <section className="upscale-setting-group"><div className="upscale-setting-title"><strong>放大倍数</strong><span>输出尺寸</span></div><div className="upscale-scale-tabs">{([2, 4] as const).map((value) => <button type="button" key={value} className={scale === value ? "selected" : ""} onClick={() => changeScale(value)} disabled={processing}><strong>{value}×</strong><span>{source.width * value} × {source.height * value}</span></button>)}</div></section>
-        <section className="upscale-setting-group"><div className="upscale-setting-title"><strong>增强模式</strong><span>画面倾向</span></div><div className="upscale-mode-list">{modes.map((item) => <button type="button" key={item.id} className={mode === item.id ? "selected" : ""} onClick={() => changeMode(item.id)} disabled={processing}><span className="upscale-mode-check">{mode === item.id && <Check size={11} />}</span><span><strong>{item.title}</strong><small>{item.description}</small></span></button>)}</div></section>
-        <div className="upscale-output-summary"><div><span>原始尺寸</span><strong>{source.width} × {source.height}</strong></div><ArrowRight size={15} /><div><span>输出尺寸</span><strong>{source.width * scale} × {source.height * scale}</strong></div></div>
+        <section className="upscale-setting-group"><div className="upscale-setting-title"><strong>高清分辨率</strong><span>输出规格</span></div><div className="upscale-scale-tabs">{(["4k", "8k"] as const).map((value) => <button type="button" key={value} className={resolution === value ? "selected" : ""} onClick={() => changeResolution(value)} disabled={processing}><strong>{value.toUpperCase()}</strong><span>{value === "4k" ? "标准高清 · 默认" : "超高分辨率"}</span></button>)}</div></section>
+        <div className="upscale-output-summary"><div><span>原始尺寸</span><strong>{source.width} × {source.height}</strong></div><ArrowRight size={15} /><div><span>输出规格</span><strong>{resolution.toUpperCase()}</strong></div></div>
         {pageError && <div className="upscale-error">{pageError}</div>}
-        <div className="upscale-actions">{outputUrl ? <><button type="button" className="primary-button" onClick={downloadResult}><Download size={16} />下载高清图片</button><button type="button" className="secondary-button" onClick={() => void upscale()}><RefreshCw size={15} />重新处理</button><span>{formatFileSize(outputBytes)} · PNG</span></> : <button type="button" className="primary-button" disabled={processing} onClick={() => void upscale()}>{processing ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{processing ? "正在处理" : "生成高清图片"}</button>}</div>
+        <div className="upscale-actions">{result ? <><button type="button" className="primary-button" onClick={downloadResult}><Download size={16} />下载高清图片</button><button type="button" className="secondary-button" onClick={() => void upscale()}><RefreshCw size={15} />重新处理</button><span>{formatFileSize(result.bytes)} · {result.resolution.toUpperCase()}</span></> : <button type="button" className="primary-button" disabled={processing} onClick={() => void upscale()}>{processing ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}{processing ? "云端处理中" : `生成 ${resolution.toUpperCase()} 图片`}</button>}</div>
       </aside>
     </section>}
     {!source && pageError && <div className="upscale-empty-error">{pageError}</div>}
+  </main>;
+}
+
+type DigitalHumanImage = { file: File; name: string; url: string };
+type DigitalHumanCallMode = "audio" | "video";
+type DigitalHumanPhase = "idle" | "creating" | "signaling" | "joining" | "waiting" | "live" | "ending" | "ended" | "failed";
+type DigitalHumanEngine = InstanceType<(typeof import("aliyun-rtc-sdk"))["default"]>;
+
+const createDigitalHumanConnectionId = () => {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, "0"));
+  return `${hex.slice(0, 4).join("")}-${hex.slice(4, 6).join("")}-${hex.slice(6, 8).join("")}-${hex.slice(8, 10).join("")}-${hex.slice(10).join("")}`;
+};
+
+const digitalHumanMediaError = (device: "摄像头" | "麦克风", error: unknown) => {
+  const detail = error instanceof Error ? `${error.name} ${error.message}` : String(error);
+  if (/NotAllowedError|PermissionDenied|denied|permission/i.test(detail)) return `浏览器未获得${device}权限，请允许访问后重试`;
+  if (/NotFoundError|DevicesNotFound|not found/i.test(detail)) return `未找到可用的${device}`;
+  if (/NotReadableError|TrackStartError|in use|busy/i.test(detail)) return `${device}正被其他应用占用`;
+  return `${device}启动失败，请检查设备后重试`;
+};
+
+const digitalHumanPhases: Array<{ key: "created" | "signal" | "rtc" | "live" | "ended"; label: string }> = [
+  { key: "created", label: "创建会话" },
+  { key: "signal", label: "控制链路" },
+  { key: "rtc", label: "RTC 入会" },
+  { key: "live", label: "实时互动" },
+  { key: "ended", label: "结束" },
+];
+
+type DigitalVoiceProvider = "qwen_omni" | "doubao";
+type DigitalVoiceOption = {
+  name: string;
+  id: string;
+  provider: DigitalVoiceProvider;
+  description: string;
+  language: string;
+};
+
+const digitalVoiceProviderLabels: Record<DigitalVoiceProvider, string> = {
+  qwen_omni: "实时版（qwen_omni）",
+  doubao: "实时版（doubao 国内）",
+};
+
+const digitalVoiceOptions: DigitalVoiceOption[] = [
+  { name: "甜甜 Tina", id: "Tina", provider: "qwen_omni", description: "奶茶小姐姐，甜甜的、暖暖的", language: "中文（普通话）" },
+  { name: "林欣宜 Cindy", id: "Cindy", provider: "qwen_omni", description: "台湾说话嗲嗲的小姐姐", language: "中文（台湾口音）" },
+  { name: "清欢 Liora Mira", id: "Liora Mira", provider: "qwen_omni", description: "用声音织就烟火人间的温柔", language: "中文（普通话）" },
+  { name: "知芝 Sunnybobi", id: "Sunnybobi", provider: "qwen_omni", description: "大大咧咧的社恐邻家姑娘", language: "中文（普通话）" },
+  { name: "林川野 Raymond", id: "Raymond", provider: "qwen_omni", description: "声音清亮，爱吃外卖的宅男", language: "中文（普通话）" },
+  { name: "晨煦 Ethan", id: "Ethan", provider: "qwen_omni", description: "标准普通话，带部分北方口音。阳光、温暖、活力、朝气", language: "中文（普通话）" },
+  { name: "予安 Theo Calm", id: "Theo Calm", provider: "qwen_omni", description: "在静默处传递理解，在言语间疗愈人心", language: "中文（普通话）" },
+  { name: "苏瑶 Serena", id: "Serena", provider: "qwen_omni", description: "温柔小姐姐", language: "中文（普通话）" },
+  { name: "厚 Harvey", id: "Harvey", provider: "qwen_omni", description: "低沉、温和，带着一点咖啡与旧书的气息", language: "中文（普通话）" },
+  { name: "四月 Maia", id: "Maia", provider: "qwen_omni", description: "知性与温柔的碰撞", language: "中文（普通话）" },
+  { name: "江晨 Evan", id: "Evan", provider: "qwen_omni", description: "男大学生，年下奶狗", language: "中文（普通话）" },
+  { name: "小乔妹 Qiao", id: "Qiao", provider: "qwen_omni", description: "表面甜妹，个性十足", language: "中文（台湾口音）" },
+  { name: "茉兔 Momo", id: "Momo", provider: "qwen_omni", description: "撒娇搞怪，逗你开心", language: "中文（普通话）" },
+  { name: "伟伦 Wil", id: "Wil", provider: "qwen_omni", description: "在深圳长大的港台腔小哥哥", language: "中文（普通话）" },
+  { name: "安琪 Angel", id: "Angel", provider: "qwen_omni", description: "略带台式口音，她超甜的哦！", language: "中文（普通话）" },
+  { name: "李公公 Li Cassian", id: "Li Cassian", provider: "qwen_omni", description: "话中三分留白、七分察言观色", language: "中文（普通话）" },
+  { name: "舒然 Mia", id: "Mia", provider: "qwen_omni", description: "以细腻声音传递慢生活美学与日常治愈力量", language: "中文（普通话）" },
+  { name: "阿逗 Joyner", id: "Joyner", provider: "qwen_omni", description: "搞笑、夸张、接地气", language: "中文（普通话）" },
+  { name: "金爷 Gold", id: "Gold", provider: "qwen_omni", description: "西海岸黑人 Rapper", language: "中文（普通话）" },
+  { name: "卡捷琳娜 Katerina", id: "Katerina", provider: "qwen_omni", description: "御姐音色，韵律回味十足", language: "中文（普通话）" },
+  { name: "甜茶 Ryan", id: "Ryan", provider: "qwen_omni", description: "节奏拉满，戏感炸裂，真实与张力共舞", language: "中文（普通话）" },
+  { name: "詹妮弗 Jennifer", id: "Jennifer", provider: "qwen_omni", description: "品牌级、电影质感般美语女声", language: "中文（普通话）" },
+  { name: "艾登 Aiden", id: "Aiden", provider: "qwen_omni", description: "精通厨艺的美语大男孩", language: "中文（普通话）" },
+  { name: "敏儿 Mione", id: "Mione", provider: "qwen_omni", description: "成熟，知性英国邻家妹妹", language: "中文（普通话）" },
+  { name: "晴儿 Sunny", id: "Sunny", provider: "qwen_omni", description: "甜到你心里的川妹子", language: "中文（四川话）" },
+  { name: "晓东 Dylan", id: "Dylan", provider: "qwen_omni", description: "北京胡同里长大的少年", language: "中文（北京话）" },
+  { name: "程川 Eric", id: "Eric", provider: "qwen_omni", description: "一个跳脱市井的四川成都男子", language: "中文（四川话）" },
+  { name: "李彼得 Peter", id: "Peter", provider: "qwen_omni", description: "天津相声，专业捧哏", language: "中文（天津话）" },
+  { name: "阿樸伯 Joseph Chen", id: "Joseph Chen", provider: "qwen_omni", description: "南洋老华侨，沉稳亲切", language: "中文（闽南话）" },
+  { name: "秦川 Marcus", id: "Marcus", provider: "qwen_omni", description: "面宽话短，心实声沉——老陕的味道", language: "中文（陕西话）" },
+  { name: "老李 Li", id: "Li", provider: "qwen_omni", description: "骂骂咧咧的伯伯", language: "中文（南京话）" },
+  { name: "阿清", id: "Kiki", provider: "qwen_omni", description: "甜美的港妹闺蜜", language: "中文（粤语）" },
+  { name: "阿强 Rocky", id: "Rocky", provider: "qwen_omni", description: "幽默风趣的阿强，在线陪聊", language: "中文（广东话）" },
+  { name: "素熙 Sohee", id: "Sohee", provider: "qwen_omni", description: "温柔开朗，情绪丰富的韩国欧尼", language: "中文（普通话）" },
+  { name: "莱恩 Lenn", id: "Lenn", provider: "qwen_omni", description: "理性是底色，叛逆藏在细节里的德国青年", language: "中文（普通话）" },
+  { name: "小野杏 Ono Anna", id: "Ono Anna", provider: "qwen_omni", description: "鬼灵精怪的青梅竹马", language: "中文（普通话）" },
+  { name: "索尼莎 Sonrisa", id: "Sonrisa", provider: "qwen_omni", description: "热情开朗的拉美大姐", language: "中文（普通话）" },
+  { name: "博德加 Bodega", id: "Bodega", provider: "qwen_omni", description: "热情的西班牙大叔", language: "中文（普通话）" },
+  { name: "埃米尔安 Emilien", id: "Emilien", provider: "qwen_omni", description: "浪漫的法国大哥哥", language: "中文（普通话）" },
+  { name: "安德雷 Andre", id: "Andre", provider: "qwen_omni", description: "声音磁性，自然舒服、沉稳男生", language: "中文（普通话）" },
+  { name: "拉迪奥·戈尔 Radio Gol", id: "Radio Gol", provider: "qwen_omni", description: "足球诗人，为你解说足球", language: "中文（普通话）" },
+  { name: "阿列克 Alek", id: "Alek", provider: "qwen_omni", description: "战斗民族的冷，也是毛呢大衣下的暖", language: "中文（普通话）" },
+  { name: "阿力 Rizky", id: "Rizky", provider: "qwen_omni", description: "印尼的青年小伙，声线个性", language: "中文（普通话）" },
+  { name: "萝雅 Roya", id: "Roya", provider: "qwen_omni", description: "热爱运动的女孩，拥有一颗自由的心", language: "中文（普通话）" },
+  { name: "阿尔达 Arda", id: "Arda", provider: "qwen_omni", description: "干净利落中带着温润的气质", language: "中文（普通话）" },
+  { name: "阿幸 Hana", id: "Hana", provider: "qwen_omni", description: "爱狗狗的越南成熟姐姐", language: "中文（普通话）" },
+  { name: "多尔切 Dolce", id: "Dolce", provider: "qwen_omni", description: "慵懒的意大利大叔", language: "中文（普通话）" },
+  { name: "雅克 Jakub", id: "Jakub", provider: "qwen_omni", description: "波兰小镇文艺青年，声线磁性性感", language: "中文（普通话）" },
+  { name: "海娜 Griet", id: "Griet", provider: "qwen_omni", description: "荷兰成熟又文艺的女性", language: "中文（普通话）" },
+  { name: "艾莉卡 Eliška", id: "Eliška", provider: "qwen_omni", description: "每个单词都传递中欧的匠心与温度", language: "中文（普通话）" },
+  { name: "玛丽娜 Marina", id: "Marina", provider: "qwen_omni", description: "一个在多元文化城市中长大的女孩", language: "中文（普通话）" },
+  { name: "西芮 Siiri", id: "Siiri", provider: "qwen_omni", description: "内敛温柔，语速舒缓如湖面微澜", language: "中文（普通话）" },
+  { name: "林恩 Ingrid", id: "Ingrid", provider: "qwen_omni", description: "挪威乡村姑娘", language: "中文（普通话）" },
+  { name: "海娜 Sigga", id: "Sigga", provider: "qwen_omni", description: "冰岛小镇的知性女青年", language: "中文（普通话）" },
+  { name: "雅娜 Bea", id: "Bea", provider: "qwen_omni", description: "爱喝咖啡的菲律宾甜甜小姐姐", language: "中文（普通话）" },
+  { name: "思怡 Chloe", id: "Chloe", provider: "qwen_omni", description: "马来西亚白领女生", language: "中文（普通话）" },
+  { name: "Vivi 2.0", id: "zh_female_vv_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文、日文、印尼语、墨西哥西班牙语" },
+  { name: "小何 2.0", id: "zh_female_xiaohe_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "云舟 2.0", id: "zh_male_m191_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "小天 2.0", id: "zh_male_taocheng_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "刘飞 2.0", id: "zh_male_liufei_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "魅力苏菲 2.0", id: "zh_female_sophie_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "清新女声 2.0", id: "zh_female_qingxinnvsheng_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "知性灿灿 2.0", id: "zh_female_cancan_uranus_bigtts", provider: "doubao", description: "角色扮演", language: "中文" },
+  { name: "撒娇学妹 2.0", id: "zh_female_sajiaoxuemei_uranus_bigtts", provider: "doubao", description: "角色扮演", language: "中文" },
+  { name: "甜美小源 2.0", id: "zh_female_tianmeixiaoyuan_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "甜美桃子 2.0", id: "zh_female_tianmeitaozi_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "爽快思思 2.0", id: "zh_female_shuangkuaisisi_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "佩奇猪 2.0", id: "zh_female_peiqi_uranus_bigtts", provider: "doubao", description: "视频配音", language: "中文" },
+  { name: "邻家女孩 2.0", id: "zh_female_linjianvhai_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "少年梓辛 2.0", id: "zh_male_shaonianzixin_uranus_bigtts", provider: "doubao", description: "通用场景", language: "中文" },
+  { name: "猴哥 2.0", id: "zh_male_sunwukong_uranus_bigtts", provider: "doubao", description: "视频配音", language: "中文" },
+  { name: "Tina老师 2.0", id: "zh_female_yingyujiaoxue_uranus_bigtts", provider: "doubao", description: "教育场景", language: "中文" },
+];
+
+function DigitalVoiceSelect({ value, onChange, disabled }: { value: string; onChange: (value: string) => void; disabled: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const container = useRef<HTMLDivElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  const selected = digitalVoiceOptions.find((option) => option.id === value);
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filteredOptions = useMemo(() => normalizedQuery ? digitalVoiceOptions.filter((option) => [option.name, option.id, option.description, option.language, digitalVoiceProviderLabels[option.provider]].some((text) => text.toLocaleLowerCase().includes(normalizedQuery))) : digitalVoiceOptions, [normalizedQuery]);
+
+  useEffect(() => {
+    if (!open) return;
+    const close = (event: MouseEvent) => { if (container.current && !container.current.contains(event.target as Node)) setOpen(false); };
+    document.addEventListener("mousedown", close);
+    window.setTimeout(() => searchInput.current?.focus(), 0);
+    return () => document.removeEventListener("mousedown", close);
+  }, [open]);
+  useEffect(() => { if (disabled) setOpen(false); }, [disabled]);
+
+  const choose = (nextValue: string) => {
+    onChange(nextValue);
+    setOpen(false);
+    setQuery("");
+  };
+
+  return <div className={`digital-voice-select ${open ? "is-open" : ""} ${disabled ? "is-disabled" : ""}`} ref={container}>
+    <button type="button" className="digital-voice-trigger" aria-label="选择数字人音色" aria-haspopup="listbox" aria-expanded={open} disabled={disabled} onClick={() => setOpen((current) => !current)}>
+      <span><strong>{selected?.name ?? "默认音色"}</strong><small>{selected ? selected.id : "由服务自动匹配"}</small></span><ChevronDown size={17} />
+    </button>
+    {open && <div className="digital-voice-menu">
+      <label className="digital-voice-search"><Search size={15} /><input ref={searchInput} value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Escape") { event.stopPropagation(); setOpen(false); } }} placeholder="搜索名称、ID、语言或风格" /></label>
+      <div className="digital-voice-options" role="listbox" aria-label="数字人音色">
+        {!normalizedQuery && <button type="button" role="option" aria-selected={!value} className={`digital-voice-option default ${!value ? "selected" : ""}`} onClick={() => choose("")}><span><strong>默认音色</strong><small>由服务根据数字人自动匹配</small></span>{!value && <Check size={15} />}</button>}
+        {(["qwen_omni", "doubao"] as const).map((provider) => {
+          const options = filteredOptions.filter((option) => option.provider === provider);
+          if (!options.length) return null;
+          return <section className="digital-voice-group" key={provider}><header><strong>{digitalVoiceProviderLabels[provider]}</strong><span>{options.length}</span></header>{options.map((option) => <button type="button" role="option" aria-selected={option.id === value} className={`digital-voice-option ${option.id === value ? "selected" : ""}`} key={option.id} onClick={() => choose(option.id)}><span><strong>{option.name}<em>{option.id}</em></strong><small>{option.description}</small><small className="digital-voice-meta">{option.language}</small></span>{option.id === value && <Check size={15} />}</button>)}</section>;
+        })}
+        {filteredOptions.length === 0 && <div className="digital-voice-empty">没有匹配的音色</div>}
+      </div>
+    </div>}
+  </div>;
+}
+
+function DigitalHumanStudio({ onToast, onError }: { onToast: (message: string) => void; onError: (message: string) => void }) {
+  const [status, setStatus] = useState<DigitalHumanServiceStatus | null>(null);
+  const [image, setImage] = useState<DigitalHumanImage | null>(null);
+  const [callMode, setCallMode] = useState<DigitalHumanCallMode>("video");
+  const [persona, setPersona] = useState("你是一个友好的数字人助手，请自然、简洁地与用户实时互动。");
+  const [voice, setVoice] = useState("");
+  const [phase, setPhase] = useState<DigitalHumanPhase>("idle");
+  const [session, setSession] = useState<DigitalHumanLiveSession | null>(null);
+  const [signalReady, setSignalReady] = useState(false);
+  const [rtcReady, setRtcReady] = useState(false);
+  const [remoteReady, setRemoteReady] = useState(false);
+  const [remoteVideoReady, setRemoteVideoReady] = useState(false);
+  const [localVideoReady, setLocalVideoReady] = useState(false);
+  const [micEnabled, setMicEnabled] = useState(true);
+  const [cameraEnabled, setCameraEnabled] = useState(true);
+  const [message, setMessage] = useState("");
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [logs, setLogs] = useState<string[]>([]);
+  const engineRef = useRef<DigitalHumanEngine | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement | null>(null);
+  const localVideoRef = useRef<HTMLVideoElement | null>(null);
+  const liveStageRef = useRef<HTMLDivElement | null>(null);
+  const sequenceRef = useRef(1);
+  const connectionIdRef = useRef(createDigitalHumanConnectionId());
+  const signalRetryRef = useRef<number | null>(null);
+  const activeLiveIdRef = useRef("");
+  const closingRef = useRef(false);
+
+  const addLog = (value: string) => setLogs((current) => [...current.slice(-5), `${new Date().toLocaleTimeString("zh-CN", { hour12: false })}  ${value}`]);
+  const phaseRank = ({ idle: 0, creating: 0, signaling: 1, joining: 2, waiting: 3, live: 3, ending: 4, ended: 5, failed: -1 } as const)[phase];
+
+  useEffect(() => {
+    void api.digitalHumanStatus().then(setStatus).catch(() => setStatus({ configured: false, mediaProvider: "AliRTC" }));
+  }, []);
+  useEffect(() => () => { if (image?.url) URL.revokeObjectURL(image.url); }, [image]);
+  useEffect(() => {
+    if (phase !== "live") return;
+    const timer = window.setInterval(() => setElapsedSeconds((value) => value + 1), 1000);
+    return () => window.clearInterval(timer);
+  }, [phase]);
+  useEffect(() => () => {
+    if (signalRetryRef.current) window.clearTimeout(signalRetryRef.current);
+    closingRef.current = true;
+    socketRef.current?.close(1000, "page closed");
+    const engine = engineRef.current;
+    if (engine) void engine.stopPreview().catch(() => undefined).then(() => engine.leaveChannel()).catch(() => undefined).then(() => engine.destroy()).catch(() => undefined);
+    const liveId = activeLiveIdRef.current;
+    if (liveId) void api.endDigitalHumanLive(liveId).catch(() => undefined);
+  }, []);
+
+  const selectImage = (file: File | undefined) => {
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { onError("请选择 PNG、JPG 或 WebP 图片"); return; }
+    if (file.size > 50 * 1024 * 1024) { onError("数字人图片不能超过 50 MB"); return; }
+    if (image?.url) URL.revokeObjectURL(image.url);
+    setImage({ file, name: file.name, url: URL.createObjectURL(file) });
+  };
+
+  const openControlChannel = (liveId: string) => new Promise<WebSocket>((resolveSocket, rejectSocket) => {
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const connId = connectionIdRef.current;
+    const socket = new WebSocket(`${protocol}//${window.location.host}/api/tools/digital-human/lives/${encodeURIComponent(liveId)}/control?conn_id=${encodeURIComponent(connId)}`);
+    socketRef.current = socket;
+    let initialized = false;
+    let settled = false;
+    let attempts = 0;
+    let timeout = 0;
+    const clearSignalTimers = () => {
+      if (timeout) window.clearTimeout(timeout);
+      if (signalRetryRef.current) window.clearTimeout(signalRetryRef.current);
+      signalRetryRef.current = null;
+    };
+    const fail = (error: Error) => {
+      if (!settled) {
+        settled = true;
+        clearSignalTimers();
+        rejectSocket(error);
+      }
+    };
+    timeout = window.setTimeout(() => fail(new Error("等待 Vidu 控制链路就绪超时，请重新发起会话")), 60_000);
+    const sendInit = () => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      attempts += 1;
+      socket.send(JSON.stringify({ type: 1, live_id: liveId, conn_id: connId, seq_id: sequenceRef.current++, payload: { conn_init: { version: 1 } } }));
+      addLog(attempts > 1 ? `数字人准备中，重新发送开始信号（${attempts}）` : "已发送 conn_init 开始信号");
+    };
+    socket.onopen = sendInit;
+    socket.onmessage = (event) => {
+      let payload: unknown;
+      try { payload = JSON.parse(String(event.data)); } catch { return; }
+      const messageValue = payload as { type?: number | string; payload?: { conn_init_ack?: { success?: boolean; error_code?: string } }; message?: string };
+      if (messageValue.type === "proxy_error") { fail(new Error(messageValue.message || "控制链路连接失败")); return; }
+      if (messageValue.type === 6) {
+        closingRef.current = true;
+        onError("Vidu 已结束当前会话");
+        setPhase("ended");
+        addLog("Vidu 已发送强制挂断信号");
+        void (async () => {
+          socket.close(1000, "remote hangup");
+          const engine = engineRef.current;
+          if (engine) {
+            await engine.stopPreview().catch(() => undefined);
+            await engine.leaveChannel().catch(() => undefined);
+            await engine.destroy().catch(() => undefined);
+            engineRef.current = null;
+          }
+          const activeLiveId = activeLiveIdRef.current;
+          if (activeLiveId) await api.endDigitalHumanLive(activeLiveId).catch(() => undefined);
+          activeLiveIdRef.current = "";
+          socketRef.current = null;
+          setSession(null);
+          setSignalReady(false);
+          setRtcReady(false);
+          setRemoteReady(false);
+          setRemoteVideoReady(false);
+          setLocalVideoReady(false);
+        })();
+        return;
+      }
+      if (messageValue.type !== 2 || !messageValue.payload?.conn_init_ack) return;
+      const ack = messageValue.payload.conn_init_ack;
+      if (ack.error_code === "NOT_READY") {
+        addLog("Vidu 返回 NOT_READY，3 秒后重试");
+        if (signalRetryRef.current) window.clearTimeout(signalRetryRef.current);
+        signalRetryRef.current = window.setTimeout(sendInit, 3000);
+        return;
+      }
+      if (ack.success === true) {
+        initialized = true;
+        setSignalReady(true);
+        addLog("WebSocket 控制链路已就绪");
+        if (!settled) { settled = true; clearSignalTimers(); resolveSocket(socket); }
+        return;
+      }
+      fail(new Error(`Vidu 控制链路初始化失败${ack.error_code ? `：${ack.error_code}` : ""}`));
+    };
+    socket.onerror = () => fail(new Error("WebSocket 控制链路连接失败"));
+    socket.onclose = () => {
+      setSignalReady(false);
+      if (!initialized) fail(new Error("控制链路在初始化完成前断开"));
+      else if (!closingRef.current) { setPhase("failed"); onError("控制链路已断开，请结束后重新连接"); }
+    };
+  });
+
+  const joinRtc = async (liveSession: DigitalHumanLiveSession) => {
+    setPhase("joining");
+    addLog("正在加入 AliRTC 频道");
+    const { default: AliRtcEngine, AliRtcAudioTrack, AliRtcSdkChannelProfile, AliRtcSubscribeState, AliRtcVideoTrack } = await import("aliyun-rtc-sdk");
+    const supported = await AliRtcEngine.isSupported("sendrecv");
+    if (!supported.support) throw new Error("当前浏览器不支持 AliRTC 实时音视频");
+    const engine = AliRtcEngine.createInstance();
+    engineRef.current = engine;
+    engine.setChannelProfile(AliRtcSdkChannelProfile.AliRtcSdkCommunication);
+    engine.setAudioOnlyMode(false);
+    engine.on("remoteUserOnLineNotify", (uid: string) => addLog(`远端用户已上线：${uid}`));
+    engine.on("remoteUserOffLineNotify", (uid: string) => {
+      engine.setRemoteViewConfig(null, uid, AliRtcVideoTrack.AliRtcVideoTrackCamera);
+      remoteVideoRef.current?.pause();
+      setRemoteReady(false);
+      setRemoteVideoReady(false);
+      addLog("远端数字人已离线");
+    });
+    engine.on("remoteTrackAvailableNotify", (_uid: string, audioTrack: AliRtcAudioTrackType, videoTrack: AliRtcVideoTrackType) => {
+      setRemoteReady(audioTrack !== AliRtcAudioTrack.AliRtcAudioTrackNo || videoTrack !== AliRtcVideoTrack.AliRtcVideoTrackNo);
+      addLog(videoTrack !== AliRtcVideoTrack.AliRtcVideoTrackNo ? "数字人已发布远端视频，正在订阅画面" : "收到数字人远端音频流");
+    });
+    engine.on("videoSubscribeStateChanged", (uid: string, _oldState: number, newState: number) => {
+      const video = remoteVideoRef.current;
+      if (newState === AliRtcSubscribeState.AliRtcStateSubscribed && video) {
+        video.muted = true;
+        engine.setRemoteViewConfig(video, uid, AliRtcVideoTrack.AliRtcVideoTrackCamera);
+        setRemoteReady(true);
+        setRemoteVideoReady(true);
+        addLog("远端数字人视频已订阅，正在加载画面");
+        void video.play().catch((error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          onError("远端视频已接收，请点击画面继续播放");
+          addLog(`远端视频播放失败：${detail}`);
+        });
+        return;
+      }
+      if (newState === AliRtcSubscribeState.AliRtcStateNoSubscribe || newState === AliRtcSubscribeState.AliRtcStateSubscribeIdle) {
+        engine.setRemoteViewConfig(null, uid, AliRtcVideoTrack.AliRtcVideoTrackCamera);
+        video?.pause();
+        setRemoteVideoReady(false);
+        addLog("远端数字人视频订阅已停止");
+      }
+    });
+    engine.on("remoteVideoAutoPlayFail", (uid: string) => {
+      onError("远端数字人画面已接收，请点击画面继续播放");
+      addLog(`远端视频自动播放被浏览器拦截：${uid}`);
+    });
+    engine.on("remoteVideoPlayError", (uid: string, reason?: string) => {
+      onError("远端数字人画面播放失败，请结束会话后重试");
+      addLog(`远端视频播放错误：${uid}${reason ? ` · ${reason}` : ""}`);
+    });
+    engine.on("bye", () => { setRemoteReady(false); setRemoteVideoReady(false); setPhase("ended"); addLog("Vidu 已结束当前会话"); });
+    engine.setDefaultSubscribeAllRemoteAudioStreams(true);
+    engine.setDefaultSubscribeAllRemoteVideoStreams(true);
+    await engine.joinChannel(liveSession.rtc.token, liveSession.rtc.userId);
+    if (callMode === "video") {
+      try {
+        if (localVideoRef.current) await engine.setLocalViewConfig(localVideoRef.current, AliRtcVideoTrack.AliRtcVideoTrackCamera);
+        await engine.startPreview();
+        await engine.publishLocalVideoStream(true);
+      } catch (error) {
+        throw new Error(digitalHumanMediaError("摄像头", error));
+      }
+    } else {
+      await engine.publishLocalVideoStream(false);
+    }
+    try {
+      await engine.publishLocalAudioStream(true);
+    } catch (error) {
+      throw new Error(digitalHumanMediaError("麦克风", error));
+    }
+    setRtcReady(true);
+    setPhase("waiting");
+    addLog("AliRTC 入会成功，等待数字人画面");
+  };
+
+  const startLive = async () => {
+    if (!image) { onError("请先添加数字人形象图片"); return; }
+    if (!persona.trim()) { onError("请填写数字人人设"); return; }
+    if (status?.configured !== true) { onError("数字人服务尚未就绪，请先完成后台配置"); return; }
+    closingRef.current = false;
+    connectionIdRef.current = createDigitalHumanConnectionId();
+    sequenceRef.current = 1;
+    setLogs([]); setElapsedSeconds(0); setSignalReady(false); setRtcReady(false); setRemoteReady(false); setRemoteVideoReady(false); setLocalVideoReady(false); setPhase("creating");
+    addLog("正在通过 HTTP 创建 Vidu Live 会话");
+    try {
+      const nextSession = await api.createDigitalHumanLive(image.file, { callMode, persona: persona.trim(), voice: voice.trim() });
+      setSession(nextSession); activeLiveIdRef.current = nextSession.liveId;
+      setPhase("signaling"); addLog(`会话已创建：${nextSession.liveId}`);
+      const signalPromise = openControlChannel(nextSession.liveId);
+      await signalPromise;
+      await joinRtc(nextSession);
+      setPhase("live"); addLog("控制与媒体链路均已就绪，可以开始互动"); onToast("数字人实时会话已接通");
+    } catch (error) {
+      const messageValue = error instanceof Error ? error.message : "数字人会话连接失败";
+      onError(messageValue); setPhase("failed"); addLog(messageValue);
+      const liveId = activeLiveIdRef.current;
+      closingRef.current = true;
+      socketRef.current?.close();
+      const engine = engineRef.current;
+      if (engine) {
+        await engine.stopPreview().catch(() => undefined);
+        await engine.leaveChannel().catch(() => undefined);
+        await engine.destroy().catch(() => undefined);
+        engineRef.current = null;
+      }
+      setLocalVideoReady(false);
+      if (liveId) await api.endDigitalHumanLive(liveId).catch(() => undefined);
+      activeLiveIdRef.current = "";
+    }
+  };
+
+  const endLive = async () => {
+    closingRef.current = true;
+    setPhase("ending"); addLog("正在发送挂断信号并离开频道");
+    if (signalRetryRef.current) window.clearTimeout(signalRetryRef.current);
+    const liveId = activeLiveIdRef.current;
+    const socket = socketRef.current;
+    if (socket?.readyState === WebSocket.OPEN && liveId) {
+      socket.send(JSON.stringify({ type: 5, live_id: liveId, conn_id: connectionIdRef.current, seq_id: sequenceRef.current++, payload: { hangup: { hangup_reason: "user_hangup" } } }));
+      await new Promise((resolveDelay) => window.setTimeout(resolveDelay, 150));
+    }
+    socket?.close(1000, "hangup"); socketRef.current = null;
+    const engine = engineRef.current;
+    if (engine) {
+      await engine.stopPreview().catch(() => undefined);
+      await engine.leaveChannel().catch(() => undefined);
+      await engine.destroy().catch(() => undefined);
+      engineRef.current = null;
+    }
+    if (liveId) await api.endDigitalHumanLive(liveId).catch(() => undefined);
+    activeLiveIdRef.current = ""; setSignalReady(false); setRtcReady(false); setRemoteReady(false); setRemoteVideoReady(false); setLocalVideoReady(false); setSession(null); setPhase("ended"); addLog("会话已结束");
+  };
+
+  const toggleMic = async () => {
+    const next = !micEnabled;
+    await engineRef.current?.publishLocalAudioStream(next);
+    setMicEnabled(next);
+  };
+  const toggleCamera = async () => {
+    const next = !cameraEnabled;
+    await engineRef.current?.publishLocalVideoStream(next);
+    setCameraEnabled(next);
+    if (!next) setLocalVideoReady(false);
+    else setLocalVideoReady((localVideoRef.current?.readyState ?? 0) >= HTMLMediaElement.HAVE_CURRENT_DATA);
+  };
+  const sendMessage = () => {
+    const value = message.trim();
+    if (!value || !session || socketRef.current?.readyState !== WebSocket.OPEN) return;
+    socketRef.current.send(JSON.stringify({ type: 99, live_id: session.liveId, conn_id: connectionIdRef.current, seq_id: sequenceRef.current++, payload: { text_msg: { msg_id: createDigitalHumanConnectionId(), content: value, timestamp: Date.now() } } }));
+    addLog(`已发送文本指令：${value.slice(0, 22)}${value.length > 22 ? "…" : ""}`); setMessage("");
+  };
+  const openFullscreen = async () => {
+    if (!liveStageRef.current) return;
+    try { await liveStageRef.current.requestFullscreen(); }
+    catch { onError("当前浏览器无法进入全屏模式"); }
+  };
+  const canConfigure = phase === "idle" || phase === "ended" || phase === "failed";
+  const isActive = !canConfigure;
+  const remoteMediaReady = callMode === "video" ? remoteVideoReady : remoteReady;
+  const displayPhase = phase === "live" ? "通话中" : phase === "waiting" ? "等待数字人" : phase === "creating" ? "创建会话" : phase === "signaling" ? "连接信令" : phase === "joining" ? "加入 RTC" : phase === "ending" ? "正在结束" : phase === "failed" ? "连接失败" : phase === "ended" ? "已结束" : "等待开始";
+  const elapsed = `${String(Math.floor(elapsedSeconds / 60)).padStart(2, "0")}:${String(elapsedSeconds % 60).padStart(2, "0")}`;
+
+  return <main className="digital-human-content realtime">
+    <header className="digital-human-head">
+      <div><span className="panel-eyebrow">VIDU LIVE · ALIRTC</span><h1>实时数字人</h1><p>创建会话后，同步连接控制信令与实时音视频，双方就绪即可开始互动。</p></div>
+      <span className={`digital-human-draft ${phase === "live" ? "live" : ""}`}><i />{displayPhase}</span>
+    </header>
+    <div className="digital-live-pipeline" aria-label="实时会话进度">
+      {digitalHumanPhases.map((item, index) => {
+        const activeIndex = phase === "failed" ? -1 : phaseRank;
+        const state = index < activeIndex ? "done" : index === activeIndex ? "active" : "pending";
+        return <div key={item.key} className={state}><span>{state === "done" ? <Check size={13} /> : index + 1}</span><strong>{item.label}</strong>{index < digitalHumanPhases.length - 1 && <i />}</div>;
+      })}
+    </div>
+    <section className="digital-human-workspace realtime">
+      <aside className="digital-human-controls realtime">
+        <div className="digital-section-head"><div><small>01</small><strong>形象与人设</strong></div><span>{image ? "已就绪" : "必填"}</span></div>
+        <label className={`digital-source-upload ${image ? "has-source" : ""} ${!canConfigure ? "disabled" : ""}`}>
+          <input type="file" disabled={!canConfigure} accept="image/png,image/jpeg,image/webp" onChange={(event) => { selectImage(event.target.files?.[0]); event.currentTarget.value = ""; }} />
+          {image ? <><span className="digital-source-thumb"><img src={image.url} alt="数字人形象" /></span><span className="digital-source-copy"><strong>{image.name}</strong><small>{formatFileSize(image.file.size)} · 建议 3:4 正面肖像</small></span>{canConfigure && <button type="button" className="icon-button" aria-label="移除形象" onClick={(event) => { event.preventDefault(); URL.revokeObjectURL(image.url); setImage(null); }}><Trash2 size={15} /></button>}</> : <><span className="digital-upload-icon"><Upload size={20} /></span><span className="digital-source-copy"><strong>添加数字人形象</strong><small>PNG / JPG / WebP · 最大 50 MB</small></span><span className="digital-upload-action">选择文件</span></>}
+        </label>
+        <label className="digital-live-field"><span>数字人人设</span><textarea disabled={!canConfigure} value={persona} maxLength={2000} onChange={(event) => setPersona(event.target.value)} /><small>{persona.length} / 2000</small></label>
+        <div className="digital-live-field compact"><span>音色 <em>选填</em></span><DigitalVoiceSelect disabled={!canConfigure} value={voice} onChange={setVoice} /></div>
+
+        <div className="digital-section-head"><div><small>02</small><strong>通话方式</strong></div><span>{callMode === "video" ? "音视频" : "仅语音"}</span></div>
+        <div className="digital-call-modes">
+          <button type="button" disabled={!canConfigure} className={callMode === "video" ? "selected" : ""} onClick={() => setCallMode("video")}><Camera size={17} /><span><strong>视频通话</strong><small>麦克风 + 摄像头</small></span></button>
+          <button type="button" disabled={!canConfigure} className={callMode === "audio" ? "selected" : ""} onClick={() => setCallMode("audio")}><Mic size={17} /><span><strong>语音通话</strong><small>不开摄像头 · 数字人仍有画面</small></span></button>
+        </div>
+
+        <div className="digital-section-head"><div><small>03</small><strong>连接状态</strong></div><span>{session ? `LIVE ${session.liveId.slice(-6)}` : "未创建"}</span></div>
+        <div className="digital-connection-list">
+          <div className={signalReady ? "ready" : phase === "signaling" ? "working" : ""}><Wifi size={15} /><span><strong>WebSocket 控制</strong><small>{signalReady ? "conn_init 已确认" : phase === "signaling" ? "正在初始化" : "等待会话"}</small></span><i /></div>
+          <div className={rtcReady ? "ready" : phase === "joining" ? "working" : ""}><Radio size={15} /><span><strong>AliRTC 媒体</strong><small>{rtcReady ? "已加入频道" : phase === "joining" ? "正在入会" : "等待凭证"}</small></span><i /></div>
+          <div className={remoteMediaReady ? "ready" : phase === "waiting" || phase === "live" ? "working" : ""}><UserRound size={15} /><span><strong>远端数字人</strong><small>{remoteVideoReady ? "视频画面正在播放" : callMode === "audio" && remoteReady ? "语音流已就绪" : remoteReady ? "音频已就绪，等待视频" : phase === "waiting" || phase === "live" ? "等待远端媒体" : "尚未连接"}</small></span><i /></div>
+        </div>
+        {status?.configured === false && <div className="digital-config-note"><LockKeyhole size={14} /><span><strong>后台服务未就绪</strong><small>请联系管理员完成服务配置后再发起会话。</small></span></div>}
+        {!isActive ? <button type="button" className="primary-button digital-generate" disabled={status?.configured !== true} onClick={() => void startLive()}><PhoneCall size={16} />{status === null ? "正在检查服务" : status.configured ? "开始实时通话" : "服务未就绪"}</button> : <button type="button" className="digital-hangup-wide" disabled={phase === "ending"} onClick={() => void endLive()}><PhoneOff size={16} />{phase === "ending" ? "正在结束" : "结束会话"}</button>}
+      </aside>
+
+      <section className="digital-human-preview realtime">
+        <div className="digital-preview-toolbar"><div><strong>实时画面</strong><span>{phase === "live" ? "控制与媒体链路已就绪" : displayPhase}</span></div><div><span className={phase === "live" ? "on-air" : ""}>{phase === "live" ? `ON AIR · ${elapsed}` : "STANDBY"}</span></div></div>
+        <div ref={liveStageRef} className="digital-live-stage">
+          <video
+            ref={remoteVideoRef}
+            className={`digital-remote-video ${remoteVideoReady ? "visible" : ""}`}
+            autoPlay
+            playsInline
+            muted
+            onLoadedData={() => setRemoteVideoReady(true)}
+            onPlaying={() => { setRemoteReady(true); setRemoteVideoReady(true); }}
+            onClick={(event) => void event.currentTarget.play().catch(() => undefined)}
+          />
+          {!remoteVideoReady && <div className="digital-live-placeholder">{image ? <img src={image.url} alt="数字人待机画面" /> : <UserRound size={42} />}<span className="digital-live-shade" /></div>}
+          <video
+            ref={localVideoRef}
+            className={`digital-local-video ${callMode === "video" && isActive && cameraEnabled && localVideoReady ? "visible" : ""}`}
+            autoPlay
+            playsInline
+            muted
+            aria-hidden={!localVideoReady}
+            onLoadedData={() => setLocalVideoReady(true)}
+            onPlaying={() => setLocalVideoReady(true)}
+            onEmptied={() => setLocalVideoReady(false)}
+          />
+          {phase === "live" && <span className="digital-on-air"><i />LIVE</span>}
+          {phase !== "idle" && logs.length > 0 && <aside className={`digital-live-session ${phase}`} aria-live="polite">
+            <header><span><strong>实时数字人会话</strong><small>{session ? `LIVE ${session.liveId.slice(-6)}` : displayPhase}</small></span><i /></header>
+            <div>{logs.slice(-4).map((item, index) => <span key={`${item}-${index}`}>{item}</span>)}</div>
+          </aside>}
+          <footer className="digital-call-bar">
+            <div><span><i className={signalReady ? "ready" : ""} />信令</span><span><i className={rtcReady ? "ready" : ""} />媒体</span></div>
+            <div className="digital-call-actions"><button type="button" disabled={!isActive} className={!micEnabled ? "off" : ""} onClick={() => void toggleMic()} title={micEnabled ? "关闭麦克风" : "开启麦克风"}>{micEnabled ? <Mic size={21} /> : <MicOff size={21} />}</button><button type="button" disabled={!isActive || callMode === "audio"} className={!cameraEnabled || callMode === "audio" ? "off" : ""} onClick={() => void toggleCamera()} title={cameraEnabled ? "关闭摄像头" : "开启摄像头"}>{cameraEnabled && callMode === "video" ? <Camera size={21} /> : <CameraOff size={21} />}</button><button type="button" className="hangup" disabled={!isActive || phase === "ending"} onClick={() => void endLive()} title="挂断"><PhoneOff size={22} /></button></div>
+            <button type="button" className="digital-fullscreen" title="全屏" aria-label="全屏查看" onClick={() => void openFullscreen()}><Maximize2 size={17} /></button>
+          </footer>
+        </div>
+        <div className="digital-live-message"><div><span>文本互动</span><small>通过控制链路向数字人发送实时指令</small></div><label><textarea rows={1} disabled={phase !== "live"} value={message} onChange={(event) => setMessage(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendMessage(); } }} placeholder={phase === "live" ? "输入要对数字人说的话…" : "会话接通后可发送"} /><button type="button" disabled={phase !== "live" || !message.trim()} onClick={sendMessage}><ArrowRight size={17} /></button></label></div>
+      </section>
+    </section>
   </main>;
 }
 
@@ -1489,7 +2011,6 @@ function VoiceCloneStudio({ onToast }: { onToast: (message: string) => void }) {
   const [profiles, setProfiles] = useState<VoiceCloneResult[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [configured, setConfigured] = useState<boolean | null>(null);
-  const [model, setModel] = useState("speech-2.8-hd");
   const [creating, setCreating] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [pageError, setPageError] = useState("");
@@ -1501,7 +2022,6 @@ function VoiceCloneStudio({ onToast }: { onToast: (message: string) => void }) {
       setProfiles(result.data);
       setSelectedId(result.data[0]?.id ?? null);
       setConfigured(result.settings.configured);
-      setModel(result.settings.model);
     }).catch((caught) => {
       setConfigured(false);
       setPageError(caught instanceof Error ? caught.message : "声音服务读取失败");
@@ -1558,7 +2078,6 @@ function VoiceCloneStudio({ onToast }: { onToast: (message: string) => void }) {
   return <main className="character-studio-content voice-clone-content">
     <header className="character-studio-head">
       <div><span className="panel-eyebrow">VOICE CLONE STUDIO</span><h1>声音克隆</h1><p>上传一段清晰的人声样本，创建可用于角色对白和旁白的专属声音。</p></div>
-      <span className={`character-config-state ${configured ? "configured" : ""}`}><i />{configured === null ? "正在连接 MiniMax" : configured ? `MiniMax · ${model}` : "MiniMax 未配置"}</span>
     </header>
     <div className="character-studio-layout voice-clone-layout">
       <section className="character-controls voice-clone-controls" aria-label="声音克隆参数">
@@ -1630,7 +2149,6 @@ function TextToSpeechStudio({ onToast }: { onToast: (message: string) => void })
   const [generations, setGenerations] = useState<TextToSpeechResult[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [configured, setConfigured] = useState<boolean | null>(null);
-  const [model, setModel] = useState("speech-2.8-hd");
   const [generating, setGenerating] = useState(false);
   const [pageError, setPageError] = useState("");
 
@@ -1648,7 +2166,6 @@ function TextToSpeechStudio({ onToast }: { onToast: (message: string) => void })
       setGenerations(speech.data);
       setSelectedId(speech.data[0]?.id ?? null);
       setConfigured(speech.settings.configured);
-      setModel(speech.settings.model);
       setVoiceId(voices.data[0]?.voiceId ?? systemSpeechVoices[0].value);
     }).catch((caught) => {
       setConfigured(false);
@@ -1675,7 +2192,6 @@ function TextToSpeechStudio({ onToast }: { onToast: (message: string) => void })
   return <main className="character-studio-content text-to-speech-content">
     <header className="character-studio-head">
       <div><span className="panel-eyebrow">TEXT TO SPEECH STUDIO</span><h1>文转语音</h1><p>选择声音并调整表达参数，将对白、旁白或播报文本生成可下载音频。</p></div>
-      <span className={`character-config-state ${configured ? "configured" : ""}`}><i />{configured === null ? "正在连接 MiniMax" : configured ? `MiniMax · ${model}` : "MiniMax 未配置"}</span>
     </header>
     <div className="character-studio-layout voice-clone-layout text-to-speech-layout">
       <section className="character-controls voice-clone-controls text-to-speech-controls" aria-label="文转语音参数">
@@ -1779,9 +2295,10 @@ function ProjectCard({ project, onOpen, onDelete }: { project: Project; onOpen: 
   </article>;
 }
 
-const assetKindLabels: Record<AssetLibraryKind, string> = { character: "角色", scene: "场景", prop: "道具", audio: "音频", video: "视频" };
+const assetKindLabels: Record<AssetLibraryKind, string> = { image: "图片", character: "角色", scene: "场景", prop: "道具", audio: "音频", video: "视频" };
 const assetFilters: Array<{ id: "all" | AssetLibraryKind; label: string; icon: typeof FileText }> = [
   { id: "all", label: "全部", icon: Sparkles },
+  { id: "image", label: "图片", icon: ImagePlus },
   { id: "character", label: "角色", icon: UsersRound },
   { id: "scene", label: "场景", icon: Layers3 },
   { id: "prop", label: "道具", icon: ImagePlus },
@@ -1798,13 +2315,13 @@ function AssetLibraryStage({ data, loading, onCreate }: { data: AssetLibraryData
     if (!normalizedQuery) return true;
     return [item.title, item.description, item.projectTitle ?? "", item.detail, assetKindLabels[item.kind]].some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
   });
-  const counts = data?.counts ?? { character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
-  const imageCount = counts.character + counts.scene + counts.prop;
-  const createType: HomeToolType = kind === "scene" ? "scene" : kind === "prop" ? "prop" : kind === "audio" ? "text-to-speech" : kind === "video" ? "reference-video" : "character";
+  const counts = data?.counts ?? { image: 0, character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
+  const imageCount = counts.image + counts.character + counts.scene + counts.prop;
+  const createType: HomeToolType = kind === "image" ? "image-upscale" : kind === "scene" ? "scene" : kind === "prop" ? "prop" : kind === "audio" ? "text-to-speech" : kind === "video" ? "reference-video" : "character";
 
   return <main className="asset-library-content">
     <header className="asset-library-head">
-      <div><span className="panel-eyebrow">ASSET LIBRARY</span><h1>资产库</h1><p>集中管理流水线和独立工具已经生成的角色、场景、道具、音频与视频。</p></div>
+      <div><span className="panel-eyebrow">ASSET LIBRARY</span><h1>资产库</h1><p>集中管理流水线和独立工具已经生成的图片、角色、场景、道具、音频与视频。</p></div>
       <button type="button" className="primary-button" onClick={() => onCreate(createType)}><Sparkles size={16} />生成新资产</button>
     </header>
     <section className="asset-summary" aria-label="资产统计">
@@ -1825,6 +2342,18 @@ function AssetLibraryStage({ data, loading, onCreate }: { data: AssetLibraryData
 function AssetLibraryCard({ item }: { item: AssetLibraryItem }) {
   const isVideo = item.mediaType === "video";
   const [videoControlsVisible, setVideoControlsVisible] = useState(false);
+  const [promptCopied, setPromptCopied] = useState(false);
+  const promptText = item.description || (isVideo ? "暂无提示词" : "暂无描述");
+  const copyPrompt = async () => {
+    if (!item.description) return;
+    try {
+      await navigator.clipboard.writeText(item.description);
+      setPromptCopied(true);
+      window.setTimeout(() => setPromptCopied(false), 1600);
+    } catch {
+      setPromptCopied(false);
+    }
+  };
   return <article
     className={`asset-library-card ${item.mediaType}`}
     onPointerEnter={(event) => { if (isVideo && event.pointerType === "mouse") setVideoControlsVisible(true); }}
@@ -1837,7 +2366,10 @@ function AssetLibraryCard({ item }: { item: AssetLibraryItem }) {
       {item.mediaType === "image" ? <a className="asset-card-preview" href={item.mediaUrl} target="_blank" rel="noreferrer" aria-label={`查看${item.title}`}><img src={item.mediaUrl} alt={item.title} loading="lazy" /><span><Eye size={20} /></span></a> : isVideo ? <video src={item.mediaUrl} poster={item.thumbnailUrl ?? undefined} controls={videoControlsVisible} preload="metadata" aria-label={item.title} /> : <div className="asset-audio-preview"><span><AudioLines size={27} /></span><audio src={item.mediaUrl} controls preload="metadata" /></div>}
       <a className="asset-card-download" href={item.mediaUrl} download aria-label={`下载${item.title}`} title="下载资产"><Download size={16} /></a>
     </div>
-    <div className="asset-card-body asset-card-description"><p title={item.description}>{item.description || (isVideo ? "暂无提示词" : "暂无描述")}</p></div>
+    <div className="asset-card-body asset-card-description">
+      <p title={item.description}>{promptText}</p>
+      {item.description && <button type="button" className={`asset-prompt-copy ${promptCopied ? "copied" : ""}`} onClick={() => void copyPrompt()} aria-label={promptCopied ? "提示词已复制" : "复制提示词"} title={promptCopied ? "已复制" : "复制提示词"}>{promptCopied ? <Check size={14} /> : <Copy size={14} />}</button>}
+    </div>
   </article>;
 }
 

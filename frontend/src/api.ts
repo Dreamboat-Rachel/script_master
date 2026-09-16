@@ -1,4 +1,4 @@
-import type { AssetLibraryData, CharacterImageResult, DashboardData, ImageSettings, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechInput, TextToSpeechList, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneInput, VoiceCloneList, VoiceCloneResult } from "./types";
+import type { AssetLibraryData, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechInput, TextToSpeechList, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneInput, VoiceCloneList, VoiceCloneResult } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const isFormData = options?.body instanceof FormData;
@@ -28,6 +28,22 @@ export const api = {
   saveLlmSettings: async (input: { apiKey?: string; model?: string; apiBase?: string }) => (await request<{ data: LlmSettings }>("/api/settings/llm", { method: "PUT", body: JSON.stringify(input) })).data,
   imageSettings: async () => (await request<{ data: ImageSettings }>("/api/settings/image")).data,
   saveImageSettings: async (input: { provider: ImageSettings["provider"]; apiKey?: string; model: string; apiBase: string }) => (await request<{ data: ImageSettings }>("/api/settings/image", { method: "PUT", body: JSON.stringify(input) })).data,
+  upscaleImage: async (file: File, resolution: ImageUpscaleResolution) => {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("resolution", resolution);
+    return (await request<{ data: ImageUpscaleResult }>("/api/tools/image-upscales", { method: "POST", body })).data;
+  },
+  digitalHumanStatus: async () => (await request<{ data: DigitalHumanServiceStatus }>("/api/tools/digital-human/status")).data,
+  createDigitalHumanLive: async (file: File, input: { callMode: "audio" | "video"; persona: string; voice: string }) => {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("callMode", input.callMode);
+    body.append("persona", input.persona);
+    body.append("voice", input.voice);
+    return (await request<{ data: DigitalHumanLiveSession }>("/api/tools/digital-human/lives", { method: "POST", body })).data;
+  },
+  endDigitalHumanLive: async (liveId: string) => { await request<void>(`/api/tools/digital-human/lives/${encodeURIComponent(liveId)}`, { method: "DELETE" }); },
   videoSettings: async () => (await request<{ data: VideoSettings }>("/api/settings/video")).data,
   saveVideoSettings: async (input: { provider: VideoSettings["provider"]; apiKey?: string; model: VideoSettings["model"]; apiBase: string }) => (await request<{ data: VideoSettings }>("/api/settings/video", { method: "PUT", body: JSON.stringify(input) })).data,
   dashboard: () => request<DashboardData>("/api/dashboard"),

@@ -5,12 +5,17 @@ import { appendFileSync, mkdirSync } from "node:fs";
 import { readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { basename, resolve } from "node:path";
+import WebSocket, { WebSocketServer } from "ws";
 import { z } from "zod";
 import { createDatabaseStore } from "./database.js";
 import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
+import { AliyunOssService } from "./oss.js";
+import { VolcengineImageUpscaleService } from "./upscale.js";
 import { configureVideo, getVideoSettings, VideoGenerationService } from "./video.js";
 import { MiniMaxVoiceCloneService } from "./voice.js";
+import { ViduLiveService } from "./vidu.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
 import type { Project, RenderJob, Shot, Subject } from "./types.js";
 
@@ -38,10 +43,15 @@ const videoMergeDirectory = resolve(generatedDirectory, "merges");
 const projectCoverDirectory = resolve(generatedDirectory, "covers");
 const voiceCloneDirectory = resolve(generatedDirectory, "voices");
 const textToSpeechDirectory = resolve(generatedDirectory, "speech");
+const imageUpscaleOutputDirectory = resolve(generatedDirectory, "upscales");
 const videoGeneration = new VideoGenerationService();
+const aliyunOss = new AliyunOssService();
+const imageUpscale = new VolcengineImageUpscaleService();
 const voiceCloning = new MiniMaxVoiceCloneService();
+const viduLive = new ViduLiveService();
 const renderJobStreams = new Set<Response>();
 const continuityFrameCache = new Map<string, string>();
+const viduLiveSources = new Map<string, string>();
 
 type StudioVideoType = keyof typeof studioVideoDirectories;
 type StudioAssetType = keyof typeof studioImageDirectories;
@@ -52,6 +62,14 @@ interface StoredStudioImage {
   model: string;
   size: string;
   prompt: string;
+  createdAt: string;
+}
+interface StoredImageUpscale {
+  id: string;
+  imageUrl: string;
+  originalName: string;
+  resolution: "4k" | "8k";
+  sourceBytes: number;
   createdAt: string;
 }
 interface StoredStudioVideo {
@@ -113,6 +131,7 @@ mkdirSync(videoMergeDirectory, { recursive: true });
 mkdirSync(projectCoverDirectory, { recursive: true });
 mkdirSync(voiceCloneDirectory, { recursive: true });
 mkdirSync(textToSpeechDirectory, { recursive: true });
+mkdirSync(imageUpscaleOutputDirectory, { recursive: true });
 
 function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Record<string, unknown>) {
   const line = `${new Date().toISOString()} [${level}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`;
@@ -288,13 +307,13 @@ async function resumeStudioVideoTasks() {
   }
 }
 
-async function readLimitedRequestBody(request: Request, maximumBytes: number) {
+async function readLimitedRequestBody(request: Request, maximumBytes: number, tooLargeError = "UPLOAD_TOO_LARGE") {
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   for await (const chunk of request) {
     const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     totalBytes += bytes.length;
-    if (totalBytes > maximumBytes) throw new Error("VOICE_UPLOAD_TOO_LARGE");
+    if (totalBytes > maximumBytes) throw new Error(tooLargeError);
     chunks.push(bytes);
   }
   return Buffer.concat(chunks);
@@ -369,6 +388,29 @@ async function listStudioImages(assetType: StudioAssetType, limit = 24) {
         model: typeof stored?.model === "string" ? stored.model : "",
         size: typeof stored?.size === "string" ? stored.size : "",
         prompt: typeof stored?.prompt === "string" ? stored.prompt : "",
+        createdAt: typeof stored?.createdAt === "string" ? stored.createdAt : file.mtime.toISOString(),
+      };
+    })))
+    .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+  return images.slice(0, limit);
+}
+
+async function listImageUpscales(limit = 200) {
+  const names = await readdir(imageUpscaleOutputDirectory).catch(() => [] as string[]);
+  const images = (await Promise.all(names
+    .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
+    .map(async (name) => {
+      const file = await stat(resolve(imageUpscaleOutputDirectory, name)).catch(() => null);
+      if (!file?.isFile()) return null;
+      const stored = await readFile(resolve(imageUpscaleOutputDirectory, `${name}.json`), "utf8")
+        .then((value) => JSON.parse(value) as Partial<StoredImageUpscale>)
+        .catch(() => null);
+      return {
+        id: name,
+        imageUrl: `/api/generated/${basename(imageUpscaleOutputDirectory)}/${name}`,
+        originalName: typeof stored?.originalName === "string" ? stored.originalName : "",
+        resolution: stored?.resolution === "8k" ? "8k" as const : stored?.resolution === "4k" ? "4k" as const : null,
         createdAt: typeof stored?.createdAt === "string" ? stored.createdAt : file.mtime.toISOString(),
       };
     })))
@@ -1014,6 +1056,170 @@ app.put("/api/settings/video", asyncRoute(async (request, response) => {
   response.json({ data: configureVideo(input) });
 }));
 
+app.post("/api/tools/image-upscales", asyncRoute(async (request, response) => {
+  if (!imageUpscale.enabled) return response.status(503).json({ error: "尚未配置火山视觉 AccessKey 和 SecretKey" });
+  if (!aliyunOss.enabled) return response.status(503).json({ error: "OSS 尚未配置，请在 backend/.env 中填写阿里云 OSS 密钥" });
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
+    return response.status(415).json({ error: "请使用 multipart/form-data 上传图片" });
+  }
+  const declaredLength = Number(request.headers["content-length"] ?? 0);
+  const maxImageBytes = Math.floor(4.7 * 1024 * 1024);
+  const maxMultipartBytes = maxImageBytes + 128 * 1024;
+  if (Number.isFinite(declaredLength) && declaredLength > maxMultipartBytes) {
+    return response.status(413).json({ error: "图片不能超过 4.7MB" });
+  }
+
+  let multipartBody: Buffer;
+  try {
+    multipartBody = await readLimitedRequestBody(request, maxMultipartBytes, "IMAGE_UPSCALE_UPLOAD_TOO_LARGE");
+  } catch (error) {
+    if (error instanceof Error && error.message === "IMAGE_UPSCALE_UPLOAD_TOO_LARGE") {
+      return response.status(413).json({ error: "图片不能超过 4.7MB" });
+    }
+    throw error;
+  }
+
+  let form: FormData;
+  try {
+    form = await new globalThis.Request("http://localhost/image-upscale-upload", {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: new Uint8Array(multipartBody),
+    }).formData();
+  } catch {
+    return response.status(400).json({ error: "无法读取上传图片，请重新选择" });
+  }
+  const file = form.get("file");
+  if (!(file instanceof Blob)) return response.status(400).json({ error: "请选择需要高清处理的图片" });
+  if (file.size > maxImageBytes) return response.status(413).json({ error: "图片不能超过 4.7MB" });
+  if (!["image/png", "image/jpeg"].includes(file.type)) return response.status(400).json({ error: "请选择 PNG 或 JPG 图片" });
+  const resolutionValue = form.get("resolution");
+  if (resolutionValue !== "4k" && resolutionValue !== "8k") return response.status(400).json({ error: "高清分辨率仅支持 4K 或 8K" });
+
+  const sourceBytes = Buffer.from(await file.arrayBuffer());
+  const originalName = "name" in file && typeof file.name === "string" ? file.name : "原图";
+  const startedAt = Date.now();
+  writeLog("INFO", "[image-upscale] 开始", { resolution: resolutionValue, sourceBytes: file.size });
+  const source = await aliyunOss.uploadTemporaryImage(sourceBytes, file.type);
+  try {
+    const task = await imageUpscale.generate(source.url, resolutionValue);
+    const providerResult = await fetch(task.imageUrl, { signal: AbortSignal.timeout(180000) });
+    if (!providerResult.ok) throw new Error(`图片高清结果下载失败（HTTP ${providerResult.status}）`);
+    const resultMime = providerResult.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+    if (resultMime && !["image/png", "image/jpeg", "image/webp"].includes(resultMime)) {
+      throw new Error(`图片高清平台返回了不支持的文件类型（${resultMime}）`);
+    }
+    const bytes = Buffer.from(await providerResult.arrayBuffer());
+    if (!bytes.length) throw new Error("图片高清平台返回了空文件");
+    if (bytes.length > 100 * 1024 * 1024) throw new Error("高清图片超过 100MB，无法保存到本地");
+    const outputExtension = resultMime === "image/jpeg" ? "jpg" : resultMime === "image/webp" ? "webp" : "png";
+    const outputName = `${randomUUID()}.${outputExtension}`;
+    const outputPath = resolve(imageUpscaleOutputDirectory, outputName);
+    await writeFile(outputPath, bytes);
+    const imageUrl = `/api/generated/${basename(imageUpscaleOutputDirectory)}/${outputName}`;
+    const record: StoredImageUpscale = {
+      id: outputName,
+      imageUrl,
+      originalName,
+      resolution: resolutionValue,
+      sourceBytes: file.size,
+      createdAt: new Date().toISOString(),
+    };
+    try {
+      await writeFile(resolve(imageUpscaleOutputDirectory, `${outputName}.json`), JSON.stringify(record, null, 2), "utf8");
+    } catch (error) {
+      await unlink(outputPath).catch(() => undefined);
+      throw error;
+    }
+    writeLog("INFO", "[image-upscale] 完成", { taskId: task.taskId, resolution: resolutionValue, bytes: bytes.length, elapsedMs: Date.now() - startedAt });
+    response.status(201).json({ data: { id: outputName, imageUrl, resolution: resolutionValue, bytes: bytes.length, taskId: task.taskId } });
+  } finally {
+    await aliyunOss.deleteObject(source.objectName).catch((error) => {
+      writeLog("WARN", "[image-upscale] OSS 临时文件清理失败", { objectName: source.objectName, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+}));
+
+app.get("/api/tools/digital-human/status", (_request, response) => {
+  response.json({ data: { configured: viduLive.enabled, mediaProvider: "AliRTC" } });
+});
+
+app.post("/api/tools/digital-human/lives", asyncRoute(async (request, response) => {
+  if (!viduLive.enabled) return response.status(503).json({ error: "Vidu Live 尚未配置，请在 backend/.env 中填写 VIDU_API_KEY" });
+  if (!aliyunOss.enabled) return response.status(503).json({ error: "OSS 尚未配置，请在 backend/.env 中填写阿里云 OSS 密钥" });
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
+    return response.status(415).json({ error: "请使用 multipart/form-data 上传数字人图片" });
+  }
+  const maximumImageBytes = 50 * 1024 * 1024;
+  const maximumMultipartBytes = maximumImageBytes + 256 * 1024;
+  const declaredLength = Number(request.headers["content-length"] ?? 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maximumMultipartBytes) {
+    return response.status(413).json({ error: "数字人图片不能超过 50MB" });
+  }
+
+  let multipartBody: Buffer;
+  try {
+    multipartBody = await readLimitedRequestBody(request, maximumMultipartBytes, "DIGITAL_HUMAN_UPLOAD_TOO_LARGE");
+  } catch (error) {
+    if (error instanceof Error && error.message === "DIGITAL_HUMAN_UPLOAD_TOO_LARGE") {
+      return response.status(413).json({ error: "数字人图片不能超过 50MB" });
+    }
+    throw error;
+  }
+
+  let form: FormData;
+  try {
+    form = await new globalThis.Request("http://localhost/digital-human-upload", {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: new Uint8Array(multipartBody),
+    }).formData();
+  } catch {
+    return response.status(400).json({ error: "无法读取数字人配置，请重新提交" });
+  }
+
+  const file = form.get("file");
+  const personaValue = form.get("persona");
+  const voiceValue = form.get("voice");
+  const callModeValue = form.get("callMode");
+  if (!(file instanceof Blob)) return response.status(400).json({ error: "请选择数字人形象图片" });
+  if (file.size > maximumImageBytes) return response.status(413).json({ error: "数字人图片不能超过 50MB" });
+  if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) return response.status(400).json({ error: "请选择 PNG、JPG 或 WebP 图片" });
+  const persona = typeof personaValue === "string" ? personaValue.trim() : "";
+  const voice = typeof voiceValue === "string" ? voiceValue.trim() : "";
+  const callMode = callModeValue === "audio" ? "audio" as const : callModeValue === "video" ? "video" as const : null;
+  if (!callMode) return response.status(400).json({ error: "通话模式仅支持视频或语音" });
+  if (!persona) return response.status(400).json({ error: "请填写数字人人设" });
+  if (persona.length > 2000) return response.status(400).json({ error: "数字人人设不能超过 2000 字" });
+
+  const source = await aliyunOss.uploadTemporaryImage(Buffer.from(await file.arrayBuffer()), file.type);
+  try {
+    // Both UI modes need an animated avatar. The selected mode only controls
+    // whether the browser publishes the caller's camera to AliRTC.
+    const session = await viduLive.createRealtimeSession({ callMode: "video", persona, imageUri: source.url, voice });
+    viduLiveSources.set(session.liveId, source.objectName);
+    writeLog("INFO", "[digital-human] Vidu Live 会话已创建", { liveId: session.liveId, callMode: "video", callerMediaMode: callMode });
+    response.status(201).json({ data: { liveId: session.liveId, rtc: session.rtc } });
+  } catch (error) {
+    await aliyunOss.deleteObject(source.objectName).catch(() => undefined);
+    throw error;
+  }
+}));
+
+app.delete("/api/tools/digital-human/lives/:liveId", asyncRoute(async (request, response) => {
+  const liveId = String(request.params.liveId ?? "").trim();
+  const objectName = viduLiveSources.get(liveId);
+  if (objectName) {
+    viduLiveSources.delete(liveId);
+    await aliyunOss.deleteObject(objectName).catch((error) => {
+      writeLog("WARN", "[digital-human] OSS 临时形象清理失败", { liveId, error: error instanceof Error ? error.message : String(error) });
+    });
+  }
+  response.status(204).end();
+}));
+
 app.get("/api/tools/voice-clones", asyncRoute(async (_request, response) => {
   response.json({
     data: await listVoiceClones(),
@@ -1034,7 +1240,7 @@ app.post("/api/tools/voice-clones", asyncRoute(async (request, response) => {
 
   let multipartBody: Buffer;
   try {
-    multipartBody = await readLimitedRequestBody(request, 21 * 1024 * 1024);
+    multipartBody = await readLimitedRequestBody(request, 21 * 1024 * 1024, "VOICE_UPLOAD_TOO_LARGE");
   } catch (error) {
     if (error instanceof Error && error.message === "VOICE_UPLOAD_TOO_LARGE") {
       return response.status(413).json({ error: "音频文件不能超过 20MB" });
@@ -1229,7 +1435,7 @@ app.get("/api/dashboard", asyncRoute(async (_request, response) => {
 
 app.get("/api/assets", asyncRoute(async (_request, response) => {
   const projects = await db.listProjects();
-  const [projectBundles, jobs, characterImages, sceneImages, propImages, voiceClones, speechGenerations, referenceVideos, keyframeVideos] = await Promise.all([
+  const [projectBundles, jobs, characterImages, sceneImages, propImages, imageUpscales, voiceClones, speechGenerations, referenceVideos, keyframeVideos] = await Promise.all([
     Promise.all(projects.map(async (project) => {
       const [subjects, shots, merges] = await Promise.all([db.listSubjects(project.id), db.listShots(project.id), listVideoMerges(project.id)]);
       return { project, subjects, shots, merges };
@@ -1238,6 +1444,7 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
     listStudioImages("character", 200),
     listStudioImages("scene", 200),
     listStudioImages("prop", 200),
+    listImageUpscales(200),
     listVoiceClones(200),
     listSpeechGenerations(300),
     listStudioVideos("reference-video", 200),
@@ -1261,8 +1468,15 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
   ] as const).flatMap(([kind, images]) => images.map((image) => ({
     id: `tool-${kind}:${image.id}`, kind, source: "tool" as const, mediaType: "image" as const,
     title: standaloneName[kind], description: image.prompt || "提示词未记录", mediaUrl: image.imageUrl, thumbnailUrl: image.imageUrl,
-    projectId: null, projectTitle: null, detail: "更多工具", createdAt: image.createdAt,
-  })));
+      projectId: null, projectTitle: null, detail: "更多工具", createdAt: image.createdAt,
+    })));
+  const upscaleImages = imageUpscales.map((image) => ({
+    id: `upscale:${image.id}`, kind: "image" as const, source: "tool" as const, mediaType: "image" as const,
+    title: image.originalName ? `${image.originalName.replace(/\.[^.]+$/, "")} · 高清` : "一键高清图片",
+    description: image.originalName ? `原图：${image.originalName}` : "一键高清处理结果",
+    mediaUrl: image.imageUrl, thumbnailUrl: image.imageUrl,
+    projectId: null, projectTitle: null, detail: image.resolution ? `一键高清 · ${image.resolution.toUpperCase()}` : "一键高清", createdAt: image.createdAt,
+  }));
   const audioAssets = [
     ...voiceClones.map((voice) => ({
       id: `voice:${voice.id}`, kind: "audio" as const, source: "tool" as const, mediaType: "audio" as const,
@@ -1298,9 +1512,9 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
       title: video.videoType === "reference-video" ? "参考生视频" : "首尾帧视频", description: video.prompt, mediaUrl: video.outputUrl!, thumbnailUrl: null,
       projectId: null, projectTitle: null, detail: `${video.ratio} · ${video.duration} 秒`, createdAt: video.createdAt,
     }));
-  const items = [...projectImages, ...standaloneImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
+  const items = [...projectImages, ...standaloneImages, ...upscaleImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
-  const counts = { character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
+  const counts = { image: 0, character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
   for (const item of items) counts[item.kind] += 1;
   response.json({ items, counts });
 }));
@@ -1686,15 +1900,79 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
   writeLog("ERROR", "[api-error]", { method: request.method, path: request.originalUrl, error: error instanceof Error ? error.stack ?? detail : detail });
   const timedOut = detail.includes("请求超过") || detail.toLowerCase().includes("timeout");
   const modelResponseIssue = detail.includes("DeepSeek 返回空内容") || detail.includes("DeepSeek 返回了无法解析的 JSON");
-  const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务");
+  const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务") || detail.includes("图片高清") || detail.includes("火山视觉");
+  const storageResponseIssue = detail.includes("OSS") || detail.includes("对象存储");
   const videoResponseIssue = detail.includes("视频平台") || detail.includes("视频任务") || detail.includes("视频生成") || detail.includes("视频合并") || detail.includes("FFmpeg") || detail.includes("镜头视频");
   const voiceResponseIssue = detail.includes("MiniMax") || detail.includes("声音克隆") || detail.includes("试听音频");
-  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || videoResponseIssue || voiceResponseIssue ? 502 : 500).json({ error: timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : voiceResponseIssue ? "声音克隆失败" : "服务器内部错误", details: detail });
+  const digitalHumanResponseIssue = detail.includes("Vidu Live") || detail.includes("数字人");
+  const publicError = timedOut && digitalHumanResponseIssue ? "数字人会话创建超时" : timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : storageResponseIssue ? "图片上传到 OSS 失败" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : voiceResponseIssue ? "声音克隆失败" : digitalHumanResponseIssue ? "数字人会话连接失败" : "服务器内部错误";
+  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || storageResponseIssue || videoResponseIssue || voiceResponseIssue || digitalHumanResponseIssue ? 502 : 500).json({ error: publicError, details: detail });
 });
 
 await db.initialize();
 await resumeVideoTasks();
 await resumeStudioVideoTasks();
-app.listen(port, () => {
+const server = createServer(app);
+const digitalHumanControlServer = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+  const match = requestUrl.pathname.match(/^\/api\/tools\/digital-human\/lives\/([^/]+)\/control$/);
+  if (!match || !viduLive.enabled) {
+    socket.write("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  const liveId = decodeURIComponent(match[1]);
+  digitalHumanControlServer.handleUpgrade(request, socket, head, (client) => {
+    const connId = requestUrl.searchParams.get("conn_id")?.trim();
+    const upstreamQuery = new URLSearchParams({ live_id: liveId });
+    if (connId) upstreamQuery.set("conn_id", connId);
+    const upstreamUrl = `${viduLive.controlBaseUrl}/live/ws/live/connect?${upstreamQuery.toString()}`;
+    const upstream = new WebSocket(upstreamUrl, { headers: { Authorization: viduLive.authorizationHeader } });
+    const pending: Array<{ data: WebSocket.RawData; isBinary: boolean }> = [];
+    let heartbeat: NodeJS.Timeout | null = null;
+    const stopHeartbeat = () => {
+      if (heartbeat) clearInterval(heartbeat);
+      heartbeat = null;
+    };
+
+    client.on("message", (data, isBinary) => {
+      if (upstream.readyState === WebSocket.OPEN) upstream.send(data, { binary: isBinary });
+      else if (upstream.readyState === WebSocket.CONNECTING) pending.push({ data, isBinary });
+    });
+    upstream.on("open", () => {
+      for (const message of pending.splice(0)) upstream.send(message.data, { binary: message.isBinary });
+      heartbeat = setInterval(() => {
+        if (upstream.readyState === WebSocket.OPEN) upstream.ping();
+      }, 10_000);
+    });
+    upstream.on("message", (data, isBinary) => {
+      if (client.readyState === WebSocket.OPEN) client.send(data, { binary: isBinary });
+    });
+    upstream.on("error", (error) => {
+      stopHeartbeat();
+      writeLog("ERROR", "[digital-human] Vidu 控制链路错误", { liveId, error: error.message });
+      if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify({ type: "proxy_error", message: "Vidu 控制链路连接失败" }));
+    });
+    upstream.on("close", (code, reason) => {
+      stopHeartbeat();
+      if (client.readyState === WebSocket.OPEN || client.readyState === WebSocket.CONNECTING) {
+        client.close(code >= 1000 && code <= 4999 ? code : 1011, reason.toString().slice(0, 120));
+      }
+    });
+    client.on("close", () => {
+      stopHeartbeat();
+      if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close(1000, "client closed");
+    });
+    client.on("error", () => {
+      stopHeartbeat();
+      if (upstream.readyState === WebSocket.OPEN || upstream.readyState === WebSocket.CONNECTING) upstream.close(1011, "client error");
+    });
+  });
+});
+
+server.listen(port, () => {
   writeLog("INFO", "[server] 启动完成", { url: `http://localhost:${port}`, database: databaseUrl.startsWith("mysql://") ? "mysql" : "sqlite", logFile });
 });
