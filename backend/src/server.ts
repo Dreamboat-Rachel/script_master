@@ -17,6 +17,7 @@ import { configureVideo, getVideoSettings, VideoGenerationService } from "./vide
 import { MiniMaxVoiceCloneService } from "./voice.js";
 import { ViduLiveService } from "./vidu.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
+import { stripSubjectVisualStyle } from "./subject-prompt.js";
 import type { Project, RenderJob, Shot, Subject } from "./types.js";
 
 const port = Number(process.env.PORT ?? 8787);
@@ -552,7 +553,34 @@ const patchProjectSchema = projectSchema.partial().extend({
 
 const scriptInputSchema = z.object({
   text: z.string().min(30).max(200000).refine((value) => value.trim().length >= 30, "剧本内容至少需要 30 个有效字符"),
+  systemPrompt: z.string().trim().max(12000).optional(),
 });
+const episodeExtractionSchema = z.object({
+  episodeId: z.string().uuid().optional(),
+  subjectIds: z.array(z.string().uuid()).max(100).optional(),
+});
+const shotExtractionSchema = episodeExtractionSchema.extend({
+  systemPrompt: z.string().trim().max(12000).optional(),
+  style: z.string().trim().min(1).max(100).optional(),
+});
+
+function subjectIdentity(role: Subject["role"], name: string) {
+  return `${role}:${name.trim().toLocaleLowerCase().replace(/[\s·•丨|｜_]+/g, "")}`;
+}
+
+function withoutProjectStyle(prompt: string, style: string) {
+  return stripSubjectVisualStyle(prompt, style);
+}
+
+function withSubjectComposition(prompt: string, role: Subject["role"]) {
+  if (prompt.includes("构图规范：")) return prompt;
+  const composition = role === "location"
+    ? "构图规范：画布水平分成上、中、下三个等高区域，依次展示同一空场景的清晨、日间、夜晚；三个区域保持完全相同的空间结构、视点、比例、门窗、出入口、固定家具设备、相对位置和动线，只改变符合时间段的自然光线；无人、无动物、无剧情动作、无文字水印。"
+    : role === "prop"
+      ? "构图规范：完整单体道具四视图，同一画布从左到右依次展示正面、左侧、背面、右侧；四个视图等高等比例，外形、材质、颜色、纹理、接口和开合结构完全一致；不出现人物、手、场景、其他道具、文字或水印。"
+      : "构图规范：同一阶段、同一人物四视图，同一画布从左到右依次展示正面、左侧、背面、右侧；四个视图等高等比例、全身完整，脸型、发型、体态、服装、配饰和识别特征完全一致；不出现额外人物、其他年龄阶段、动作场景、文字或水印。";
+  return `${prompt.trim()}\n${composition}`.trim();
+}
 const llmSettingsSchema = z.object({
   apiKey: z.string().max(500).optional(),
   model: z.string().trim().min(1).max(100).optional(),
@@ -981,9 +1009,9 @@ function episodesFromText(projectId: string, sourceText: string, targetEpisodeCo
 
 function subjectsFromProject(project: { title: string; style: string }) {
   return [
-    { name: "林默", role: "character" as const, description: "29 岁，夜班检票员，沉默克制，始终守在废弃月台。", visualPrompt: `${project.style}，林默，短黑发，深色旧制服，疲惫而专注的眼神，人物设定图` },
-    { name: "午夜车站", role: "location" as const, description: "城市边缘的旧车站，雨后潮湿，只有一盏信号灯仍在工作。无人空场景；明确站房、检票亭、月台、轨道、站牌、出入口和固定灯具的相对位置，布局符合真实车站动线。", visualPrompt: `${project.style}，午夜旧车站完整空场景设定图，雨后月台、站房、检票亭、站牌、轨道和孤独信号灯，合理建筑布局，无人物无动物无手无人体，无剧情动作，无漂浮或穿模` },
-    { name: "未来来信", role: "prop" as const, description: "一封没有寄件人的纸质信，落款日期是二十年以后。完整单体纸信，包含纸张、折痕、边缘、信封封口和可辨识的日期细节，不带人物、手、桌面或其他背景。", visualPrompt: `${project.style}，未来来信完整单体道具设定图，泛黄纸张、信封、折痕、封口、未来日期细节，展示完整外形和材质，无人物无手无桌面无场景` },
+    { name: "林默", role: "character" as const, description: "29 岁，夜班检票员，沉默克制，始终守在废弃月台。", visualPrompt: "林默，短黑发，深色旧制服，疲惫而专注的眼神，人物设定图" },
+    { name: "午夜车站", role: "location" as const, description: "城市边缘的旧车站，雨后潮湿，只有一盏信号灯仍在工作。无人空场景；明确站房、检票亭、月台、轨道、站牌、出入口和固定灯具的相对位置，布局符合真实车站动线。", visualPrompt: "午夜旧车站完整空场景设定图，雨后月台、站房、检票亭、站牌、轨道和孤独信号灯，合理建筑布局，无人物无动物无手无人体，无剧情动作，无漂浮或穿模" },
+    { name: "未来来信", role: "prop" as const, description: "一封没有寄件人的纸质信，落款日期是二十年以后。完整单体纸信，包含纸张、折痕、边缘、信封封口和可辨识的日期细节，不带人物、手、桌面或其他背景。", visualPrompt: "未来来信完整单体道具设定图，泛黄纸张、信封、折痕、封口、未来日期细节，展示完整外形和材质，无人物无手无桌面无场景" },
   ];
 }
 
@@ -1569,22 +1597,20 @@ app.get("/api/projects/:id/pipeline", asyncRoute(async (request, response) => {
 app.post("/api/projects/:id/format", asyncRoute(async (request, response) => {
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
-  const { text } = scriptInputSchema.parse(request.body);
+  const { text, systemPrompt } = scriptInputSchema.parse(request.body);
   if (!deepSeek.enabled && !localFallback) return response.status(503).json({ error: "尚未配置 DeepSeek API Key，请先打开模型设置" });
+  if (systemPrompt && !deepSeek.enabled) return response.status(503).json({ error: "自定义系统提示词需要配置 DeepSeek API Key 后才能使用" });
   let formattedText = normalizeScript(text);
   let qualityReport = "本地保真格式化：原文逐字保留";
   if (deepSeek.enabled) {
     try {
-      const result = await deepSeek.formatScript(text);
+      const result = await deepSeek.formatScript(text, systemPrompt);
       formattedText = result.formattedText;
       qualityReport = result.qualityReport;
     } catch (caught) {
       const detail = caught instanceof Error ? caught.message : String(caught);
-      if (!detail.includes("原文保真校验")) throw caught;
-      // Preserve the user's text and keep the pipeline usable when the model's audit field drifts.
-      formattedText = normalizeScript(text);
-      qualityReport = "模型保真校验未通过，已使用本地原文保真格式化";
-      writeLog("WARN", "[format] 模型保真校验失败，降级本地格式化", { projectId: project.id, detail });
+      writeLog("WARN", "[format] 模型格式化结果未通过校验", { projectId: project.id, detail });
+      throw caught;
     }
   }
   const document = await db.saveScriptDocument(project.id, text, formattedText);
@@ -1616,12 +1642,53 @@ app.post("/api/projects/:id/episodes/extract", asyncRoute(async (request, respon
 app.post("/api/projects/:id/subjects/extract", asyncRoute(async (request, response) => {
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
+  const input = episodeExtractionSchema.parse(request.body ?? {});
   const episodes = await db.listEpisodes(project.id);
   if (!episodes.length) return response.status(409).json({ error: "请先完成分集" });
+  const selectedEpisode = input.episodeId ? episodes.find((episode) => episode.id === input.episodeId) : undefined;
+  if (input.episodeId && !selectedEpisode) return response.status(404).json({ error: "分集不存在" });
   if (!deepSeek.enabled && !localFallback) return response.status(503).json({ error: "尚未配置 DeepSeek API Key，无法调用主体模型" });
-  const subjects = await db.replaceSubjects(project.id, deepSeek.enabled ? await deepSeek.extractSubjects((await db.getScriptDocument(project.id))?.formattedText ?? "", project.style) : subjectsFromProject(project));
+  const sourceText = selectedEpisode?.originalText || (await db.getScriptDocument(project.id))?.formattedText || "";
+  const existing = (await db.listSubjects(project.id)).map((subject) => ({
+    ...subject,
+    description: stripSubjectVisualStyle(subject.description, project.style),
+    visualPrompt: withSubjectComposition(withoutProjectStyle(subject.visualPrompt, project.style), subject.role),
+  }));
+  const existingByKey = new Map(existing.map((subject) => [subjectIdentity(subject.role, subject.name), subject]));
+  const extracted = deepSeek.enabled ? await deepSeek.extractSubjects(sourceText, existing) : subjectsFromProject(project);
+  const lockedExtracted = extracted.map((subject) => {
+    const locked = existingByKey.get(subjectIdentity(subject.role, subject.name));
+    return locked ? {
+      name: locked.name,
+      role: locked.role,
+      description: locked.description,
+      visualPrompt: locked.visualPrompt,
+    } : {
+      ...subject,
+      description: stripSubjectVisualStyle(subject.description, project.style),
+      visualPrompt: withSubjectComposition(withoutProjectStyle(subject.visualPrompt, project.style), subject.role),
+    };
+  });
+  let subjects: Subject[];
+  if (selectedEpisode) {
+    const merged = new Map(existing.map((subject) => [subjectIdentity(subject.role, subject.name), {
+      name: subject.name,
+      role: subject.role,
+      description: subject.description,
+      visualPrompt: subject.visualPrompt,
+    }]));
+    for (const subject of lockedExtracted) {
+      const key = subjectIdentity(subject.role, subject.name);
+      if (!merged.has(key)) merged.set(key, subject);
+    }
+    const saved = await db.replaceSubjects(project.id, Array.from(merged.values()));
+    const extractedKeys = new Set(lockedExtracted.map((subject) => subjectIdentity(subject.role, subject.name)));
+    subjects = saved.filter((subject) => extractedKeys.has(subjectIdentity(subject.role, subject.name)));
+  } else {
+    subjects = await db.replaceSubjects(project.id, lockedExtracted);
+  }
   const updated = await db.updateProject(project.id, { status: "storyboarding", progress: 56 });
-  response.json({ data: { project: updated, subjects, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
+  response.json({ data: { project: updated, subjects, episodeId: selectedEpisode?.id ?? null, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
 }));
 
 app.delete("/api/projects/:id/subjects/:subjectId", asyncRoute(async (request, response) => {
@@ -1672,23 +1739,35 @@ app.post("/api/projects/:id/shots/extract", asyncRoute(async (request, response)
   const startedAt = Date.now();
   const project = await db.getProject(String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
+  const input = shotExtractionSchema.parse(request.body ?? {});
   const episodes = await db.listEpisodes(project.id);
   if (!episodes.length) return response.status(409).json({ error: "请先完成分集" });
-  const subjects = await db.listSubjects(project.id);
+  const selectedEpisode = input.episodeId ? episodes.find((episode) => episode.id === input.episodeId) : undefined;
+  if (input.episodeId && !selectedEpisode) return response.status(404).json({ error: "分集不存在" });
+  const selectedEpisodes = selectedEpisode ? [selectedEpisode] : episodes;
+  const allSubjects = await db.listSubjects(project.id);
+  const selectedSubjectIds = new Set(input.subjectIds ?? []);
+  const subjects = selectedSubjectIds.size ? allSubjects.filter((subject) => selectedSubjectIds.has(subject.id)) : allSubjects;
   if (!deepSeek.enabled && !localFallback) return response.status(503).json({ error: "尚未配置 DeepSeek API Key，无法调用分镜模型" });
   const document = await db.getScriptDocument(project.id);
+  const sourceText = selectedEpisode?.originalText || document?.formattedText || "";
   writeLog("INFO", "[extract-shots] 开始", {
     projectId: project.id,
-    formattedLength: document?.formattedText.length ?? 0,
-    episodeCount: episodes.length,
+    episodeId: selectedEpisode?.id ?? null,
+    formattedLength: sourceText.length,
+    episodeCount: selectedEpisodes.length,
     subjectCount: subjects.length,
     outputTokenBudget: SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET,
     engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback",
   });
-  const shots = await db.replaceShots(project.id, deepSeek.enabled ? await deepSeek.extractShots(document?.formattedText ?? "", episodes, subjects, project.style) : shotsFromEpisodes(project.id, episodes, project.style));
+  const shotStyle = input.style || project.style;
+  const extracted = deepSeek.enabled ? await deepSeek.extractShots(sourceText, selectedEpisodes, subjects, shotStyle, input.systemPrompt, project.durationSeconds) : shotsFromEpisodes(project.id, selectedEpisodes, shotStyle);
+  const shots = selectedEpisode
+    ? await db.replaceEpisodeShots(project.id, selectedEpisode.id, extracted)
+    : await db.replaceShots(project.id, extracted);
   const updated = await db.updateProject(project.id, { status: "storyboarding", progress: 76 });
-  writeLog("INFO", "[extract-shots] 完成", { projectId: project.id, shotCount: shots.length, elapsedMs: Date.now() - startedAt });
-  response.json({ data: { project: updated, shots, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
+  writeLog("INFO", "[extract-shots] 完成", { projectId: project.id, episodeId: selectedEpisode?.id ?? null, shotCount: shots.length, elapsedMs: Date.now() - startedAt });
+  response.json({ data: { project: updated, shots, episodeId: selectedEpisode?.id ?? null, engine: deepSeek.enabled ? deepSeekConfig.model : "local-fallback" } });
 }));
 
 app.post("/api/projects/:id/generate-script", asyncRoute(async (request, response) => {

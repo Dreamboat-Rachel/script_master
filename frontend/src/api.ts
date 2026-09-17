@@ -61,8 +61,8 @@ export const api = {
     targetEpisodeCount: number;
   }) => (await request<{ data: Project }>("/api/projects", { method: "POST", body: JSON.stringify(input) })).data,
   deleteProject: async (id: string) => { await request<void>(`/api/projects/${id}`, { method: "DELETE" }); },
-  updateProject: async (id: string, input: { title: string; logline: string; genre: string; style: string; aspectRatio: string; durationSeconds: number; targetEpisodeCount: number }) =>
-    (await request<{ data: { project: Project } }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(input) })).data.project,
+  updateProject: async (id: string, input: Partial<{ title: string; logline: string; genre: string; style: string; aspectRatio: string; durationSeconds: number; targetEpisodeCount: number }>) =>
+    (await request<{ data: Project }>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(input) })).data,
   generateScript: async (id: string, input: { title: string; logline: string; genre: string; style: string; aspectRatio: string; durationSeconds: number; targetEpisodeCount: number }) =>
     (await request<{ data: { project: Project; scriptText: string; document: PipelineData["document"] } }>(`/api/projects/${id}/generate-script`, {
       method: "POST",
@@ -77,9 +77,9 @@ export const api = {
   shotContinuityPreview: async (projectId: string, shotId: string) =>
     (await request<{ data: ShotContinuityPreview }>(`/api/projects/${projectId}/shots/${shotId}/continuity-preview`)).data,
   pipeline: async (id: string) => (await request<{ data: PipelineData }>(`/api/projects/${id}/pipeline`)).data,
-  format: async (id: string, text: string) => (await request<{ data: { project: Project; document: PipelineData["document"] } }>(`/api/projects/${id}/format`, { method: "POST", body: JSON.stringify({ text }) })).data,
+  format: async (id: string, text: string, systemPrompt?: string) => (await request<{ data: { project: Project; document: PipelineData["document"] } }>(`/api/projects/${id}/format`, { method: "POST", body: JSON.stringify({ text, ...(systemPrompt?.trim() ? { systemPrompt: systemPrompt.trim() } : {}) }) })).data,
   extractEpisodes: async (id: string) => (await request<{ data: { project: Project; episodes: PipelineData["episodes"] } }>(`/api/projects/${id}/episodes/extract`, { method: "POST", body: "{}" })).data,
-  extractSubjects: async (id: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${id}/subjects/extract`, { method: "POST", body: "{}" })).data,
+  extractSubjects: async (id: string, input: { episodeId?: string } = {}) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"]; episodeId?: string | null } }>(`/api/projects/${id}/subjects/extract`, { method: "POST", body: JSON.stringify(input) })).data,
   deleteSubject: async (projectId: string, subjectId: string) => (await request<{ data: { project: Project; subjects: PipelineData["subjects"] } }>(`/api/projects/${projectId}/subjects/${subjectId}`, { method: "DELETE" })).data,
   generateSubjectImage: async (projectId: string, subjectId: string, input: SubjectImageInput) => (await request<{ data: { subject: Subject; provider: string; model: string; size: string } }>(`/api/projects/${projectId}/subjects/${subjectId}/image`, { method: "POST", body: JSON.stringify(input) })).data,
   assetImages: async (assetType: StudioAssetType) => (await request<{ data: CharacterImageResult[] }>(`/api/tools/${assetType}-images`)).data,
@@ -96,5 +96,5 @@ export const api = {
   },
   speechGenerations: () => request<TextToSpeechList>("/api/tools/text-to-speech"),
   generateSpeech: async (input: TextToSpeechInput) => (await request<{ data: TextToSpeechResult }>("/api/tools/text-to-speech", { method: "POST", body: JSON.stringify(input) })).data,
-  extractShots: async (id: string) => (await request<{ data: { project: Project; shots: PipelineData["shots"] } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: "{}" })).data,
+  extractShots: async (id: string, input: { episodeId?: string; subjectIds?: string[]; systemPrompt?: string; style?: string } = {}) => (await request<{ data: { project: Project; shots: PipelineData["shots"]; episodeId?: string | null } }>(`/api/projects/${id}/shots/extract`, { method: "POST", body: JSON.stringify(input) })).data,
 };

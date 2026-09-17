@@ -44,6 +44,7 @@ export interface DatabaseStore {
   listShots(projectId: string, episodeNumber?: number): Promise<Shot[]>;
   updateShot(projectId: string, shotId: string, input: Pick<Shot, "location" | "action" | "visualPrompt">): Promise<Shot | null>;
   replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Shot[]>;
+  replaceEpisodeShots(projectId: string, episodeId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]): Promise<Shot[]>;
 }
 
 const now = () => new Date().toISOString();
@@ -504,6 +505,17 @@ class SqliteStore implements DatabaseStore {
     for (const shot of shots) { const stamp = now(); insert.run(randomUUID(), projectId, shot.episodeId, shot.episodeNumber, shot.shotOrder, shot.title, shot.location, shot.action, shot.dialogue, shot.visualPrompt, shot.camera, shot.durationSeconds, shot.status, stamp, stamp); }
     return this.listShots(projectId);
   }
+
+  async replaceEpisodeShots(projectId: string, episodeId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM shots WHERE project_id=? AND episode_id=?").run(projectId, episodeId);
+      const insert = this.db.prepare(`INSERT INTO shots (id,project_id,episode_id,episode_number,shot_order,title,location,action,dialogue,visual_prompt,camera,duration_seconds,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+      for (const shot of shots) { const stamp = now(); insert.run(randomUUID(), projectId, shot.episodeId, shot.episodeNumber, shot.shotOrder, shot.title, shot.location, shot.action, shot.dialogue, shot.visualPrompt, shot.camera, shot.durationSeconds, shot.status, stamp, stamp); }
+      this.db.exec("COMMIT");
+    } catch (error) { this.db.exec("ROLLBACK"); throw error; }
+    return this.listShots(projectId, shots[0]?.episodeNumber);
+  }
 }
 
 class MysqlStore implements DatabaseStore {
@@ -773,6 +785,21 @@ class MysqlStore implements DatabaseStore {
 
   async replaceShots(projectId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
     await this.pool.execute("DELETE FROM shots WHERE project_id=?", [projectId]); for (const shot of shots) { const stamp = new Date(); await this.pool.execute("INSERT INTO shots (id,project_id,episode_id,episode_number,shot_order,title,location,action,dialogue,visual_prompt,camera,duration_seconds,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [randomUUID(),projectId,shot.episodeId,shot.episodeNumber,shot.shotOrder,shot.title,shot.location,shot.action,shot.dialogue,shot.visualPrompt,shot.camera,shot.durationSeconds,shot.status,stamp,stamp]); } return this.listShots(projectId);
+  }
+
+  async replaceEpisodeShots(projectId: string, episodeId: string, shots: Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">[]) {
+    const connection = await this.pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      await connection.execute("DELETE FROM shots WHERE project_id=? AND episode_id=?", [projectId, episodeId]);
+      for (const shot of shots) {
+        const stamp = new Date();
+        await connection.execute("INSERT INTO shots (id,project_id,episode_id,episode_number,shot_order,title,location,action,dialogue,visual_prompt,camera,duration_seconds,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", [randomUUID(),projectId,shot.episodeId,shot.episodeNumber,shot.shotOrder,shot.title,shot.location,shot.action,shot.dialogue,shot.visualPrompt,shot.camera,shot.durationSeconds,shot.status,stamp,stamp]);
+      }
+      await connection.commit();
+    } catch (error) { await connection.rollback(); throw error; }
+    finally { connection.release(); }
+    return this.listShots(projectId, shots[0]?.episodeNumber);
   }
 }
 
