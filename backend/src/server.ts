@@ -34,10 +34,12 @@ const subjectImageDirectory = resolve(generatedDirectory, "subjects");
 const characterImageDirectory = resolve(generatedDirectory, "characters");
 const sceneImageDirectory = resolve(generatedDirectory, "scenes");
 const propImageDirectory = resolve(generatedDirectory, "props");
-const studioImageDirectories = { character: characterImageDirectory, scene: sceneImageDirectory, prop: propImageDirectory } as const;
+const canvasImageDirectory = resolve(generatedDirectory, "canvas-images");
+const studioImageDirectories = { character: characterImageDirectory, scene: sceneImageDirectory, prop: propImageDirectory, canvas: canvasImageDirectory } as const;
 const referenceVideoDirectory = resolve(generatedDirectory, "reference-videos");
 const keyframeVideoDirectory = resolve(generatedDirectory, "keyframe-videos");
-const studioVideoDirectories = { "reference-video": referenceVideoDirectory, "keyframe-video": keyframeVideoDirectory } as const;
+const canvasVideoDirectory = resolve(generatedDirectory, "canvas-videos");
+const studioVideoDirectories = { "reference-video": referenceVideoDirectory, "keyframe-video": keyframeVideoDirectory, "canvas-video": canvasVideoDirectory } as const;
 const continuityFrameDirectory = resolve(generatedDirectory, "continuity");
 const generatedVideoDirectory = resolve(generatedDirectory, "videos");
 const videoMergeDirectory = resolve(generatedDirectory, "merges");
@@ -124,8 +126,10 @@ mkdirSync(subjectImageDirectory, { recursive: true });
 mkdirSync(characterImageDirectory, { recursive: true });
 mkdirSync(sceneImageDirectory, { recursive: true });
 mkdirSync(propImageDirectory, { recursive: true });
+mkdirSync(canvasImageDirectory, { recursive: true });
 mkdirSync(referenceVideoDirectory, { recursive: true });
 mkdirSync(keyframeVideoDirectory, { recursive: true });
+mkdirSync(canvasVideoDirectory, { recursive: true });
 mkdirSync(continuityFrameDirectory, { recursive: true });
 mkdirSync(generatedVideoDirectory, { recursive: true });
 mkdirSync(videoMergeDirectory, { recursive: true });
@@ -606,16 +610,22 @@ const subjectImageSchema = z.object({
   referenceImage: z.string().max(11_500_000).regex(/^data:image\/[a-z0-9.+-]+;base64,/i, "参考图格式无效").optional(),
   watermark: z.boolean().optional(),
 });
+const canvasImageSchema = subjectImageSchema.extend({
+  prompt: z.string().trim().min(1, "请输入图片提示词").max(12000),
+});
 const studioVideoSchema = z.object({
   prompt: z.string().trim().min(10, "视频提示词至少需要 10 个字").max(16000),
   model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]),
   ratio: z.enum(["16:9", "9:16", "1:1"]),
-  duration: z.coerce.number().int().min(2).max(12),
+  duration: z.coerce.number().int().refine((value) => [4, 5, 6, 8, 10, 12].includes(value), "视频时长仅支持 4、5、6、8、10 或 12 秒"),
   generateAudio: z.boolean().default(true),
   watermark: z.boolean().default(false),
-  referenceImages: z.array(z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "参考图格式无效")).max(3).optional(),
+  referenceImages: z.array(z.string().max(5_700_000).refine((value) => /^data:image\/(?:png|jpeg|webp);base64,/i.test(value) || /^https?:\/\//i.test(value), "参考图格式无效")).max(3).optional(),
   firstFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "首帧格式无效").optional(),
   lastFrame: z.string().max(5_700_000).regex(/^data:image\/(?:png|jpeg|webp);base64,/i, "尾帧格式无效").optional(),
+});
+const canvasVideoSchema = studioVideoSchema.extend({
+  prompt: z.string().trim().min(1, "请输入视频提示词").max(16000),
 });
 const voiceCloneMetadataSchema = z.object({
   name: z.string().trim().min(1, "请填写声音名称").max(30),
@@ -1381,7 +1391,7 @@ app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) =>
   const directory = studioImageDirectories[assetType];
   if (!directory) return response.status(404).json({ error: "不支持的资产类型" });
   if (!imageGeneration.enabled) return response.status(503).json({ error: "尚未配置图片生成 API Key，请先打开模型设置" });
-  const input = subjectImageSchema.parse(request.body);
+  const input = (assetType === "canvas" ? canvasImageSchema : subjectImageSchema).parse(request.body);
   const generated = await imageGeneration.generate(input);
   if (!generated.bytes.length) throw new Error("图片平台返回了空文件");
   if (generated.bytes.length > 25 * 1024 * 1024) throw new Error("生成图片超过 25MB，无法保存到本地");
@@ -1412,14 +1422,14 @@ app.post("/api/tools/:videoType-videos", asyncRoute(async (request, response) =>
   const videoType = String(request.params.videoType) as StudioVideoType;
   if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
   if (!videoGeneration.enabled) return response.status(503).json({ error: "尚未配置视频生成 API Key，请先打开模型设置" });
-  const input = studioVideoSchema.parse(request.body ?? {});
+  const input = (videoType === "canvas-video" ? canvasVideoSchema : studioVideoSchema).parse(request.body ?? {});
   if (videoType === "reference-video" && !input.referenceImages?.length) return response.status(400).json({ error: "请至少添加一张参考图" });
   if (videoType === "keyframe-video" && !input.firstFrame) return response.status(400).json({ error: "请添加首帧图片" });
 
   const task = await videoGeneration.createTask({
     prompt: input.prompt,
     model: input.model,
-    referenceImageUrls: videoType === "reference-video" ? input.referenceImages : undefined,
+    referenceImageUrls: videoType === "reference-video" || videoType === "canvas-video" ? input.referenceImages : undefined,
     firstFrameUrl: videoType === "keyframe-video" ? input.firstFrame : undefined,
     lastFrameUrl: videoType === "keyframe-video" ? input.lastFrame : undefined,
     ratio: input.ratio,
@@ -1463,7 +1473,7 @@ app.get("/api/dashboard", asyncRoute(async (_request, response) => {
 
 app.get("/api/assets", asyncRoute(async (_request, response) => {
   const projects = await db.listProjects();
-  const [projectBundles, jobs, characterImages, sceneImages, propImages, imageUpscales, voiceClones, speechGenerations, referenceVideos, keyframeVideos] = await Promise.all([
+  const [projectBundles, jobs, characterImages, sceneImages, propImages, canvasImages, imageUpscales, voiceClones, speechGenerations, referenceVideos, keyframeVideos, canvasVideos] = await Promise.all([
     Promise.all(projects.map(async (project) => {
       const [subjects, shots, merges] = await Promise.all([db.listSubjects(project.id), db.listShots(project.id), listVideoMerges(project.id)]);
       return { project, subjects, shots, merges };
@@ -1472,11 +1482,13 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
     listStudioImages("character", 200),
     listStudioImages("scene", 200),
     listStudioImages("prop", 200),
+    listStudioImages("canvas", 200),
     listImageUpscales(200),
     listVoiceClones(200),
     listSpeechGenerations(300),
     listStudioVideos("reference-video", 200),
     listStudioVideos("keyframe-video", 200),
+    listStudioVideos("canvas-video", 200),
   ]);
   const projectById = new Map(projects.map((project) => [project.id, project]));
   const shotById = new Map(projectBundles.flatMap(({ shots }) => shots.map((shot) => [`${shot.projectId}:${shot.id}`, shot] as const)));
@@ -1498,6 +1510,11 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
     title: standaloneName[kind], description: image.prompt || "提示词未记录", mediaUrl: image.imageUrl, thumbnailUrl: image.imageUrl,
       projectId: null, projectTitle: null, detail: "更多工具", createdAt: image.createdAt,
     })));
+  const canvasGeneratedImages = canvasImages.map((image) => ({
+    id: `canvas-image:${image.id}`, kind: "image" as const, source: "tool" as const, mediaType: "image" as const,
+    title: "画布生成图片", description: image.prompt, mediaUrl: image.imageUrl, thumbnailUrl: image.imageUrl,
+    projectId: null, projectTitle: null, detail: `无限画布 · ${image.size || image.model}`, createdAt: image.createdAt,
+  }));
   const upscaleImages = imageUpscales.map((image) => ({
     id: `upscale:${image.id}`, kind: "image" as const, source: "tool" as const, mediaType: "image" as const,
     title: image.originalName ? `${image.originalName.replace(/\.[^.]+$/, "")} · 高清` : "一键高清图片",
@@ -1533,14 +1550,14 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
     title: `${project.title} · 合成视频`, description: `由 ${merge.shotIds.length} 个镜头合成`, mediaUrl: merge.outputUrl, thumbnailUrl: merge.coverUrl ?? project.coverUrl,
     projectId: project.id, projectTitle: project.title, detail: `${merge.durationSeconds} 秒 · 成片`, createdAt: merge.createdAt,
   })));
-  const standaloneVideos = [...referenceVideos, ...keyframeVideos]
+  const standaloneVideos = [...referenceVideos, ...keyframeVideos, ...canvasVideos]
     .filter((video) => video.status === "completed" && Boolean(video.outputUrl))
     .map((video) => ({
       id: `tool-video:${video.id}`, kind: "video" as const, source: "tool" as const, mediaType: "video" as const,
-      title: video.videoType === "reference-video" ? "参考生视频" : "首尾帧视频", description: video.prompt, mediaUrl: video.outputUrl!, thumbnailUrl: null,
+      title: video.videoType === "reference-video" ? "参考生视频" : video.videoType === "keyframe-video" ? "首尾帧视频" : "画布生成视频", description: video.prompt, mediaUrl: video.outputUrl!, thumbnailUrl: null,
       projectId: null, projectTitle: null, detail: `${video.ratio} · ${video.duration} 秒`, createdAt: video.createdAt,
     }));
-  const items = [...projectImages, ...standaloneImages, ...upscaleImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
+  const items = [...projectImages, ...standaloneImages, ...canvasGeneratedImages, ...upscaleImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const counts = { image: 0, character: 0, scene: 0, prop: 0, audio: 0, video: 0 };
   for (const item of items) counts[item.kind] += 1;

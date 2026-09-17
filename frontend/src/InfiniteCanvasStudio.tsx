@@ -62,7 +62,7 @@ import {
 import { api } from "./api";
 import type { AssetLibraryItem, Episode, ImageSettings, RenderJob, Shot, Subject, VideoSettings } from "./types";
 
-type CanvasNodeKind = "note" | "text" | "image" | "video" | "audio" | "character" | "scene" | "prop" | "prompt" | "script" | "formattedScript" | "episodes" | "subjects" | "shot" | "shotItem" | "merge" | "media";
+type CanvasNodeKind = "note" | "text" | "imageGenerator" | "videoGenerator" | "image" | "video" | "audio" | "character" | "scene" | "prop" | "prompt" | "script" | "formattedScript" | "episodes" | "subjects" | "shot" | "shotItem" | "merge" | "media";
 type CanvasOperation = "format-script" | "extract-episodes" | "extract-subjects" | "generate-subject-images" | "extract-shots" | "render-videos" | "merge-videos";
 type CanvasRunState = "idle" | "running" | "success" | "error";
 type CanvasNodeData = {
@@ -111,8 +111,10 @@ function stripCanvasSubjectStyle(value: string, additionalStyle = "") {
 const kindMeta: Record<CanvasNodeKind, { label: string; icon: LucideIcon; color: string }> = {
   note: { label: "通用", icon: Box, color: "#8a9099" },
   text: { label: "文本", icon: Type, color: "#5a9ab8" },
-  image: { label: "图片", icon: ImageIcon, color: "#58a67a" },
-  video: { label: "视频", icon: Video, color: "#c06972" },
+  imageGenerator: { label: "图片生成", icon: WandSparkles, color: "#58a67a" },
+  videoGenerator: { label: "视频生成", icon: Clapperboard, color: "#c06972" },
+  image: { label: "图片输出", icon: ImageIcon, color: "#58a67a" },
+  video: { label: "视频输出", icon: Video, color: "#c06972" },
   audio: { label: "音频", icon: AudioLines, color: "#b17ac5" },
   character: { label: "角色", icon: UserRound, color: "#e76b61" },
   scene: { label: "场景", icon: MapPin, color: "#4e9f76" },
@@ -129,8 +131,8 @@ const kindMeta: Record<CanvasNodeKind, { label: string; icon: LucideIcon; color:
 };
 
 const nodeGroups: Array<{ label: string; kinds: CanvasNodeKind[] }> = [
-  { label: "基础节点", kinds: ["note", "text", "image", "video", "audio"] },
-  { label: "素材节点", kinds: ["character", "scene", "prop", "prompt"] },
+  { label: "基础节点", kinds: ["text", "image", "video", "audio"] },
+  { label: "生成节点", kinds: ["imageGenerator", "videoGenerator"] },
   { label: "流程节点", kinds: ["script", "subjects", "shot", "merge"] },
 ];
 
@@ -159,6 +161,8 @@ type CanvasRuntimeValue = {
   runEpisodeShots: (nodeId: string) => void;
   generateSubjectImage: (nodeId: string) => void;
   generateShotVideo: (nodeId: string) => void;
+  generateCanvasImage: (nodeId: string) => void;
+  generateCanvasVideo: (nodeId: string) => void;
   deleteNode: (nodeId: string) => void;
   imageModel: string;
   imageModelOptions: string[];
@@ -237,6 +241,19 @@ const videoModelLabels: Record<VideoSettings["model"], string> = {
   "doubao-seedance-2-0-fast-260128": "Seedance 2.0 Fast",
 };
 
+const canvasAspectRatioOptions = [
+  { value: "1:1", label: "1:1 · 方形" },
+  { value: "16:9", label: "16:9 · 横屏" },
+  { value: "9:16", label: "9:16 · 竖屏" },
+  { value: "3:2", label: "3:2 · 横向" },
+  { value: "2:3", label: "2:3 · 竖向" },
+  { value: "4:3", label: "4:3 · 横向" },
+  { value: "3:4", label: "3:4 · 竖向" },
+];
+
+const canvasVideoRatioOptions = canvasAspectRatioOptions.filter(({ value }) => ["1:1", "16:9", "9:16"].includes(value));
+const canvasVideoDurationOptions = [4, 5, 6, 8, 10, 12];
+
 function nodeString(data: CanvasNodeData, key: string, fallback: string) {
   const value = data[key];
   return typeof value === "string" && value ? value : fallback;
@@ -292,6 +309,140 @@ function NodeRunner({ id, data }: { id: string; data: CanvasNodeData }) {
       {running ? meta.running : data.runState === "error" ? `重试：${meta.label}` : meta.label}
     </button>
   </div>;
+}
+
+function CanvasNodeHeader({ id, kind, status }: { id: string; kind: CanvasNodeKind; status?: string }) {
+  const runtime = useContext(CanvasRuntimeContext);
+  const metadata = kindMeta[kind];
+  const Icon = metadata.icon;
+  return <header>
+    <span><i><Icon size={14} /></i>{metadata.label}</span>
+    <div className="infinite-node-head-actions">
+      <small>{status || "节点"}</small>
+      <button type="button" className="infinite-node-delete-button nodrag" onClick={(event) => { event.stopPropagation(); runtime?.deleteNode(id); }} aria-label="删除节点" title="删除节点"><Trash2 size={13} /></button>
+    </div>
+  </header>;
+}
+
+function useCanvasTextDraft(value: string, commit: (next: string) => void) {
+  const [draft, setDraft] = useState(value);
+  const composing = useRef(false);
+  const commitRef = useRef(commit);
+  commitRef.current = commit;
+
+  useEffect(() => {
+    if (!composing.current) setDraft(value);
+  }, [value]);
+
+  return {
+    draft,
+    inputProps: {
+      value: draft,
+      onPointerDown: (event: React.PointerEvent<HTMLTextAreaElement>) => event.stopPropagation(),
+      onKeyDown: (event: React.KeyboardEvent<HTMLTextAreaElement>) => event.stopPropagation(),
+      onCompositionStart: () => { composing.current = true; },
+      onCompositionEnd: (event: React.CompositionEvent<HTMLTextAreaElement>) => {
+        composing.current = false;
+        const next = event.currentTarget.value;
+        setDraft(next);
+        commitRef.current(next);
+      },
+      onChange: (event: React.ChangeEvent<HTMLTextAreaElement>) => {
+        const next = event.target.value;
+        setDraft(next);
+        const nativeEvent = event.nativeEvent as InputEvent;
+        if (!composing.current && !nativeEvent.isComposing) commitRef.current(next);
+      },
+      onBlur: (event: React.FocusEvent<HTMLTextAreaElement>) => {
+        composing.current = false;
+        const next = event.currentTarget.value;
+        setDraft(next);
+        commitRef.current(next);
+      },
+    },
+  };
+}
+
+function TextCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
+  const { updateNodeData } = useReactFlow<CanvasNode, Edge>();
+  const metadata = kindMeta.text;
+  const text = useCanvasTextDraft(data.description, (description) => updateNodeData(id, { description }));
+  return <article className={`infinite-node infinite-text-input-node ${selected ? "selected" : ""}`} style={{ "--node-accent": metadata.color } as React.CSSProperties}>
+    <Handle type="target" position={Position.Left} className="infinite-handle" />
+    <CanvasNodeHeader id={id} kind="text" status={text.draft.trim() ? `${text.draft.length} 字` : "等待输入"} />
+    <label className="infinite-node-prompt-field nodrag nowheel">
+      <span>文本内容</span>
+      <textarea className="nodrag nowheel" {...text.inputProps} maxLength={16000} placeholder="输入图片或视频提示词……" />
+      <small>{text.draft.length} / 16000</small>
+    </label>
+    <Handle type="source" position={Position.Right} className="infinite-handle" />
+  </article>;
+}
+
+function ImageGeneratorCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
+  const runtime = useContext(CanvasRuntimeContext);
+  const { updateNodeData } = useReactFlow<CanvasNode, Edge>();
+  const metadata = kindMeta.imageGenerator;
+  const running = data.runState === "running";
+  const model = nodeString(data, "imageModel", runtime?.imageModel || defaultSubjectImageModels[0]);
+  const modelOptions = runtime?.imageModelOptions.length ? runtime.imageModelOptions : defaultSubjectImageModels;
+  const ratio = nodeString(data, "imageAspectRatio", "16:9");
+  const resolution = nodeString(data, "imageResolution", "2K");
+  const prompt = useCanvasTextDraft(data.description, (description) => updateNodeData(id, { description }));
+  return <article className={`infinite-node infinite-generator-node ${selected ? "selected" : ""}`} style={{ "--node-accent": metadata.color } as React.CSSProperties}>
+    <Handle type="target" position={Position.Left} className="infinite-handle" />
+    <CanvasNodeHeader id={id} kind="imageGenerator" status={running ? "生成中" : data.runState === "success" ? "已完成" : data.runState === "error" ? "需重试" : "就绪"} />
+    <div className="infinite-generator-body nodrag nowheel">
+      <label className="infinite-node-prompt-field">
+        <span>提示词 <small>可选覆盖</small></span>
+        <textarea className="nodrag nowheel" {...prompt.inputProps} maxLength={12000} placeholder="留空时读取上游文本节点" />
+      </label>
+      <label className="infinite-generator-field"><span>图片模型</span><CanvasSelect value={model} ariaLabel="图片生成模型" options={modelOptions.map((item) => ({ value: item, label: item }))} onChange={(value) => updateNodeData(id, { imageModel: value })} /></label>
+      <div className="infinite-generator-grid">
+        <label className="infinite-generator-field"><span>画面比例</span><CanvasSelect value={ratio} ariaLabel="图片比例" options={canvasAspectRatioOptions} onChange={(value) => updateNodeData(id, { imageAspectRatio: value })} /></label>
+        <label className="infinite-generator-field"><span>分辨率</span><CanvasSelect value={resolution} ariaLabel="图片分辨率" options={["2K", "4K"].map((item) => ({ value: item, label: item }))} onChange={(value) => updateNodeData(id, { imageResolution: value })} /></label>
+      </div>
+      <button type="button" className="infinite-generator-submit" disabled={running} onClick={() => runtime?.generateCanvasImage(id)}>{running ? <LoaderCircle className="spin" size={15} /> : <WandSparkles size={15} />}{running ? "正在生成图片" : data.runState === "error" ? "重试生成图片" : data.runState === "success" ? "重新生成图片" : "生成图片"}</button>
+    </div>
+    <Handle type="source" position={Position.Right} className="infinite-handle" />
+  </article>;
+}
+
+function VideoGeneratorCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
+  const runtime = useContext(CanvasRuntimeContext);
+  const { updateNodeData } = useReactFlow<CanvasNode, Edge>();
+  const metadata = kindMeta.videoGenerator;
+  const running = data.runState === "running";
+  const savedModel = nodeString(data, "videoModel", runtime?.videoModel ?? defaultVideoModels[0]) as VideoSettings["model"];
+  const model = defaultVideoModels.includes(savedModel) ? savedModel : runtime?.videoModel ?? defaultVideoModels[0];
+  const modelOptions = runtime?.videoModelOptions ?? defaultVideoModels;
+  const ratio = nodeString(data, "videoRatio", "16:9");
+  const savedDuration = numericChoice(data.videoDuration, 5);
+  const duration = String(canvasVideoDurationOptions.includes(savedDuration) ? savedDuration : 5);
+  const generateAudio = data.generateAudio !== false;
+  const referenceCount = typeof data.referenceCount === "number" ? data.referenceCount : 0;
+  const prompt = useCanvasTextDraft(data.description, (description) => updateNodeData(id, { description }));
+  return <article className={`infinite-node infinite-generator-node ${selected ? "selected" : ""}`} style={{ "--node-accent": metadata.color } as React.CSSProperties}>
+    <Handle type="target" position={Position.Left} className="infinite-handle" />
+    <CanvasNodeHeader id={id} kind="videoGenerator" status={running ? "生成中" : data.runState === "success" ? "已完成" : data.runState === "error" ? "需重试" : "就绪"} />
+    <div className="infinite-generator-body nodrag nowheel">
+      <label className="infinite-node-prompt-field">
+        <span>提示词 <small>可选覆盖</small></span>
+        <textarea className="nodrag nowheel" {...prompt.inputProps} maxLength={16000} placeholder="留空时读取上游文本节点" />
+      </label>
+      <label className="infinite-generator-field"><span>视频模型</span><CanvasSelect value={model} ariaLabel="视频生成模型" options={modelOptions.map((item) => ({ value: item, label: videoModelLabels[item] }))} onChange={(value) => updateNodeData(id, { videoModel: value })} /></label>
+      <div className="infinite-generator-grid">
+        <label className="infinite-generator-field"><span>画面比例</span><CanvasSelect value={ratio} ariaLabel="视频比例" options={canvasVideoRatioOptions} onChange={(value) => updateNodeData(id, { videoRatio: value })} /></label>
+        <label className="infinite-generator-field"><span>视频时长</span><CanvasSelect value={duration} ariaLabel="视频时长" options={canvasVideoDurationOptions.map((item) => ({ value: String(item), label: `${item} 秒` }))} onChange={(value) => updateNodeData(id, { videoDuration: value })} /></label>
+      </div>
+      <div className="infinite-generator-options">
+        <button type="button" role="switch" aria-checked={generateAudio} className={generateAudio ? "selected" : ""} onClick={() => updateNodeData(id, { generateAudio: !generateAudio })}><span />生成音频</button>
+        <small>{referenceCount ? `已读取 ${referenceCount} 张参考图` : "可连接图片输出作为参考"}</small>
+      </div>
+      <button type="button" className="infinite-generator-submit" disabled={running} onClick={() => runtime?.generateCanvasVideo(id)}>{running ? <LoaderCircle className="spin" size={15} /> : <Video size={15} />}{running ? nodeString(data, "statusMessage", "正在生成视频") : data.runState === "error" ? "重试生成视频" : data.runState === "success" ? "重新生成视频" : "生成视频"}</button>
+    </div>
+    <Handle type="source" position={Position.Right} className="infinite-handle" />
+  </article>;
 }
 
 function CreativeCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
@@ -533,6 +684,9 @@ function ShotCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
 
 function CanvasCardNode(props: NodeProps<CanvasNode>) {
   const runtime = useContext(CanvasRuntimeContext);
+  if (props.data.kind === "text") return <TextCanvasNode {...props} />;
+  if (props.data.kind === "imageGenerator") return <ImageGeneratorCanvasNode {...props} />;
+  if (props.data.kind === "videoGenerator") return <VideoGeneratorCanvasNode {...props} />;
   if (props.data.kind === "script" || props.data.kind === "shot") return <CreativeCanvasNode {...props} />;
   if (props.data.kind === "formattedScript") return <FormattedScriptCanvasNode {...props} />;
   if (props.data.kind === "episodes" && props.data.source === "generated") return <EpisodeCanvasNode {...props} />;
@@ -681,6 +835,36 @@ function findUpstreamNode(nodeId: string, nodes: CanvasNode[], edges: Edge[], pr
     for (const edge of edges) if (edge.target === currentId) queue.push(edge.source);
   }
   return null;
+}
+
+function findUpstreamNodes(nodeId: string, nodes: CanvasNode[], edges: Edge[], predicate: (node: CanvasNode) => boolean) {
+  const byId = new Map(nodes.map((node) => [node.id, node]));
+  const visited = new Set<string>();
+  const matches: CanvasNode[] = [];
+  const queue = edges.filter((edge) => edge.target === nodeId).map((edge) => edge.source);
+  while (queue.length) {
+    const currentId = queue.shift()!;
+    if (visited.has(currentId)) continue;
+    visited.add(currentId);
+    const current = byId.get(currentId);
+    if (!current) continue;
+    if (predicate(current)) matches.push(current);
+    for (const edge of edges) if (edge.target === currentId) queue.push(edge.source);
+  }
+  return matches;
+}
+
+async function canvasVideoReference(value: string) {
+  if (/^data:image\//i.test(value) || /^https?:\/\//i.test(value)) return value;
+  const response = await fetch(value);
+  if (!response.ok) throw new Error(`参考图读取失败（HTTP ${response.status}）`);
+  const blob = await response.blob();
+  return await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(new Error("参考图转换失败"));
+    reader.readAsDataURL(blob);
+  });
 }
 
 export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (message: string) => void; onBack: () => void }) {
@@ -849,7 +1033,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
     }
   }, [onToast, patchCanvasNode, refreshAssets, setNodes]);
 
-  const syncGeneratedNodes = useCallback((parentId: string, items: Array<Partial<CanvasNodeData> & { entityId: string; kind: CanvasNodeKind; label: string; description: string; projectId: string }>, generatedGroup = "default") => {
+  const syncGeneratedNodes = useCallback((parentId: string, items: Array<Partial<CanvasNodeData> & { entityId: string; kind: CanvasNodeKind; label: string; description: string; projectId?: string }>, generatedGroup = "default") => {
     const parent = nodesRef.current.find((node) => node.id === parentId);
     if (!parent) return;
     const snapshot = nodesRef.current;
@@ -864,8 +1048,8 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
       ? parent.position.x + 380 + Math.max(1, Math.ceil(episodeSubjectCount / branchRows)) * 318
       : parent.position.x + 380;
     const generated: CanvasNode[] = items.map((item, index) => {
-      const previous = existing.get(item.entityId);
-      const generatedPosition = generatedGroup === "shot-video"
+      const previous = existing.get(item.entityId) ?? (generatedGroup === "canvas-output" && items.length === 1 ? existingNodes[0] : undefined);
+      const generatedPosition = generatedGroup === "shot-video" || generatedGroup === "canvas-output"
         ? { x: parent.position.x + 340, y: parent.position.y }
         : isEpisodeFanOut
         ? { x: parent.position.x + 640 + Math.floor(index / episodeRows) * 380, y: parent.position.y + (index % episodeRows) * 328 }
@@ -888,6 +1072,101 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
     setNodes(nextNodes);
     setEdges(nextEdges);
   }, [setEdges, setNodes]);
+
+  const generateCanvasImage = useCallback(async (nodeId: string) => {
+    const node = nodesRef.current.find((item) => item.id === nodeId && item.data.kind === "imageGenerator");
+    if (!node || node.data.runState === "running") return;
+    const upstream = findUpstreamNode(nodeId, nodesRef.current, edgesRef.current, (item) => item.data.kind === "text" || item.data.kind === "prompt");
+    const prompt = node.data.description.trim() || upstream?.data.description.trim() || "";
+    if (!prompt) {
+      patchCanvasNode(nodeId, { runState: "error", statusMessage: "请连接包含内容的文本节点，或填写图片提示词" });
+      return;
+    }
+    patchCanvasNode(nodeId, { runState: "running", statusMessage: "正在生成图片" });
+    try {
+      const settings = imageSettings ?? await api.imageSettings();
+      if (!settings.configured) throw new Error("图片模型尚未配置，请先在模型设置中配置图片服务");
+      const model = nodeString(node.data, "imageModel", settings.model || defaultSubjectImageModels[0]);
+      const aspectRatio = nodeString(node.data, "imageAspectRatio", "16:9") as "1:1" | "16:9" | "9:16" | "3:2" | "2:3" | "4:3" | "3:4";
+      const resolution = nodeString(node.data, "imageResolution", "2K") as "2K" | "4K";
+      const result = await api.generateCanvasImage({ prompt, model, aspectRatio, resolution, watermark: false });
+      syncGeneratedNodes(nodeId, [{
+        entityId: result.id,
+        kind: "image",
+        label: "图片结果",
+        description: prompt,
+        meta: `${aspectRatio} · ${resolution} · ${model}`,
+        mediaUrl: result.imageUrl,
+        thumbnailUrl: result.imageUrl,
+        mediaType: "image",
+      }], "canvas-output");
+      patchCanvasNode(nodeId, { runState: "success", statusMessage: "图片已生成并加入资产库", imageModel: model, imageAspectRatio: aspectRatio, imageResolution: resolution });
+      await refreshAssets();
+      onToast("图片已生成并加入资产库");
+    } catch (error) {
+      const message = canvasError(error);
+      patchCanvasNode(nodeId, { runState: "error", statusMessage: message });
+      onToast(`图片生成失败：${message}`);
+    }
+  }, [imageSettings, onToast, patchCanvasNode, refreshAssets, syncGeneratedNodes]);
+
+  const generateCanvasVideo = useCallback(async (nodeId: string) => {
+    const node = nodesRef.current.find((item) => item.id === nodeId && item.data.kind === "videoGenerator");
+    if (!node || node.data.runState === "running") return;
+    const upstreamPrompt = findUpstreamNode(nodeId, nodesRef.current, edgesRef.current, (item) => item.data.kind === "text" || item.data.kind === "prompt");
+    const prompt = node.data.description.trim() || upstreamPrompt?.data.description.trim() || "";
+    if (!prompt) {
+      patchCanvasNode(nodeId, { runState: "error", statusMessage: "请连接包含内容的文本节点，或填写视频提示词" });
+      return;
+    }
+    const referenceUrls = Array.from(new Set(findUpstreamNodes(nodeId, nodesRef.current, edgesRef.current, (item) => item.data.mediaType === "image" || item.data.kind === "image")
+      .map((item) => typeof item.data.mediaUrl === "string" ? item.data.mediaUrl : typeof item.data.thumbnailUrl === "string" ? item.data.thumbnailUrl : "")
+      .filter(Boolean))).slice(0, 3);
+    patchCanvasNode(nodeId, { runState: "running", statusMessage: "正在提交视频任务", referenceCount: referenceUrls.length });
+    try {
+      const settings = videoSettings ?? await api.videoSettings();
+      if (!settings.configured) throw new Error("视频模型尚未配置，请先在模型设置中配置视频服务");
+      const savedModel = nodeString(node.data, "videoModel", settings.model || defaultVideoModels[0]) as VideoSettings["model"];
+      const model = defaultVideoModels.includes(savedModel) ? savedModel : settings.model;
+      const ratio = nodeString(node.data, "videoRatio", "16:9") as "16:9" | "9:16" | "1:1";
+      const savedDuration = numericChoice(node.data.videoDuration, 5);
+      const duration = canvasVideoDurationOptions.includes(savedDuration) ? savedDuration : 5;
+      const referenceImages = await Promise.all(referenceUrls.map(canvasVideoReference));
+      let result = await api.generateCanvasVideo({
+        prompt,
+        model,
+        ratio,
+        duration,
+        generateAudio: node.data.generateAudio !== false,
+        watermark: false,
+        ...(referenceImages.length ? { referenceImages } : {}),
+      });
+      for (let attempt = 0; result.status !== "completed" && attempt < 120; attempt += 1) {
+        if (result.status === "failed") throw new Error(result.errorMessage || "视频生成失败");
+        patchCanvasNode(nodeId, { statusMessage: `正在生成视频 ${result.progress}%` });
+        await delay(5000);
+        result = await api.canvasVideo(result.id);
+      }
+      if (result.status !== "completed" || !result.outputUrl) throw new Error(result.errorMessage || "视频生成等待超时，后台任务可能仍在继续");
+      syncGeneratedNodes(nodeId, [{
+        entityId: result.id,
+        kind: "video",
+        label: "视频结果",
+        description: prompt,
+        meta: `${ratio} · ${duration} 秒 · ${videoModelLabels[model]}`,
+        mediaUrl: result.outputUrl,
+        thumbnailUrl: null,
+        mediaType: "video",
+      }], "canvas-output");
+      patchCanvasNode(nodeId, { runState: "success", statusMessage: "视频已生成并加入资产库", videoModel: model, videoRatio: ratio, videoDuration: String(duration), referenceCount: referenceImages.length });
+      await refreshAssets();
+      onToast("视频已生成并加入资产库");
+    } catch (error) {
+      const message = canvasError(error);
+      patchCanvasNode(nodeId, { runState: "error", statusMessage: message });
+      onToast(`视频生成失败：${message}`);
+    }
+  }, [onToast, patchCanvasNode, refreshAssets, syncGeneratedNodes, videoSettings]);
 
   const addCanvasNode = useCallback((kind: CanvasNodeKind, input: Partial<CanvasNodeData> = {}, position?: { x: number; y: number }) => {
     const metadata = kindMeta[kind];
@@ -1418,7 +1697,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
     const episodeStartColumn = 2;
     const afterEpisodes = episodeStartColumn + episodeColumns;
     const columns: Record<CanvasNodeKind, number> = {
-      note: 0, text: 0, prompt: 0, script: 0, formattedScript: 1, episodes: episodeStartColumn,
+      note: 0, text: 0, prompt: 0, script: 0, imageGenerator: 1, videoGenerator: 1, formattedScript: 1, episodes: episodeStartColumn,
       subjects: afterEpisodes, character: afterEpisodes + 1, scene: afterEpisodes + 1, prop: afterEpisodes + 1,
       image: afterEpisodes + 2, audio: afterEpisodes + 2, media: afterEpisodes + 2,
       shot: afterEpisodes + 3, shotItem: afterEpisodes + 4, video: afterEpisodes + 5, merge: afterEpisodes + 6,
@@ -1523,7 +1802,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
 
     <section className="infinite-workbench">
       <div ref={canvasRef} className="infinite-flow-shell" onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }} onDrop={handleDrop}>
-        <CanvasRuntimeContext.Provider value={{ runNode: (nodeId) => void runNode(nodeId), runFormattedEpisodes, runEpisodeSubjects, runEpisodeShots: openEpisodeShotPrompt, generateSubjectImage: (nodeId) => void generateSubjectImage(nodeId), generateShotVideo: (nodeId) => void generateShotVideo(nodeId), deleteNode, imageModel, imageModelOptions, videoModel: videoSettings?.model ?? defaultVideoModels[0], videoModelOptions: defaultVideoModels }}>
+        <CanvasRuntimeContext.Provider value={{ runNode: (nodeId) => void runNode(nodeId), runFormattedEpisodes, runEpisodeSubjects, runEpisodeShots: openEpisodeShotPrompt, generateSubjectImage: (nodeId) => void generateSubjectImage(nodeId), generateShotVideo: (nodeId) => void generateShotVideo(nodeId), generateCanvasImage: (nodeId) => void generateCanvasImage(nodeId), generateCanvasVideo: (nodeId) => void generateCanvasVideo(nodeId), deleteNode, imageModel, imageModelOptions, videoModel: videoSettings?.model ?? defaultVideoModels[0], videoModelOptions: defaultVideoModels }}>
         <ReactFlow<CanvasNode, Edge>
           nodes={nodes}
           edges={edges}
@@ -1535,7 +1814,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
           onConnect={onConnect}
           onSelectionChange={({ nodes: selected }) => {
             const node = selected[0];
-            setSelectedId(node && node.data.kind !== "script" && node.data.kind !== "shot" ? node.id : null);
+            setSelectedId(node && !["script", "shot", "text", "imageGenerator", "videoGenerator"].includes(node.data.kind) ? node.id : null);
           }}
           onPaneClick={clearSelectedNode}
           onNodesDelete={(deleted) => removeNodes(deleted.map((node) => node.id))}

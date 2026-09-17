@@ -156,6 +156,7 @@ export interface SubjectImageInput {
 
 export type StudioAssetType = "character" | "scene" | "prop";
 export type StudioVideoType = "reference-video" | "keyframe-video";
+export type CanvasVideoType = "canvas-video";
 export type HomeToolType = StudioAssetType | StudioVideoType | "voice-clone" | "text-to-speech" | "prompt-workshop" | "image-upscale" | "digital-human" | "infinite-canvas";
 
 export interface CharacterImageResult {
@@ -181,7 +182,7 @@ export interface StudioVideoInput {
 
 export interface StudioVideoResult {
   id: string;
-  videoType: StudioVideoType;
+  videoType: StudioVideoType | CanvasVideoType;
   status: "queued" | "processing" | "completed" | "failed";
   progress: number;
   outputUrl: string | null;
