@@ -84,6 +84,23 @@ function isTimeoutError(error: unknown) {
   return Boolean(error && typeof error === "object" && (error as { name?: string }).name === "TimeoutError");
 }
 
+export function deepSeekHttpErrorMessage(status: number, responseBody: string) {
+  const normalized = responseBody.toLocaleLowerCase();
+  if (status === 402 || /insufficient[ _-]*(balance|credit|quota)|余额不足|额度不足/.test(normalized)) {
+    return "DeepSeek 账户余额不足，请充值后重试或在模型设置中更换可用的 API Key";
+  }
+  if (status === 401 || status === 403) {
+    return "DeepSeek API Key 无效或无权访问当前模型，请检查模型设置";
+  }
+  if (status === 429) {
+    return "DeepSeek 请求过于频繁，请稍后重试";
+  }
+  if (status >= 500) {
+    return "DeepSeek 服务暂时不可用，请稍后重试";
+  }
+  return `DeepSeek 请求失败（HTTP ${status}），请检查模型名称和 API 地址`;
+}
+
 function number(value: unknown, fallback: number) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
@@ -155,7 +172,10 @@ export class DeepSeekService {
       if (isTimeoutError(error)) throw new Error(`DeepSeek 请求超过 ${Math.round(timeoutMs / 60000)} 分钟仍未完成，请稍后重试或缩短剧本内容`);
       throw error;
     }
-    if (!response.ok) throw new Error(`DeepSeek API ${response.status}: ${(await response.text()).slice(0, 300)}`);
+    if (!response.ok) {
+      const responseBody = (await response.text()).slice(0, 2_000);
+      throw new Error(deepSeekHttpErrorMessage(response.status, responseBody));
+    }
     const payload = await response.json() as {
       choices?: Array<{
         finish_reason?: string | null;
@@ -388,19 +408,17 @@ visualPrompt 是“主体设定提示词”，只用于生成该主体的完整�
 
   async extractShots(formattedText: string, episodes: Array<{ id: string; episodeNumber: number }>, subjects: Subject[], style: string, customSystemPrompt?: string, targetDurationSeconds = 60): Promise<Array<Omit<Shot, "id" | "projectId" | "createdAt" | "updatedAt">>> {
     const episodeDuration = Math.min(720, Math.max(15, Math.round(targetDurationSeconds)));
-    const recommendedShotCount = Math.min(15, Math.max(8, Math.round(episodeDuration / 6)));
-    const preferredMinShotCount = 8;
-    const preferredMaxShotCount = 15;
-    const maxShotCount = 20;
     const shotCountProtocol = `镜头数量与时长规则：
-1. 每集目标总时长约 ${episodeDuration} 秒，建议 ${recommendedShotCount} 个镜头；常规应控制在 ${preferredMinShotCount}-${preferredMaxShotCount} 个，剧情确实复杂时可以增加，但绝对不得超过 ${maxShotCount} 个。原文内容很短且无法支撑 8 个镜头时可以少于 8 个，禁止扩写剧情凑数量。
+1. 每集目标总时长约 ${episodeDuration} 秒，镜头数量不设上限或下限，必须根据本集剧情、场景切换、人物动作、表情反应和对白节奏自然决定。优先把内容拆解得具体、完整、可拍摄，不得为了减少镜头数量而合并或省略关键动作、反应、对白、场景信息和叙事转折。
 2. 单镜头推荐 3-12 秒，各镜头 durationSeconds 总和应尽量接近 ${episodeDuration} 秒。
    - 3-4 秒：短反应、简单动作、无对白或极短对白。
    - 5-7 秒：一般动作、普通对话和常规建立镜头。
    - 8-12 秒：较长对白、复杂调度或需要充分展示环境的镜头。
    不得为了省事把所有镜头统一写成 6 秒，必须逐镜头估算。
-3. 不要把每句话、每个表情或每个连续动作各拆成一个镜头。相同地点、相同时间且机位可连续表达的短对白与动作应合并到同一个镜头；仅在换场、叙事重点变化或确有剪辑必要时切镜。
-4. 在不遗漏关键情节与关键对白的前提下，以精炼、可生成、可剪辑为优先。`;
+3. 每个镜头必须写清可见主体、起始状态、具体动作、人物反应、对白、景别机位、运镜、光线以及结束状态；较长动作或对白应按自然节奏拆成多个连续镜头。
+4. 相同地点和时间下也要根据叙事重点、人物反应、视线变化、动作阶段和对白节奏合理切镜。不得机械地一句一镜，但也不得用一个笼统镜头跳过多个关键视觉事件。
+5. 生成后逐场核对原剧本，确保所有关键情节、动作、对白、人物反应、场景变化和结尾钩子都有对应镜头。
+6. visualPrompt 只写当前镜头，控制在约 900 个中文字符以内；不要复制上一镜头内容、整段剧本或无关的负面词。`;
     const builtInSystemPrompt = `你是影视分镜导演。请基于剧本、分集和主体资产生成可直接用于视频生成的镜头清单。必须覆盖原文关键剧情和关键对白；每个镜头表达一个完整、可连续拍摄的视觉段落。输出 JSON: {"shots":[{"episodeNumber":1,"shotOrder":1,"title":"","location":"","action":"","dialogue":"","visualPrompt":"","camera":"","durationSeconds":6,"status":"ready"}]}。shotOrder 在每集内从 1 连续编号。
 
 ${shotCountProtocol}
@@ -411,17 +429,24 @@ ${shotCountProtocol}
 3. 不要为了填满镜头时长增加台词。较长原文对白应按自然语义拆到连续镜头中，每个镜头的台词量必须能以自然或舒缓语速在 durationSeconds 内说完。
 
 连续性规则（这是分镜提示词的硬约束，不是可选建议）：
-1. 必须按每集 shotOrder 从前到后规划镜头。除每集第一个镜头外，每个 visualPrompt 都必须明确写出“承接上一镜头结束状态”：上一镜头最后一帧的人物姿势、位置、视线、服装、道具位置、空间方位、光线、色调、运动方向和动作进度；然后写“本镜头首帧”：从这些状态原地开始的当前构图；最后写“本镜头发展”：只在连续时间中完成当前动作和结束状态。不得把后续镜头写成重新入场或独立重启。
-2. visualPrompt 要包含主体、环境、光线、情绪、本镜头开场状态和结束状态；相邻镜头的“结束状态 → 开场状态”必须能直接衔接。每个镜头都要有明确的结束状态，供下一个镜头继承。
-3. 同一场景的相邻镜头必须保持人物外观与服装、道具、空间方位、光线、天气、色调和运动方向一致，除非原文明确发生变化。
-4. camera 写清景别、机位和运镜，避免相邻镜头无理由跳轴；若必须换景别或机位，要把变化放在剪辑点并保持人物/道具/视线/光线的空间连续，不要在镜头内部旋转、变形或无理由转景。
-5. 不得臆造剧本没有的剧情、对白或心理活动。
-6. 相邻镜头更换景别或机位时，默认在剪辑点直接切镜；每个镜头的第一帧就是本镜头目标构图，但该第一帧必须继承上一镜头结束时的主体状态，禁止把从上一构图移动、旋转或变形成当前构图的过程写进 visualPrompt。
-7. 只有同一场景、同一机位下的连续动作才可直接使用上一镜头尾帧；如果更换时间或地点，剪辑点发生在视频开始前，第一帧直接进入新场景，但仍继承可见人物外观、服装、道具、色彩和叙事动作进度，不要默认添加淡入淡出、叠化、甩镜或遮挡转场。
-8. 以第一镜头建立整部影片的基础色彩方案。后续镜头默认继承同一色温、白平衡、明暗关系、曝光倾向、饱和度和统一调色风格；即使切到普通新地点，也不能无理由在暖色调与冷色调之间跳变。
-9. 只有原文明确发生时间、天气变化，进入本身具有特殊光色的地点，或明确出现闪回、梦境等视觉动机时，才允许改变基础色彩方案；变化后的连续镜头必须稳定继承新的色彩基线，直至原文再次明确变化。
-10. 每个 visualPrompt 都必须重复写明该镜头所继承的色温、主光方向、曝光或明暗关系、饱和度以及统一调色关键词。同一连续场景必须复用一致措辞，禁止在相邻镜头中无依据地交替使用“暖色调”“冷色调”等冲突描述。
-11. 生成前自检每集相邻镜头：如果当前镜头开场状态无法从上一镜头结束状态自然推出，必须先修改当前镜头的 action、camera 和 visualPrompt，再输出 JSON；不能仅依赖剪辑或后期弥补不连续。
+1. 必须按每集 shotOrder 从前到后规划镜头。上一镜头生成的视频尾帧会作为当前镜头的首帧输入；不要在当前 visualPrompt 中复述上一镜头的标题、动作或完整结束状态。
+2. 当前 visualPrompt 只描述当前镜头：人物/物品分别站在哪里或位于哪里、当前可见状态、当前唯一动作、表情反应、对白、摄影机、光线和当前镜头结束时的状态。
+3. 当前镜头第 0 秒必须直接接住输入尾帧，不得重新入场、重复上一镜头已完成的动作、重置空间或改变人物/道具方位。若输入尾帧不可用，才在首帧栏目中写清当前镜头的起始位置。
+4. camera 写清景别、机位、朝向和运镜；同一连续动作保持轴线、视线、人物外观、服装、道具、空间方位、光线和色调一致。
+5. 相邻镜头换景别、机位、时间或地点时，视为视频开始前已经完成剪辑，当前镜头直接从目标构图开始，不在镜头内部制作转场。
+6. 不得臆造剧本没有的剧情、对白或心理活动；visualPrompt 控制在约 900 个中文字符以内，避免重复背景、整段剧本和泛化负面词。
+7. visualPrompt 必须严格使用以下栏目和顺序，每个栏目单独换行：
+**当前场景**：具体地点、时间、内外景、固定空间关系
+**当前动作**：人物/物品的当前位置、朝向、正在进行的唯一动作和可见反应
+**当前摄影**：景别、机位、朝向、焦点和运镜
+**视觉风格**：全局风格、光线、色温、饱和度和统一调色
+**本镜头引用主体资产**：用「」逐项列出当前镜头真实可见的角色、场景和道具；非动作主体另写“背景保留”
+**本镜头首帧**：只写当前镜头第 0 秒的可见构图；连续镜头注明“以上一镜头尾帧为首帧”，不要描述上一镜头
+**本镜头发展**：按时间顺序写当前动作、人物反应和摄影机运动
+**本镜头尾帧**：写清当前镜头最后一帧人物/物品的位置、姿势、视线、道具状态、空间方位和光线；这将作为下一镜头首帧
+**人物对白 / 内心 OS**：只放原文对白；没有则写“无。禁止添加旁白或解说。”
+**禁止事项**：禁止重新入场、重复动作、重置空间、改变方位、无理由转景、片内转场和改变锁定的光线调色
+8. 栏目正文必须具体，必须出现可见的位置和动作，不得使用“保持一致”“自然衔接”等空泛表述代替画面细节。
 
 主体资产引用规则：
 1. 每个镜头必须从 subjects 中识别该镜头实际可见的角色、场景和道具，并在 visualPrompt 中逐字写出对应主体资产的完整名称，随后沿用该主体的 description 和 visualPrompt 中的稳定特征。
@@ -437,6 +462,18 @@ ${shotCountProtocol}
 2. shotOrder 在每集内必须从 1 连续编号，durationSeconds 必须为 3 至 12 秒。
 3. 必须以 formattedScreenplay 为剧情依据。每个镜头必须识别实际可见的 subjects，并在 visualPrompt 中逐字引用对应主体资产的完整名称及其稳定特征；已有 imageUrl 的主体不得重新设计。
 4. dialogue 只能使用原文真实对白或明确的 OS，不得新增台词、旁白或剧情。
+5. visualPrompt 只描述当前镜头，控制在约 900 个中文字符以内；上一镜头尾帧会作为当前镜头首帧，不要复述上一镜头内容。必须逐行使用以下十个 Markdown 栏目，顺序不得变化，也不得合并为一段；每个标题后使用中文全角冒号，JSON 字符串内用 \\n 表示栏目换行：
+**当前场景**：具体地点与稳定空间信息
+**当前动作**：当前人物/物品的位置、朝向、唯一动作和可见反应
+**当前摄影**：景别、机位、朝向和运镜
+**视觉风格**：全局风格、饱和度、光线与统一调色
+**本镜头引用主体资产**：用「」逐项列出可见主体，非动作主体另写“背景保留”
+**本镜头首帧**：第 0 秒可见构图；连续镜头直接使用上一镜头尾帧，不复述上一镜头
+**本镜头发展**：按时间顺序写动作、反应和摄影机运动
+**本镜头尾帧**：最后一帧可供下一镜头继承的状态
+**人物对白 / 内心 OS**：只放原文对白，没有则写“无。禁止添加旁白或解说。”
+**禁止事项**：逐行列出禁止重新入场、重复动作、重置空间、改变方位、改变光线调色和片内转场等约束
+6. 每个镜头必须具体写出当前人物/物品位置、动作、摄影和尾帧状态；不得用“保持一致”“自然衔接”等空泛表述替代可见状态。
 
 ${shotCountProtocol}`
       : builtInSystemPrompt;
@@ -465,12 +502,6 @@ ${shotCountProtocol}`
       const camera = text(row.camera, "中景");
       return { episodeId: episodeIds.get(episodeNumber)!, episodeNumber, shotOrder, title: text(row.title, `镜头 ${index + 1}`), location: text(row.location, "未设定"), action, dialogue, visualPrompt: text(row.visualPrompt, `${style}，${action}`), camera, durationSeconds: recommendedShotDuration(action, dialogue, camera, number(row.durationSeconds, 6)), status: "ready" as const };
     });
-    for (const episode of episodes) {
-      const episodeShotCount = normalized.filter((shot) => shot.episodeNumber === episode.episodeNumber).length;
-      if (episodeShotCount > maxShotCount) {
-        throw new Error(`第 ${episode.episodeNumber} 集生成了 ${episodeShotCount} 个镜头，超过本集 ${episodeDuration} 秒时长的上限 ${maxShotCount} 个，请重新生成`);
-      }
-    }
     const compact = (value: string) => value.toLocaleLowerCase().replace(/[\s·•丨|｜_，,。；;：:、/\\()（）【】\[\]《》"']/g, "");
     const locationSubjects = subjects.filter((subject) => subject.role === "location");
     const shotsWithSubjectReferences = normalized.map((shot) => {
@@ -491,21 +522,6 @@ ${shotCountProtocol}`
       const styleLine = `视觉风格：${style}。`;
       return { ...shot, visualPrompt: [styleLine, referenceLine, shot.visualPrompt].filter(Boolean).join("\n") };
     });
-    return shotsWithSubjectReferences.map((shot, index) => {
-      const previousShot = shotsWithSubjectReferences
-        .slice(0, index)
-        .filter((candidate) => candidate.episodeNumber === shot.episodeNumber)
-        .at(-1);
-      const previousPromptTail = previousShot?.visualPrompt.trim().slice(-1200);
-      const continuityAnchor = previousShot
-        ? [
-          "连续性锚点（必须执行，不是独立镜头）：",
-          `上一镜头《${previousShot.title}》结束于：${previousShot.location}；结束动作：${previousShot.action}；摄影机：${previousShot.camera}。`,
-          previousPromptTail ? `上一镜头画面提示词的末尾状态：${previousPromptTail}` : "上一镜头画面提示词未提供末尾状态。",
-          "本镜头第 0 秒必须从上述结束状态自然开始，继承人物/道具位置、姿势、视线、空间方位、光线、色温、曝光、饱和度和运动方向；先保持状态，再逐步完成当前动作，最后写清本镜头结束状态供下一个镜头继续。禁止重新入场、重置空间、无理由转景或在片内制作转场。",
-        ].join("\n")
-        : "连续性锚点（本集首镜头）：建立人物、道具、空间方位、摄影机、光线、色温、曝光、饱和度和运动方向的基线，并写清本镜头结束状态，供下一镜头从此处继续。";
-      return { ...shot, visualPrompt: `${continuityAnchor}\n当前镜头画面：${shot.visualPrompt}` };
-    });
+    return shotsWithSubjectReferences;
   }
 }

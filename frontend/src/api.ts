@@ -1,9 +1,10 @@
-import type { AssetLibraryData, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechInput, TextToSpeechList, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneInput, VoiceCloneList, VoiceCloneResult } from "./types";
+import type { AssetLibraryData, AuthUser, CanvasProjectDetail, CanvasProjectSummary, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, ProjectDetail, RenderJob, Shot, ShotContinuityPreview, StudioAssetType, StudioVideoInput, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechInput, TextToSpeechList, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoResolution, VideoSettings, VideoSpeechRate, VoiceCloneInput, VoiceCloneList, VoiceCloneResult } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const isFormData = options?.body instanceof FormData;
   const response = await fetch(url, {
     headers: { ...(!isFormData ? { "Content-Type": "application/json" } : {}), ...options?.headers },
+    credentials: "include",
     ...options,
   });
   let payload: any = null;
@@ -24,6 +25,19 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  session: async () => (await request<{ data: AuthUser }>("/api/auth/session")).data,
+  login: async (input: { account: string; password: string; remember: boolean }) => (await request<{ data: AuthUser }>("/api/auth/login", { method: "POST", body: JSON.stringify(input) })).data,
+  register: async (input: { account: string; password: string; remember: boolean }) => (await request<{ data: AuthUser }>("/api/auth/register", { method: "POST", body: JSON.stringify(input) })).data,
+  logout: async () => { await request<void>("/api/auth/logout", { method: "POST", body: "{}" }); },
+  updateProfile: async (input: { displayName: string; email: string; avatarUrl: string }) => (await request<{ data: AuthUser }>("/api/auth/profile", { method: "PATCH", body: JSON.stringify(input) })).data,
+  uploadAvatar: async (file: File) => { const body = new FormData(); body.append("file", file); return (await request<{ data: AuthUser }>("/api/auth/avatar", { method: "POST", body })).data; },
+  changePassword: async (input: { currentPassword: string; newPassword: string }) => (await request<{ data: AuthUser }>("/api/auth/change-password", { method: "POST", body: JSON.stringify(input) })).data,
+  logoutAll: async () => { await request<void>("/api/auth/logout-all", { method: "POST", body: "{}" }); },
+  canvases: async () => (await request<{ data: CanvasProjectSummary[] }>("/api/canvases")).data,
+  canvas: async (id: string) => (await request<{ data: CanvasProjectDetail }>(`/api/canvases/${id}`)).data,
+  createCanvas: async (input: { name: string; nodes: unknown[]; edges: unknown[]; sourceId?: string }) => (await request<{ data: CanvasProjectDetail }>("/api/canvases", { method: "POST", body: JSON.stringify(input) })).data,
+  updateCanvas: async (id: string, input: Partial<{ name: string; nodes: unknown[]; edges: unknown[] }>) => (await request<{ data: CanvasProjectDetail }>(`/api/canvases/${id}`, { method: "PATCH", body: JSON.stringify(input) })).data,
+  deleteCanvas: async (id: string) => { await request<void>(`/api/canvases/${id}`, { method: "DELETE" }); },
   llmSettings: async () => (await request<{ data: LlmSettings }>("/api/settings/llm")).data,
   saveLlmSettings: async (input: { apiKey?: string; model?: string; apiBase?: string }) => (await request<{ data: LlmSettings }>("/api/settings/llm", { method: "PUT", body: JSON.stringify(input) })).data,
   imageSettings: async () => (await request<{ data: ImageSettings }>("/api/settings/image")).data,
@@ -68,12 +82,16 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     })).data,
-  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"]; duration?: number; prompt?: string; audioMode?: VideoAudioMode; speechRate?: VideoSpeechRate; bgm?: boolean; continuityMode?: VideoContinuityMode } = {}) =>
+  render: async (id: string, input: { shotId?: string; referenceSubjectIds?: string[]; model?: VideoSettings["model"]; resolution?: VideoResolution; duration?: number; watermark?: boolean; prompt?: string; promptMode?: "structured" | "complete"; audioMode?: VideoAudioMode; speechRate?: VideoSpeechRate; bgm?: boolean; continuityMode?: VideoContinuityMode } = {}) =>
     (await request<{ data: RenderJob }>(`/api/projects/${id}/render`, { method: "POST", body: JSON.stringify(input) })).data,
   videoMerges: async (id: string) => (await request<{ data: VideoMerge[] }>(`/api/projects/${id}/video-merges`)).data,
   mergeVideos: async (id: string, shotIds: string[]) => (await request<{ data: VideoMerge }>(`/api/projects/${id}/video-merges`, { method: "POST", body: JSON.stringify({ shotIds }) })).data,
   updateShot: async (projectId: string, shotId: string, input: { location: string; action: string; visualPrompt: string }) =>
     (await request<{ data: Shot }>(`/api/projects/${projectId}/shots/${shotId}`, { method: "PATCH", body: JSON.stringify(input) })).data,
+  deleteShot: async (projectId: string, shotId: string) =>
+    (await request<{ data: { shots: Shot[]; deletedCount: number } }>(`/api/projects/${projectId}/shots/${shotId}`, { method: "DELETE" })).data,
+  deleteShots: async (projectId: string) =>
+    (await request<{ data: { shots: Shot[]; deletedCount: number } }>(`/api/projects/${projectId}/shots`, { method: "DELETE" })).data,
   shotContinuityPreview: async (projectId: string, shotId: string) =>
     (await request<{ data: ShotContinuityPreview }>(`/api/projects/${projectId}/shots/${shotId}/continuity-preview`)).data,
   pipeline: async (id: string) => (await request<{ data: PipelineData }>(`/api/projects/${id}/pipeline`)).data,

@@ -11,7 +11,7 @@
 - 将格式化后的完整剧本拆分为单集内容。
 - 按集提取角色、场景和物品，重复主体会在项目内复用。
 - 为主体生成角色四视图、场景三段式设定图或物品四视图，并自动加入资产库。
-- 按集生成分镜；通常每集 8–15 个镜头，最多 20 个镜头。
+- 按集生成详细分镜；镜头数量根据剧情、动作、对白和场景复杂度自动决定，不设固定上限。
 - 分镜会绑定本集主体及其参考图，并根据对白、动作和镜头复杂度推荐 3–12 秒的时长。
 - 每个分镜可独立选择视频模型并生成视频。
 - 支持使用上一镜头尾帧延续动作，也可明确切镜或切换场景。
@@ -21,6 +21,8 @@
 ![无限画布完整工作流](./docs/images/infinite-canvas-workflow.png)
 
 无限画布使用节点和连线组织生产流程，支持：
+- 账号隔离的服务端持久化，画布不再以浏览器存储作为数据源。
+- 新用户首次进入时自动将当前浏览器中的旧画布迁移到该账号。
 - 剧本输入与剧本格式化节点。
 - 单集剧本节点。
 - 角色、场景、物品等主体节点。
@@ -148,6 +150,22 @@ npm run dev
 
 ## 数据库
 
+账号、登录会话、项目和无限画布分别保存在 `users`、`user_sessions`、`projects`、`canvas_projects` 表中。登录使用服务端异步 scrypt 密码哈希和 HttpOnly Cookie。项目、画布、渲染任务、独立工具资产及数字人会话都从登录会话确定用户，客户端不能传入用户编号访问其他账号的数据。
+
+本地开发时，第一个注册账号会成为管理员。生产环境不会把公开注册用户提升为管理员，首次启动前必须通过服务端环境变量创建初始管理员；管理员创建成功后应从运行环境中移除明文的 `ADMIN_BOOTSTRAP_PASSWORD`。只有管理员可以修改模型服务配置：
+
+```env
+NODE_ENV=production
+ADMIN_BOOTSTRAP_ACCOUNT=admin
+ADMIN_BOOTSTRAP_PASSWORD=replace_with_at_least_12_characters
+```
+
+若升级前已经存在 `user_id` 为空的历史项目，在配置中显式设置 `LEGACY_OWNER_ACCOUNT`，该管理员登录后才会接管历史数据：
+
+```env
+LEGACY_OWNER_ACCOUNT=your_admin_account
+```
+
 ### SQLite（默认）
 
 本地开发无需额外安装数据库：
@@ -172,7 +190,7 @@ docker compose up -d mysql
 DATABASE_URL=mysql://script_master:script_master@localhost:3306/script_master
 ```
 
-首次启动时会自动执行 `backend/sql/mysql-init.sql`。生产环境请更换 `docker-compose.yml` 中的默认账号和密码。
+后端首次启动时会自动创建或补齐所需表；`backend/sql/mysql-init.sql` 也可用于手动初始化。生产环境请更换 `docker-compose.yml` 中的默认账号和密码。
 
 ## 服务配置
 
@@ -183,9 +201,15 @@ DATABASE_URL=mysql://script_master:script_master@localhost:3306/script_master
 ```env
 PORT=8787
 CLIENT_ORIGIN=http://localhost:5173
+TRUST_PROXY=false
 DATABASE_URL=sqlite://./data/script-master.db
+MEDIA_SIGNING_SECRET=replace_with_at_least_32_random_bytes
 LOCAL_FALLBACK=false
 ```
+
+`MEDIA_SIGNING_SECRET` 用于生成第三方视频平台读取参考媒体时所需的短时签名地址。生产环境必须使用独立随机值，并在所有 API 实例中保持一致。
+
+`CLIENT_ORIGIN` 是允许携带登录 Cookie 调用 API 的前端来源；多个来源用英文逗号分隔。只有后端确实位于可信反向代理之后时才将 `TRUST_PROXY` 设为 `true`，否则登录限流会忽略客户端伪造的转发地址。
 
 `LOCAL_FALLBACK=true` 仅用于离线界面演示。正式生产流程应保持为 `false`，让缺失配置或模型错误直接暴露出来。
 
@@ -228,6 +252,9 @@ VIDEO_API_BASE=https://ark.cn-beijing.volces.com/api/v3
 | Seedance 2.0 Mini | `doubao-seedance-2-0-mini-260615` |
 | Seedance 2.0 | `doubao-seedance-2-0-260128` |
 | Seedance 2.0 Fast | `doubao-seedance-2-0-fast-260128` |
+| Seedance 2.5 | `doubao-seedance-2-5-260628` |
+
+视频分辨率可选择 `480P`、`720P` 或 `1080P`，未指定时默认使用 `720P`。镜头推荐时长会在提交前自动对齐到平台支持的 `4 / 5 / 6 / 8 / 10 / 12` 秒档位。
 
 当视频平台需要主动读取本地生成的参考图时，后端必须有公网可访问地址：
 
@@ -371,6 +398,12 @@ npm run start
 ### 系统与设置
 
 - `GET /api/health`：健康检查。
+- `GET /api/auth/session`：读取当前登录账号。
+- `POST /api/auth/register|login|logout`：注册、登录和退出。
+- `PATCH /api/auth/profile`：更新昵称、邮箱和头像地址。
+- `POST /api/auth/avatar`：上传账号头像。
+- `POST /api/auth/change-password`：修改密码并注销其他会话。
+- `POST /api/auth/logout-all`：注销账号全部会话。
 - `GET|PUT /api/settings/llm`：文本模型配置。
 - `GET|PUT /api/settings/image`：图片模型配置。
 - `GET|PUT /api/settings/video`：视频模型配置。
@@ -448,7 +481,11 @@ npm run start
 - 不要把服务端密钥写入前端代码或任何 `VITE_*` 环境变量。
 - OSS、数据库和第三方 API 账号应使用最小权限。
 - 声音克隆、数字人形象和真人素材必须取得合法授权。
-- 面向公网部署时，应在 API 前增加身份认证、访问频率限制、上传大小限制和 HTTPS。
+- 除健康检查、注册和登录外，业务 API 默认要求有效登录会话；登录失败次数由数据库统一限流。
+- 媒体文件会校验账号归属；提供给第三方平台的媒体地址使用短时 HMAC 签名。
+- 正式部署必须启用 HTTPS、设置准确的 `CLIENT_ORIGIN`，并让反向代理保留 Cookie、SSE 和 WebSocket 连接。
+- 多实例部署应共享 MySQL、生成文件存储和同一个 `MEDIA_SIGNING_SECRET`；本机磁盘只适合单实例部署。
+- 上线前应建立 MySQL 与 `backend/data/generated/` 的定期备份和恢复演练，并配置日志轮转、监控和告警。
 
 ## License
 

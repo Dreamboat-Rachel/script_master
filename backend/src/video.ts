@@ -1,14 +1,24 @@
 import { updateEnvFile } from "./llm.js";
 
 export type VideoProvider = "volcengine" | "aliyun" | "openai" | "custom";
-export type VideoModel = "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+export type VideoModel = "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128" | "doubao-seedance-2-5-260628";
+export type VideoResolution = "480p" | "720p" | "1080p";
 export type VideoTaskStatus = "queued" | "processing" | "completed" | "failed";
 
 export const videoModelOptions = [
   "doubao-seedance-2-0-mini-260615",
   "doubao-seedance-2-0-260128",
   "doubao-seedance-2-0-fast-260128",
+  "doubao-seedance-2-5-260628",
 ] as const;
+
+export const videoResolutionOptions = ["480p", "720p", "1080p"] as const;
+export const videoDurationOptions = [4, 5, 6, 8, 10, 12] as const;
+
+export function normalizeVideoDuration(value: number) {
+  const duration = Number.isFinite(value) ? Math.round(value) : 5;
+  return videoDurationOptions.reduce((closest, option) => Math.abs(option - duration) < Math.abs(closest - duration) ? option : closest);
+}
 
 const providerDefaults: Record<VideoProvider, string> = {
   volcengine: "https://ark.cn-beijing.volces.com/api/v3",
@@ -151,7 +161,7 @@ export class VideoGenerationService {
     return payload;
   }
 
-  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; firstFrameUrl?: string; lastFrameUrl?: string; ratio: string; duration: number; generateAudio?: boolean; watermark?: boolean }) {
+  async createTask(input: { prompt: string; model?: VideoModel; referenceImageUrls?: string[]; firstFrameUrl?: string; lastFrameUrl?: string; ratio: string; resolution?: VideoResolution; duration: number; generateAudio?: boolean; watermark?: boolean }) {
     const referenceItems = (input.referenceImageUrls ?? []).filter(Boolean).map((url) => ({ type: "image_url", image_url: { url }, role: "reference_image" }));
     const firstFrameItem = input.firstFrameUrl ? { type: "image_url", image_url: { url: input.firstFrameUrl }, role: "first_frame" } : undefined;
     const lastFrameItem = input.lastFrameUrl ? { type: "image_url", image_url: { url: input.lastFrameUrl }, role: "last_frame" } : undefined;
@@ -165,7 +175,8 @@ export class VideoGenerationService {
       ],
       generate_audio: input.generateAudio ?? true,
       ratio: input.ratio,
-      duration: Math.max(2, Math.min(12, Math.round(input.duration))),
+      resolution: input.resolution ?? "720p",
+      duration: normalizeVideoDuration(input.duration),
       watermark: input.watermark ?? false,
     });
     // Seedance rejects first/last-frame media mixed with reference media. A real

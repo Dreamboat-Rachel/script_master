@@ -7,10 +7,11 @@ import {
 } from "lucide-react";
 import { api } from "./api";
 import InfiniteCanvasStudio from "./InfiniteCanvasStudio";
-import type { AssetLibraryData, AssetLibraryItem, AssetLibraryKind, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, Episode, HomeToolType, ImageAspectRatio, ImageResolution, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, SpeechEmotion, SpeechLanguageBoost, StudioAssetType, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoSettings, VideoSpeechRate, VoiceCloneResult } from "./types";
+import type { AssetLibraryData, AssetLibraryItem, AssetLibraryKind, AuthUser, CharacterImageResult, DashboardData, DigitalHumanLiveSession, DigitalHumanServiceStatus, Episode, HomeToolType, ImageAspectRatio, ImageResolution, ImageSettings, ImageUpscaleResolution, ImageUpscaleResult, LlmSettings, PipelineData, Project, RenderJob, Shot, ShotContinuityPreview, SpeechEmotion, SpeechLanguageBoost, StudioAssetType, StudioVideoResult, StudioVideoType, Subject, SubjectImageInput, TextToSpeechResult, VideoAudioMode, VideoContinuityMode, VideoMerge, VideoResolution, VideoSettings, VideoSpeechRate, VoiceCloneResult } from "./types";
 
 type Stage = "setup" | "format" | "episodes" | "subjects" | "shots" | "render";
-type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject";
+type WorkingAction = "setup" | "generate" | "format" | "episodes" | "subjects" | "shots" | "render" | "delete" | "deleteSubject" | "deleteShot";
+type VideoPromptMode = "structured" | "complete";
 const stages: Array<{ id: Stage; label: string; description: string; icon: typeof FileText }> = [
   { id: "setup", label: "项目设定", description: "确定项目规格", icon: Settings2 },
   { id: "format", label: "剧本格式化", description: "整理标准剧本", icon: WandSparkles },
@@ -33,11 +34,8 @@ const sampleScript = `午夜车站
 林默打开信，车站深处传来列车启动的声音。`;
 const MAX_SCRIPT_LENGTH = 200000;
 const MIN_LOGLINE_LENGTH = 50;
-const LOGIN_SESSION_KEY = "script-master-local-session-v1";
-const USER_PROFILE_KEY = "script-master-local-profile-v1";
 const THEME_STORAGE_KEY = "script-master-theme-v1";
 const fallbackLoginCover = "https://images.unsplash.com/photo-1489599849927-2ee91cede3ba?auto=format&fit=crop&w=1800&q=88";
-const readSavedSession = () => window.localStorage.getItem(LOGIN_SESSION_KEY) ?? window.sessionStorage.getItem(LOGIN_SESSION_KEY) ?? "";
 type ThemeMode = "dark" | "light";
 const readSavedTheme = (): ThemeMode => {
   const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
@@ -45,17 +43,9 @@ const readSavedTheme = (): ThemeMode => {
   return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
 };
 type LocalUserProfile = { displayName: string; email: string; avatarDataUrl: string };
-type AccountDialogKind = "profile" | "avatar" | "email" | "logout";
+type AccountDialogKind = "profile" | "avatar" | "email" | "security" | "logout";
 const emptyUserProfile = (): LocalUserProfile => ({ displayName: "", email: "", avatarDataUrl: "" });
-const readSavedUserProfile = (account: string): LocalUserProfile => {
-  if (!account) return emptyUserProfile();
-  try {
-    const saved = JSON.parse(window.localStorage.getItem(`${USER_PROFILE_KEY}:${account}`) ?? "null") as Partial<LocalUserProfile> | null;
-    return { displayName: saved?.displayName ?? "", email: saved?.email ?? "", avatarDataUrl: saved?.avatarDataUrl ?? "" };
-  } catch {
-    return emptyUserProfile();
-  }
-};
+const profileFromUser = (user: AuthUser): LocalUserProfile => ({ displayName: user.displayName, email: user.email, avatarDataUrl: user.avatarUrl });
 const imageProviderDefaults: Record<ImageSettings["provider"], string> = {
   volcengine: "https://ark.cn-beijing.volces.com/api/v3",
   aliyun: "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -70,12 +60,17 @@ const videoModelOptions: VideoSettings["model"][] = [
   "doubao-seedance-2-0-mini-260615",
   "doubao-seedance-2-0-260128",
   "doubao-seedance-2-0-fast-260128",
+  "doubao-seedance-2-5-260628",
 ];
 const videoModelLabels: Record<VideoSettings["model"], string> = {
   "doubao-seedance-2-0-mini-260615": "Seedance 2.0 Mini",
   "doubao-seedance-2-0-260128": "Seedance 2.0",
   "doubao-seedance-2-0-fast-260128": "Seedance 2.0 Fast",
+  "doubao-seedance-2-5-260628": "Seedance 2.5",
 };
+const videoResolutionOptions: Array<{ value: VideoResolution; label: string }> = [{ value: "480p", label: "480P" }, { value: "720p", label: "720P" }, { value: "1080p", label: "1080P" }];
+const videoDurationOptions = [4, 5, 6, 8, 10, 12];
+const normalizeVideoDuration = (value: number) => videoDurationOptions.reduce((closest, option) => Math.abs(option - value) < Math.abs(closest - value) ? option : closest);
 type ImageSettingsDraft = Pick<ImageSettings, "provider" | "model" | "apiBase"> & { apiKey: string };
 type VideoSettingsDraft = Pick<VideoSettings, "provider" | "model" | "apiBase"> & { apiKey: string };
 type SubjectImageDraft = SubjectImageInput & { referenceName: string };
@@ -109,42 +104,44 @@ const dialogueWithoutNarration = (dialogue: string) => dialogue
   .join("\n")
   .replace(/\s*(旁白|解说|画外音|narrator)\s*[：:][\s\S]*$/i, "")
   .trim();
-const shotVideoPrompt = (shot: Shot, previousShot?: Shot) => [
-  ...(previousShot ? [
-    "上一镜头画面（当前镜头必须从此处自然延伸）：",
-    `上一镜头：${previousShot.title}`,
-    `上一场景：${previousShot.location}`,
-    `上一镜头结束动作：${previousShot.action}`,
-    `上一镜头摄影：${previousShot.camera}`,
-    `上一镜头画面提示词：${previousShot.visualPrompt}`,
-    "承接要求：继承上一镜头末尾的人物姿势、位置、视线、服装、道具、光线、空间方位和运动方向；不要重新入场，不要重复已经完成的动作，不要在视频内部制作转场。",
-    "",
-  ] : []),
-  "当前镜头目标（从上述结束状态继续）：",
-  `当前镜头：${shot.title}`,
-  `当前场景：${shot.location}`,
-  `当前动作：${shot.action}`,
-  `当前摄影：${shot.camera}`,
-  `当前画面：${shot.visualPrompt}`,
-  dialogueWithoutNarration(shot.dialogue) ? `人物对白 / 内心 OS（须逐字呈现）：${dialogueWithoutNarration(shot.dialogue)}` : "人物对白 / 内心 OS：无（禁止添加旁白或解说）",
-].join("\n");
-const submittedVideoPrompt = (generationPrompt: string | null) => {
-  if (!generationPrompt?.trim()) return null;
-  const matchers = [
-    /(?:^|\r?\n\r?\n)用户确认的视频提示词（除连续性首帧约束外必须执行）：\r?\n([\s\S]*?)(?=\r?\n\r?\n衔接方式：)/,
-    /(?:^|\r?\n\r?\n)当前镜头目标：\r?\n([\s\S]*?)(?=\r?\n\r?\n(?:声音要求：|允许说出的唯一文本|音乐要求：|画面中不要生成))/,
-  ];
-  for (const matcher of matchers) {
-    const matched = generationPrompt.match(matcher)?.[1]?.trim();
-    if (matched) return matched;
-  }
-  return generationPrompt.trim();
+const videoPromptHeadings = ["当前场景", "当前动作", "当前摄影", "视觉风格", "本镜头引用主体资产", "本镜头首帧", "本镜头发展", "本镜头尾帧", "人物对白 / 内心 OS", "禁止事项"] as const;
+const legacyVideoPromptHeadings = ["当前场景", "当前动作", "当前摄影", "视觉风格", "本镜头引用主体资产", "承接上一镜头结束状态", "本镜头第0秒必须从上述结束状态自然开始", "本镜头首帧", "本镜头发展", "本镜头结束状态", "人物对白 / 内心 OS", "禁止事项"] as const;
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const visualPromptSection = (prompt: string, heading: string) => {
+  const escaped = heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const nextHeading = [...videoPromptHeadings, ...legacyVideoPromptHeadings].filter((value, index, all) => all.indexOf(value) === index).map(escapeRegExp).join("|");
+  return prompt.match(new RegExp(`(?:\\*\\*)?${escaped}(?:\\*\\*)?[：:]\\s*([\\s\\S]*?)(?=\\r?\\n(?:\\*\\*)?(?:${nextHeading})(?:\\*\\*)?[：:]|$)`))?.[1]?.trim() ?? "";
 };
-
+const hasStructuredVideoPrompt = (prompt: string) => videoPromptHeadings.every((heading) => visualPromptSection(prompt, heading)) || legacyVideoPromptHeadings.every((heading) => visualPromptSection(prompt, heading));
+const shotVideoPrompt = (shot: Shot, previousShot: Shot | undefined, referencedSubjects: Subject[], projectStyle: string) => {
+  const source = shot.visualPrompt;
+  const subjectNames = referencedSubjects.map((subject) => `「${subject.name}」`).join("、") || "无已绑定主体资产";
+  const existingReferences = visualPromptSection(source, "本镜头引用主体资产");
+  const background = existingReferences.split(/\r?\n/).find((line) => line.trim().startsWith("背景保留"));
+  const firstFrame = visualPromptSection(source, "本镜头首帧")
+    || (previousShot ? "以上一镜头输出的尾帧作为本镜头首帧；只从该画面继续当前动作。" : `${shot.camera}。画面位于 ${shot.location}，${subjectNames} 按当前动作开始前的姿势和位置出现在画面中。`);
+  const development = visualPromptSection(source, "本镜头发展") || `${shot.action}。摄影机按“${shot.camera}”完成拍摄。`;
+  const ending = visualPromptSection(source, "本镜头尾帧") || visualPromptSection(source, "本镜头结束状态")
+    || `${shot.action}完成后的最终姿势、位置、视线和道具状态清晰可见。摄影机停在${shot.camera}。`;
+  const dialogue = dialogueWithoutNarration(shot.dialogue);
+  return [
+    `**当前场景**：${visualPromptSection(source, "当前场景") || shot.location}`,
+    `**当前动作**：${visualPromptSection(source, "当前动作") || shot.action}`,
+    `**当前摄影**：${visualPromptSection(source, "当前摄影") || shot.camera}`,
+    `**视觉风格**：${visualPromptSection(source, "视觉风格") || projectStyle || "电影写实"}`,
+    `**本镜头引用主体资产**：\n${subjectNames}。${background ? `\n${background}` : ""}`,
+    `**本镜头首帧**：\n${firstFrame}`,
+    `**本镜头发展**：\n${development}`,
+    `**本镜头尾帧**：\n${ending}`,
+    `**人物对白 / 内心 OS**：${dialogue || "无。禁止添加旁白或解说。"}`,
+    "**禁止事项**：\n禁止重新入场、重复上一镜头已完成的动作、重置空间、无理由转景或在片内制作转场。\n禁止改变人物身份、外观、服装、道具及其相对位置。\n禁止改变当前镜头的空间方位和锁定的光线调色。",
+  ].join("\n");
+};
 function App() {
-  const [sessionUser, setSessionUser] = useState(readSavedSession);
+  const [sessionUser, setSessionUser] = useState("");
+  const [sessionRole, setSessionRole] = useState<AuthUser["role"]>("user");
   const [theme, setTheme] = useState<ThemeMode>(readSavedTheme);
-  const [userProfile, setUserProfile] = useState<LocalUserProfile>(() => readSavedUserProfile(readSavedSession()));
+  const [userProfile, setUserProfile] = useState<LocalUserProfile>(emptyUserProfile);
   const [accountMenuOpen, setAccountMenuOpen] = useState(false);
   const [accountDialog, setAccountDialog] = useState<AccountDialogKind | null>(null);
   const [helpVisible, setHelpVisible] = useState(false);
@@ -181,12 +178,14 @@ function App() {
   const [subjectImageDraft, setSubjectImageDraft] = useState<SubjectImageDraft>({ prompt: "", model: imageModelOptions[0], resolution: "2K", aspectRatio: "1:1", referenceName: "" });
   const [videoDialogShot, setVideoDialogShot] = useState<Shot | null>(null);
   const [videoDialogInitialPrompt, setVideoDialogInitialPrompt] = useState<string | null>(null);
+  const [videoDialogPromptMode, setVideoDialogPromptMode] = useState<VideoPromptMode>("structured");
   const [submittedRenderJobId, setSubmittedRenderJobId] = useState<string | null>(null);
   const [videoPreview, setVideoPreview] = useState<{ shot: Shot; url: string } | null>(null);
   const [newProjectDialogOpen, setNewProjectDialogOpen] = useState(false);
   const [existingScriptSetupOpen, setExistingScriptSetupOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleteSubjectTarget, setDeleteSubjectTarget] = useState<Subject | null>(null);
+  const [deleteShotTarget, setDeleteShotTarget] = useState<Shot | "all" | null>(null);
   const [projectManagerVisible, setProjectManagerVisible] = useState(false);
   const [managerProjects, setManagerProjects] = useState<Project[]>([]);
   const [managerLoading, setManagerLoading] = useState(false);
@@ -223,7 +222,15 @@ function App() {
     catch (caught) { setToast(caught instanceof Error ? caught.message : "资产库读取失败"); }
     finally { setAssetLibraryLoading(false); }
   };
-  useEffect(() => { void refresh(); void api.videoSettings().then(setVideoSettings).catch(() => undefined); }, []);
+  useEffect(() => {
+    let active = true;
+    void api.session()
+      .then((user) => { if (active) { setSessionUser(user.account); setSessionRole(user.role); setUserProfile(profileFromUser(user)); } })
+      .catch(() => undefined)
+      .finally(() => { if (active) void refresh(); });
+    void api.videoSettings().then((settings) => { if (active) setVideoSettings(settings); }).catch(() => undefined);
+    return () => { active = false; };
+  }, []);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     window.localStorage.setItem(THEME_STORAGE_KEY, theme);
@@ -264,14 +271,15 @@ function App() {
   const projectInput = (draft: ProjectDraft) => ({ title: draft.title.trim(), logline: draft.logline.trim().slice(0, 5000), genre: draft.genre, style: draft.style, aspectRatio: draft.aspectRatio, durationSeconds: Math.min(720, Math.max(15, draft.durationSeconds)), targetEpisodeCount: Math.min(100, Math.max(1, draft.targetEpisodeCount)) });
   const ensureProject = async () => { if (project) return project; const created = await api.createProject(projectInput({ ...setupDraft, title: setupDraft.title.trim() || getProjectTitle(scriptText) })); setProject(created); return created; };
   const saveProjectSetup = () => run("setup", async () => { const next = project ? await api.updateProject(project.id, projectInput(setupDraft)) : await ensureProject(); setProject(next); setHomeVisible(false); setDashboard(await api.dashboard()); setStage("format"); }, "项目设定已保存，请导入剧本");
-  const generateProjectScript = () => run("generate", async () => { const input = projectInput(setupDraft); const next = project ? await api.updateProject(project.id, input) : await api.createProject(input); const result = await api.generateScript(next.id, input); const data = await api.pipeline(next.id); setProject(result.project); setScriptText(result.scriptText); setPipeline(data); setHomeVisible(false); setDashboard(await api.dashboard()); setStage("format"); }, "剧本草案已生成并保存，请开始格式化");
+  const generateProjectScript = () => run("generate", async () => { const input = projectInput(setupDraft); const next = project ? await api.updateProject(project.id, input) : await api.createProject(input); setProject(next); const result = await api.generateScript(next.id, input); const data = await api.pipeline(next.id); setProject(result.project); setScriptText(result.scriptText); setPipeline(data); setHomeVisible(false); setDashboard(await api.dashboard()); setStage("format"); }, "剧本草案已生成并保存，请开始格式化");
   const formatScript = () => run("format", async () => { const next = await ensureProject(); const result = await api.format(next.id, scriptText); setProject(result.project); setPipeline(await api.pipeline(next.id)); setStage("format"); }, "剧本已整理为标准格式");
   const extractEpisodes = () => run("episodes", async () => { const result = await api.extractEpisodes(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, episodes: result.episodes })); setStage("episodes"); return result.episodes.length; }, (count) => `已拆分 ${count} 集剧情`);
   const extractSubjects = () => run("subjects", async () => { const result = await api.extractSubjects(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, subjects: result.subjects })); setStage("subjects"); }, "已提取角色、场景与道具");
   const extractShots = () => run("shots", async () => { const result = await api.extractShots(project!.id); setProject(result.project); setPipeline((current) => ({ ...current, shots: result.shots })); setStage("shots"); return result.shots.length; }, (count) => `已生成 ${count} 个镜头`);
-  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"], duration?: number, options?: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => run("render", async () => { setToast(shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中"); setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.map((subject) => subject.id), model: model ?? videoSettings?.model, ...(duration ? { duration } : {}), ...options }); setSubmittedRenderJobId(job.id); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); await refresh(); return job; }, () => shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中");
+  const renderVideo = (shot?: Shot, references: Subject[] = [], model?: VideoSettings["model"], duration?: number, options?: { prompt: string; promptMode: VideoPromptMode; resolution: VideoResolution; watermark: boolean; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => run("render", async () => { setToast(shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中"); setVideoDialogShot(null); const job = await api.render(project!.id, { ...(shot ? { shotId: shot.id } : {}), referenceSubjectIds: references.slice(0, 12).map((subject) => subject.id), model: model ?? videoSettings?.model, ...(duration ? { duration } : {}), ...options }); setSubmittedRenderJobId(job.id); const data = await api.pipeline(project!.id); setPipeline(data); setProject(data.project); await refresh(); return job; }, () => shot ? `镜头 ${shot.episodeNumber}-${shot.shotOrder} 视频生成中` : "视频生成中");
   const deleteProject = (item: Project) => setDeleteTarget(item);
   const deleteSubject = (item: Subject) => setDeleteSubjectTarget(item);
+  const deleteShot = (item: Shot) => setDeleteShotTarget(item);
   const confirmDeleteProject = () => {
     if (!deleteTarget) return;
     const item = deleteTarget;
@@ -288,6 +296,21 @@ function App() {
       setProject(result.project);
       setPipeline((current) => ({ ...current, subjects: result.subjects }));
     }, "主体已删除");
+  };
+  const confirmDeleteShot = () => {
+    if (!deleteShotTarget || !project) return;
+    const target = deleteShotTarget;
+    void run("deleteShot", async () => {
+      const result = target === "all" ? await api.deleteShots(project.id) : await api.deleteShot(project.id, target.id);
+      const deletedIds = target === "all" ? new Set(pipeline.shots.map((shot) => shot.id)) : new Set([target.id]);
+      setPipeline((current) => ({ ...current, shots: result.shots }));
+      setRenderJobs((current) => current.filter((job) => !job.shotId || !deletedIds.has(job.shotId)));
+      setVideoDialogShot((current) => current && deletedIds.has(current.id) ? null : current);
+      setVideoPreview((current) => current && deletedIds.has(current.shot.id) ? null : current);
+      setSubmittedRenderJobId(null);
+      setDeleteShotTarget(null);
+      return result.deletedCount;
+    }, (count) => target === "all" ? `已删除全部 ${count} 个分镜` : "分镜已删除，本集镜头编号已更新");
   };
   const openSettings = () => {
     setSettingsOpen(true);
@@ -357,28 +380,54 @@ function App() {
   const handleFile = (event: ChangeEvent<HTMLInputElement>) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { const content = String(reader.result ?? ""); setScriptText(content.slice(0, MAX_SCRIPT_LENGTH)); if (content.length > MAX_SCRIPT_LENGTH) setToast("文件内容超过 200000 字符，已截取前 200000 字符"); }; reader.readAsText(file, "utf-8"); event.target.value = ""; };
   const navigate = (nextStage: Stage) => { if (sourceScriptMode && nextStage === "setup") return; const required: Record<Stage, boolean> = { setup: true, format: Boolean(project), episodes: pipeline.document?.formatStatus === "formatted", subjects: pipeline.episodes.length > 0, shots: pipeline.subjects.length > 0, render: pipeline.shots.length > 0 }; if (!required[nextStage]) { setToast(`请先完成「${stages[Math.max(0, stages.findIndex((item) => item.id === nextStage) - 1)].label}」`); return; } setStage(nextStage); setMobileNavOpen(false); };
   const newWorkflow = () => { setHomeTool(null); setProjectManagerVisible(false); setAssetLibraryVisible(false); setHelpVisible(false); setNewProjectDialogOpen(true); };
-  const login = (account: string, remember: boolean) => {
-    window.localStorage.removeItem(LOGIN_SESSION_KEY);
-    window.sessionStorage.removeItem(LOGIN_SESSION_KEY);
-    (remember ? window.localStorage : window.sessionStorage).setItem(LOGIN_SESSION_KEY, account);
-    setSessionUser(account);
-    setUserProfile(readSavedUserProfile(account));
+  const login = async (account: string, password: string, remember: boolean, mode: "login" | "register") => {
+    const user = mode === "register"
+      ? await api.register({ account, password, remember })
+      : await api.login({ account, password, remember });
+    setSessionUser(user.account);
+    setSessionRole(user.role);
+    setUserProfile(profileFromUser(user));
+    setError("");
+    await refresh();
   };
-  const saveUserProfile = (next: LocalUserProfile, message: string) => {
+  const saveUserProfile = async (next: LocalUserProfile, message: string) => {
     try {
-      window.localStorage.setItem(`${USER_PROFILE_KEY}:${sessionUser}`, JSON.stringify(next));
-    } catch {
-      setToast("保存失败，请更换更小的头像后重试");
+      const user = await api.updateProfile({ displayName: next.displayName, email: next.email, avatarUrl: next.avatarDataUrl });
+      setUserProfile(profileFromUser(user));
+      setAccountDialog(null);
+      setToast(message);
+    } catch (caught) {
+      setErrorToast(caught instanceof Error ? caught.message : "个人资料保存失败");
       return;
     }
-    setUserProfile(next);
-    setAccountDialog(null);
-    setToast(message);
   };
-  const logout = () => {
-    window.localStorage.removeItem(LOGIN_SESSION_KEY);
-    window.sessionStorage.removeItem(LOGIN_SESSION_KEY);
+  const saveAvatar = async (file: File | null) => {
+    try {
+      const user = file
+        ? await api.uploadAvatar(file)
+        : await api.updateProfile({ displayName: userProfile.displayName, email: userProfile.email, avatarUrl: "" });
+      setUserProfile(profileFromUser(user));
+      setAccountDialog(null);
+      setToast(file ? "头像已更新" : "头像已移除");
+    } catch (caught) {
+      setErrorToast(caught instanceof Error ? caught.message : "头像保存失败");
+    }
+  };
+  const changePassword = async (currentPassword: string, newPassword: string) => {
+    const user = await api.changePassword({ currentPassword, newPassword });
+    setSessionRole(user.role);
+    setUserProfile(profileFromUser(user));
+    setAccountDialog(null);
+    setToast("密码已更新，其他设备已退出登录");
+  };
+  const logoutAll = async () => {
+    await api.logoutAll();
+    await logout(false);
+  };
+  const logout = async (notifyServer = true) => {
+    if (notifyServer) await api.logout().catch(() => undefined);
     setSessionUser("");
+    setSessionRole("user");
     setProject(null);
     setHomeVisible(true);
     setProjectManagerVisible(false);
@@ -409,32 +458,21 @@ function App() {
   const chooseNewProjectMode = (hasScript: boolean) => { setNewProjectDialogOpen(false); setProject(null); setSourceScriptMode(hasScript); setPipeline(emptyPipeline()); setScriptText(""); setSetupDraft({ title: hasScript ? "已有剧本项目" : "", logline: "", genre: "悬疑", style: "电影写实", aspectRatio: "16:9", durationSeconds: 60, targetEpisodeCount: 3 }); setMobileNavOpen(false); if (hasScript) { setExistingScriptSetupOpen(true); return; } setHomeVisible(false); setStage("setup"); };
   const confirmExistingScriptSetup = () => run("setup", async () => { const next = await api.createProject(projectInput(setupDraft)); setProject(next); setHomeVisible(false); setExistingScriptSetupOpen(false); setStage("format"); setDashboard(await api.dashboard()); }, "项目设定已保存，请导入剧本");
   const goHome = () => { setProject(null); setSourceScriptMode(false); setHomeVisible(true); setProjectManagerVisible(false); setAssetLibraryVisible(false); setHelpVisible(false); setHomeTool(null); setHomeSection("home"); window.scrollTo(0, 0); setStage("setup"); setMobileNavOpen(false); };
-  const saveShotEdits = async (shot: Shot, input: { location: string; action: string; visualPrompt: string }) => {
-    try {
-      const updated = await api.updateShot(shot.projectId, shot.id, input);
-      setPipeline((current) => ({ ...current, shots: current.shots.map((item) => item.id === updated.id ? updated : item) }));
-      setVideoPreview((current) => current?.shot.id === updated.id ? { ...current, shot: updated } : current);
-      setToast("分镜内容已保存");
-      return true;
-    } catch (caught) {
-      setToast(caught instanceof Error ? caught.message : "分镜内容保存失败");
-      return false;
-    }
-  };
-  const settingsDialog = settingsOpen && <SettingsDialog settings={settings} imageSettings={imageSettings} videoSettings={videoSettings} draft={apiKeyDraft} imageDraft={imageSettingsDraft} videoDraft={videoSettingsDraft} busy={settingsBusy} onDraftChange={setApiKeyDraft} onImageDraftChange={setImageSettingsDraft} onVideoDraftChange={setVideoSettingsDraft} onSave={() => void saveSettings()} onClose={() => setSettingsOpen(false)} />;
+  const settingsDialog = settingsOpen && sessionRole === "admin" && <SettingsDialog settings={settings} imageSettings={imageSettings} videoSettings={videoSettings} draft={apiKeyDraft} imageDraft={imageSettingsDraft} videoDraft={videoSettingsDraft} busy={settingsBusy} onDraftChange={setApiKeyDraft} onImageDraftChange={setImageSettingsDraft} onVideoDraftChange={setVideoSettingsDraft} onSave={() => void saveSettings()} onClose={() => setSettingsOpen(false)} />;
   const subjectImageDialog = <>{imageDialogSubject && <SubjectImageDialog subject={imageDialogSubject} draft={subjectImageDraft} configured={imageSettings?.configured} busy={generatingSubjectIds.includes(imageDialogSubject.id)} onDraftChange={setSubjectImageDraft} onReference={selectSubjectReference} onGenerate={() => void generateSubjectImage()} onConfigure={() => { setImageDialogSubject(null); openSettings(); }} onClose={() => { if (!generatingSubjectIds.includes(imageDialogSubject.id)) setImageDialogSubject(null); }} />}{subjectImagePreview && <SubjectImagePreviewDialog subject={subjectImagePreview} onClose={() => setSubjectImagePreview(null)} />}</>;
   const previousVideoDialogShot = videoDialogShot ? pipeline.shots
     .filter((shot) => shot.episodeNumber === videoDialogShot.episodeNumber && shot.shotOrder < videoDialogShot.shotOrder)
     .sort((left, right) => right.shotOrder - left.shotOrder)[0] : undefined;
-  const videoDialog = videoDialogShot && <ShotVideoDialog key={videoDialogShot.id} shot={videoDialogShot} previousShot={previousVideoDialogShot} subjects={pipeline.subjects} videoModel={videoSettings?.model} initialPrompt={videoDialogInitialPrompt} busy={workingAction === "render"} onGenerate={(references, model, duration, options) => renderVideo(videoDialogShot, references, model, duration, options)} onClose={() => { if (workingAction !== "render") { setVideoDialogShot(null); setVideoDialogInitialPrompt(null); } }} />;
-  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} history={renderJobs.filter((job) => job.shotId === videoPreview.shot.id && job.outputUrl).map((job) => ({ id: job.id, outputUrl: job.outputUrl!, createdAt: job.createdAt, generationPrompt: job.generationPrompt }))} onSave={(input) => saveShotEdits(videoPreview.shot, input)} onRegenerate={(prompt) => { setVideoPreview(null); setVideoDialogInitialPrompt(prompt); setVideoDialogShot(videoPreview.shot); }} onClose={() => setVideoPreview(null)} />;
+  const videoDialog = videoDialogShot && <ShotVideoDialog key={`${videoDialogShot.id}-${videoDialogPromptMode}`} shot={videoDialogShot} previousShot={previousVideoDialogShot} subjects={pipeline.subjects} projectStyle={pipeline.project.style} videoModel={videoSettings?.model} initialPrompt={videoDialogInitialPrompt} promptMode={videoDialogPromptMode} busy={workingAction === "render"} onGenerate={(references, model, duration, options) => renderVideo(videoDialogShot, references, model, duration, options)} onClose={() => { if (workingAction !== "render") { setVideoDialogShot(null); setVideoDialogInitialPrompt(null); setVideoDialogPromptMode("structured"); } }} />;
+  const videoPreviewDialog = videoPreview && <ShotVideoPreviewDialog shot={videoPreview.shot} url={videoPreview.url} history={renderJobs.filter((job) => job.shotId === videoPreview.shot.id && job.outputUrl).map((job) => ({ id: job.id, outputUrl: job.outputUrl!, createdAt: job.createdAt, generationPrompt: job.generationPrompt }))} onRegenerate={(prompt) => { setVideoPreview(null); setVideoDialogInitialPrompt(prompt); setVideoDialogPromptMode("complete"); setVideoDialogShot(videoPreview.shot); }} onClose={() => setVideoPreview(null)} />;
   const subjectDeleteDialog = deleteSubjectTarget && <DeleteSubjectDialog subject={deleteSubjectTarget} busy={workingAction === "deleteSubject"} onConfirm={confirmDeleteSubject} onClose={() => { if (workingAction !== "deleteSubject") setDeleteSubjectTarget(null); }} />;
+  const shotDeleteDialog = deleteShotTarget && <DeleteShotDialog target={deleteShotTarget} shotCount={pipeline.shots.length} busy={workingAction === "deleteShot"} onConfirm={confirmDeleteShot} onClose={() => { if (workingAction !== "deleteShot") setDeleteShotTarget(null); }} />;
 
   if (loading) return <div className="loading-screen"><LoaderCircle className="spin" size={24} /><span>正在载入工作区</span></div>;
   if (!sessionUser) return <LoginScreen coverUrl={dashboard?.projects.find((item) => item.coverUrl)?.coverUrl ?? fallbackLoginCover} onLogin={login} />;
   const openAccountDialog = (kind: AccountDialogKind) => { setAccountMenuOpen(false); setAccountDialog(kind); };
   const accountMenu = <AccountMenu account={sessionUser} profile={userProfile} open={accountMenuOpen} onToggle={() => setAccountMenuOpen((current) => !current)} onClose={() => setAccountMenuOpen(false)} onSelect={openAccountDialog} />;
-  const accountDialogNode = accountDialog && <AccountDialog kind={accountDialog} account={sessionUser} profile={userProfile} onSave={saveUserProfile} onLogout={logout} onClose={() => setAccountDialog(null)} />;
+  const accountDialogNode = accountDialog && <AccountDialog kind={accountDialog} account={sessionUser} profile={userProfile} onSave={saveUserProfile} onSaveAvatar={saveAvatar} onChangePassword={changePassword} onLogoutAll={logoutAll} onLogout={() => void logout()} onClose={() => setAccountDialog(null)} />;
   const themeButton = <button type="button" className="icon-button theme-toggle" aria-label={theme === "dark" ? "当前为夜间模式，点击切换到日间模式" : "当前为日间模式，点击切换到夜间模式"} title={theme === "dark" ? "夜间模式" : "日间模式"} onClick={() => setTheme((current) => current === "dark" ? "light" : "dark")}>{theme === "dark" ? <Moon size={17} /> : <Sun size={17} />}</button>;
   const showHomeSection = () => {
     setHomeTool(null);
@@ -449,10 +487,10 @@ function App() {
     <header className="topbar home-topbar">
       <a className="brand" href="#home" onClick={(event) => { event.preventDefault(); showHomeSection(); }}><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a>
       <HomeNavigation active={helpVisible ? "help" : homeTool ? "tools" : assetLibraryVisible ? "assets" : projectManagerVisible ? "pipeline" : homeSection} onHome={showHomeSection} onPipeline={openProjectManager} onAssets={openAssetLibrary} onSelectTool={openAssetStudio} onCreate={newWorkflow} onHelp={openHelp} />
-      <div className="top-actions">{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div>
+      <div className="top-actions">{themeButton}{sessionRole === "admin" && <button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>}{accountMenu}</div>
     </header>
     <div key={homeViewKey} className="home-view-transition">
-      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "infinite-canvas" ? <InfiniteCanvasStudio onToast={setToast} onBack={showHomeSection} /> : homeTool === "digital-human" ? <DigitalHumanStudio onToast={setToast} onError={setErrorToast} /> : homeTool === "image-upscale" ? <ImageUpscaleStudio onToast={setToast} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
+      {error ? <div className="fatal-state home-fatal"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : helpVisible ? <HelpStage onSelectTool={openAssetStudio} /> : homeTool === "infinite-canvas" ? <InfiniteCanvasStudio onToast={setToast} /> : homeTool === "digital-human" ? <DigitalHumanStudio onToast={setToast} onError={setErrorToast} /> : homeTool === "image-upscale" ? <ImageUpscaleStudio onToast={setToast} /> : homeTool === "prompt-workshop" ? <PromptWorkshop onToast={setToast} /> : homeTool === "voice-clone" ? <VoiceCloneStudio onToast={setToast} /> : homeTool === "text-to-speech" ? <TextToSpeechStudio onToast={setToast} /> : homeTool === "reference-video" || homeTool === "keyframe-video" ? <VideoToolStudio key={homeTool} videoType={homeTool} videoSettings={videoSettings} onConfigure={openSettings} onToast={setToast} /> : homeTool ? <CharacterStudio key={homeTool} assetType={homeTool} imageSettings={imageSettings} onConfigure={openSettings} onToast={setToast} /> : assetLibraryVisible ? <AssetLibraryStage data={assetLibrary} loading={assetLibraryLoading} onCreate={openAssetStudio} /> : projectManagerVisible ? <ProjectManagerStage projects={managerProjects} loading={managerLoading} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} onNew={newWorkflow} /> : <HomeStage projects={dashboard?.projects ?? []} stats={dashboard?.stats} onNew={newWorkflow} onManage={openProjectManager} onOpen={(item, target) => void loadProject(item, target)} onDelete={deleteProject} />}
     </div>
     {newProjectDialogOpen && <NewProjectDialog onHasScript={() => chooseNewProjectMode(true)} onNoScript={() => chooseNewProjectMode(false)} onClose={() => setNewProjectDialogOpen(false)} />}
     {existingScriptSetupOpen && <ExistingScriptSetupDialog draft={setupDraft} setDraft={setSetupDraft} busy={workingAction === "setup"} onConfirm={confirmExistingScriptSetup} onClose={() => { if (!workingAction) { setExistingScriptSetupOpen(false); setSourceScriptMode(false); } }} />}
@@ -460,8 +498,8 @@ function App() {
     {settingsDialog}{accountDialogNode}{toast && <div key={toast.id} className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>{toast.tone === "error" ? <CircleAlert size={17} /> : <Check size={16} />}<span>{toast.message}</span></div>}
   </div>;
   return <div className="app-shell project-shell">
-    <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "开始创作"}</span>{themeButton}<button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>{accountMenu}</div></header>
-    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={project || sourceScriptMode ? saveProjectSetup : generateProjectScript} working={workingAction === "setup" || workingAction === "generate"} generate={!project && !sourceScriptMode} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} working={workingAction === "render"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{settingsDialog}{toast && <div key={toast.id} className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>{toast.tone === "error" ? <CircleAlert size={17} /> : <Check size={16} />}<span>{toast.message}</span></div>}
+    <header className="topbar project-topbar"><div className="topbar-left"><a className="brand" href="#home" onClick={(event) => { event.preventDefault(); goHome(); }} aria-label="返回拥抱世界首页"><span className="brand-mark"><Film size={18} /></span><span className="brand-name">拥抱世界</span></a></div><nav className="top-steps" aria-label="项目处理步骤">{stages.slice(0, 5).filter((item) => !(sourceScriptMode && item.id === "setup")).map((item, visibleIndex) => { const itemIndex = stages.findIndex((stageItem) => stageItem.id === item.id); const done = itemIndex < currentIndex || (item.id === "format" && Boolean(pipeline.document)) || (item.id === "episodes" && pipeline.episodes.length > 0) || (item.id === "subjects" && pipeline.subjects.length > 0) || (item.id === "shots" && pipeline.shots.length > 0); return <button key={item.id} className={`${stage === item.id ? "active" : ""} ${done ? "done" : ""}`} onClick={() => navigate(item.id)}><span>{done ? <Check size={12} /> : visibleIndex + 1}</span>{item.label}</button>; })}</nav><div className="top-actions"><span className="project-top-title">{project?.title || setupDraft.title || "开始创作"}</span>{themeButton}{sessionRole === "admin" && <button className="icon-button model-settings-button" aria-label="模型设置" title="模型设置" onClick={openSettings}><Settings2 size={17} /></button>}{accountMenu}</div></header>
+    <main id="workspace" className="workspace"><div className="workspace-head"><div><h1>{stages[currentIndex].label}</h1><p>{stages[currentIndex].description}，每一步的结果都会成为下一步的输入。</p></div><div className="head-tools"><span className="workspace-progress">项目进度 {completion}%</span><button className="icon-button"><MoreHorizontal size={18} /></button></div></div>{error ? <div className="fatal-state"><h2>工作区暂时无法连接</h2><p>{error}</p><button className="primary-button" onClick={() => void refresh()}>重新连接</button></div> : <div className="work-area"><section className={`canvas-panel ${stage === "setup" ? "setup-canvas-panel" : ""}`}>{stage === "setup" && <SetupStage draft={setupDraft} setDraft={setSetupDraft} onNext={!sourceScriptMode && !pipeline.document ? generateProjectScript : saveProjectSetup} working={workingAction === "setup" || workingAction === "generate"} generate={!sourceScriptMode && !pipeline.document} />}{stage === "format" && pipeline.document?.formatStatus === "formatted" ? <FormatStage document={pipeline.document} onNext={extractEpisodes} working={workingAction === "episodes"} /> : stage === "format" ? <ImportStage text={scriptText} setText={setScriptText} onFile={() => fileInput.current?.click()} onNext={formatScript} working={workingAction === "format"} fileInput={fileInput} onFileChange={handleFile} /> : null}{stage === "episodes" && <EpisodesStage episodes={pipeline.episodes} onNext={extractSubjects} working={workingAction === "subjects"} />}{stage === "subjects" && <SubjectsStage key={project?.id} subjects={pipeline.subjects} onNext={extractShots} working={workingAction === "shots"} generatingSubjectId={generatingSubjectId} deletingSubjectId={workingAction === "deleteSubject" ? deleteSubjectTarget?.id ?? "pending" : null} onGenerateImage={openSubjectImageDialog} onDeleteSubject={deleteSubject} />}{stage === "shots" && <ShotsStage shots={pipeline.shots} subjects={pipeline.subjects} episodes={pipeline.episodes} jobs={renderJobs} onNext={() => setStage("render")} onGenerateVideo={(shot) => { setVideoDialogInitialPrompt(null); setVideoDialogPromptMode("structured"); setVideoDialogShot(shot); }} onViewVideo={(shot, url) => setVideoPreview({ shot, url })} onDeleteShot={deleteShot} onDeleteAll={() => setDeleteShotTarget("all")} working={workingAction === "render"} deleting={workingAction === "deleteShot"} />}{stage === "render" && <RenderStage project={project} shots={pipeline.shots} jobs={renderJobs} onCoverCreated={(coverUrl) => { setProject((current) => current ? { ...current, coverUrl } : current); setDashboard((current) => current ? { ...current, projects: current.projects.map((item) => item.id === project?.id ? { ...item, coverUrl } : item) } : current); }} onBack={() => setStage("shots")} />}</section><Inspector stage={stage} project={project} pipeline={pipeline} /></div>}</main>{subjectImageDialog}{videoDialog}{videoPreviewDialog}{subjectDeleteDialog}{shotDeleteDialog}{settingsDialog}{toast && <div key={toast.id} className={`toast ${toast.tone}`} role={toast.tone === "error" ? "alert" : "status"}>{toast.tone === "error" ? <CircleAlert size={17} /> : <Check size={16} />}<span>{toast.message}</span></div>}
     {accountDialogNode}
   </div>;
 }
@@ -608,17 +646,23 @@ function AccountMenu({ account, profile, open, onToggle, onClose, onSelect }: { 
         <button type="button" role="menuitem" onClick={() => onSelect("profile")}><UserRound size={16} /><span><strong>个人信息</strong><small>查看账号并修改昵称</small></span></button>
         <button type="button" role="menuitem" onClick={() => onSelect("avatar")}><ImagePlus size={16} /><span><strong>修改头像</strong><small>使用本地图片作为头像</small></span></button>
         <button type="button" role="menuitem" onClick={() => onSelect("email")}><Mail size={16} /><span><strong>{profile.email ? "更换邮箱" : "绑定邮箱"}</strong><small>{profile.email || "尚未绑定邮箱"}</small></span></button>
+        <button type="button" role="menuitem" onClick={() => onSelect("security")}><LockKeyhole size={16} /><span><strong>账号安全</strong><small>修改密码与退出其他设备</small></span></button>
       </div>
       <div className="account-menu-items account-menu-danger"><button type="button" role="menuitem" onClick={() => onSelect("logout")}><LogOut size={16} /><span><strong>退出登录</strong><small>返回登录页面</small></span></button></div>
     </div>}
   </div>;
 }
 
-function AccountDialog({ kind, account, profile, onSave, onLogout, onClose }: { kind: AccountDialogKind; account: string; profile: LocalUserProfile; onSave: (profile: LocalUserProfile, message: string) => void; onLogout: () => void; onClose: () => void }) {
+function AccountDialog({ kind, account, profile, onSave, onSaveAvatar, onChangePassword, onLogoutAll, onLogout, onClose }: { kind: AccountDialogKind; account: string; profile: LocalUserProfile; onSave: (profile: LocalUserProfile, message: string) => void | Promise<void>; onSaveAvatar: (file: File | null) => Promise<void>; onChangePassword: (currentPassword: string, newPassword: string) => Promise<void>; onLogoutAll: () => Promise<void>; onLogout: () => void; onClose: () => void }) {
   const [displayName, setDisplayName] = useState(profile.displayName || account);
   const [email, setEmail] = useState(profile.email);
   const [avatarDataUrl, setAvatarDataUrl] = useState(profile.avatarDataUrl);
+  const [avatarFile, setAvatarFile] = useState<File | null>(null);
   const [error, setError] = useState("");
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [securityBusy, setSecurityBusy] = useState<"password" | "sessions" | null>(null);
   const avatarInput = useRef<HTMLInputElement>(null);
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => { if (event.key === "Escape") onClose(); };
@@ -631,7 +675,7 @@ function AccountDialog({ kind, account, profile, onSave, onLogout, onClose }: { 
     if (!file.type.startsWith("image/")) { setError("请选择图片文件"); return; }
     if (file.size > 2 * 1024 * 1024) { setError("头像图片不能超过 2MB"); return; }
     const reader = new FileReader();
-    reader.onload = () => { setAvatarDataUrl(String(reader.result ?? "")); setError(""); };
+    reader.onload = () => { setAvatarFile(file); setAvatarDataUrl(String(reader.result ?? "")); setError(""); };
     reader.onerror = () => setError("头像读取失败，请重新选择");
     reader.readAsDataURL(file);
     event.target.value = "";
@@ -640,23 +684,50 @@ function AccountDialog({ kind, account, profile, onSave, onLogout, onClose }: { 
 
   if (kind === "logout") return <div {...backdropProps}><section className="settings-dialog account-dialog logout-dialog" role="dialog" aria-modal="true" aria-labelledby="logout-title">
     <div className="settings-dialog-head"><div><span className="panel-eyebrow">ACCOUNT</span><h2 id="logout-title">确定退出登录吗？</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭退出确认"><X size={18} /></button></div>
-    <div className="account-logout-copy"><LogOut size={19} /><div><strong>将结束当前登录状态</strong><p>你的项目和个人资料仍会保存在当前设备中。</p></div></div>
+    <div className="account-logout-copy"><LogOut size={19} /><div><strong>将结束当前登录状态</strong><p>你的项目和个人资料已保存在账号中，下次登录仍可继续。</p></div></div>
     <div className="settings-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="danger-button" onClick={onLogout}><LogOut size={15} />退出登录</button></div>
   </section></div>;
 
   if (kind === "avatar") return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="avatar-title">
-    <div className="settings-dialog-head"><div><span className="panel-eyebrow">PROFILE IMAGE</span><h2 id="avatar-title">修改头像</h2><p>图片只会保存在当前设备。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭头像设置"><X size={18} /></button></div>
-    <div className="avatar-editor"><UserAvatar account={account} profile={{ ...profile, avatarDataUrl }} large /><div><button className="secondary-button" type="button" onClick={() => avatarInput.current?.click()}><Upload size={15} />选择图片</button>{avatarDataUrl && <button className="text-button" type="button" onClick={() => setAvatarDataUrl("")}>移除头像</button>}<input ref={avatarInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={selectAvatar} /></div><small>支持 JPG、PNG、WebP，最大 2MB</small></div>
+    <div className="settings-dialog-head"><div><span className="panel-eyebrow">PROFILE IMAGE</span><h2 id="avatar-title">修改头像</h2><p>头像会同步到当前账号。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭头像设置"><X size={18} /></button></div>
+    <div className="avatar-editor"><UserAvatar account={account} profile={{ ...profile, avatarDataUrl }} large /><div><button className="secondary-button" type="button" onClick={() => avatarInput.current?.click()}><Upload size={15} />选择图片</button>{avatarDataUrl && <button className="text-button" type="button" onClick={() => { setAvatarFile(null); setAvatarDataUrl(""); }}>移除头像</button>}<input ref={avatarInput} type="file" accept="image/png,image/jpeg,image/webp" hidden onChange={selectAvatar} /></div><small>支持 JPG、PNG、WebP，最大 2MB</small></div>
     {error && <p className="account-dialog-error" role="alert">{error}</p>}
-    <div className="settings-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={() => onSave({ ...profile, avatarDataUrl }, "头像已更新")}><Check size={15} />保存头像</button></div>
+    <div className="settings-actions"><button className="secondary-button" onClick={onClose}>取消</button><button className="primary-button" onClick={() => void onSaveAvatar(avatarFile)} disabled={avatarDataUrl === profile.avatarDataUrl}><Check size={15} />保存头像</button></div>
   </section></div>;
 
   if (kind === "email") {
     const emailReady = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
     const submitEmail = (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); if (emailReady) onSave({ ...profile, email: email.trim() }, profile.email ? "邮箱已更新" : "邮箱已绑定"); else setError("请输入有效的邮箱地址"); };
     return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="email-title">
-      <div className="settings-dialog-head"><div><span className="panel-eyebrow">EMAIL</span><h2 id="email-title">{profile.email ? "更换绑定邮箱" : "绑定邮箱"}</h2><p>用于完善当前设备上的个人资料。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭邮箱设置"><X size={18} /></button></div>
+      <div className="settings-dialog-head"><div><span className="panel-eyebrow">EMAIL</span><h2 id="email-title">{profile.email ? "更换绑定邮箱" : "绑定邮箱"}</h2><p>邮箱会同步到当前账号。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭邮箱设置"><X size={18} /></button></div>
       <form onSubmit={submitEmail}><label className="account-dialog-field"><span>邮箱地址</span><div><Mail size={16} /><input type="email" value={email} onChange={(event) => { setEmail(event.target.value); setError(""); }} autoComplete="email" placeholder="name@example.com" autoFocus /></div></label>{error && <p className="account-dialog-error" role="alert">{error}</p>}<div className="settings-actions"><button className="secondary-button" type="button" onClick={onClose}>取消</button><button className="primary-button" type="submit" disabled={!email.trim()}><Check size={15} />确认绑定</button></div></form>
+    </section></div>;
+  }
+
+  if (kind === "security") {
+    const submitPassword = async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (newPassword.length < 8) { setError("新密码至少需要 8 个字符"); return; }
+      if (newPassword !== confirmPassword) { setError("两次输入的新密码不一致"); return; }
+      setSecurityBusy("password"); setError("");
+      try { await onChangePassword(currentPassword, newPassword); }
+      catch (caught) { setError(caught instanceof Error ? caught.message : "密码修改失败"); }
+      finally { setSecurityBusy(null); }
+    };
+    const revokeSessions = async () => {
+      setSecurityBusy("sessions"); setError("");
+      try { await onLogoutAll(); }
+      catch (caught) { setError(caught instanceof Error ? caught.message : "退出其他设备失败"); setSecurityBusy(null); }
+    };
+    return <div {...backdropProps}><section className="settings-dialog account-dialog" role="dialog" aria-modal="true" aria-labelledby="security-title">
+      <div className="settings-dialog-head"><div><span className="panel-eyebrow">ACCOUNT SECURITY</span><h2 id="security-title">账号安全</h2><p>修改密码后，其他设备上的登录会立即失效。</p></div><button className="icon-button" onClick={onClose} aria-label="关闭账号安全"><X size={18} /></button></div>
+      <form onSubmit={(event) => void submitPassword(event)}>
+        <label className="account-dialog-field"><span>当前密码</span><div><LockKeyhole size={16} /><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" /></div></label>
+        <label className="account-dialog-field"><span>新密码</span><div><LockKeyhole size={16} /><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" /></div></label>
+        <label className="account-dialog-field"><span>确认新密码</span><div><LockKeyhole size={16} /><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" /></div></label>
+        {error && <p className="account-dialog-error" role="alert">{error}</p>}
+        <div className="settings-actions"><button className="secondary-button" type="button" disabled={Boolean(securityBusy)} onClick={() => void revokeSessions()}>{securityBusy === "sessions" ? <LoaderCircle className="spin" size={15} /> : <LogOut size={15} />}退出全部设备</button><button className="primary-button" type="submit" disabled={Boolean(securityBusy) || !currentPassword || !newPassword || !confirmPassword}>{securityBusy === "password" ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}更新密码</button></div>
+      </form>
     </section></div>;
   }
 
@@ -668,20 +739,29 @@ function AccountDialog({ kind, account, profile, onSave, onLogout, onClose }: { 
   </section></div>;
 }
 
-function LoginScreen({ coverUrl, onLogin }: { coverUrl: string; onLogin: (account: string, remember: boolean) => void }) {
+function LoginScreen({ coverUrl, onLogin }: { coverUrl: string; onLogin: (account: string, password: string, remember: boolean, mode: "login" | "register") => Promise<void> }) {
+  const [mode, setMode] = useState<"login" | "register">("login");
   const [account, setAccount] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [remember, setRemember] = useState(true);
   const [passwordVisible, setPasswordVisible] = useState(false);
   const [attempted, setAttempted] = useState(false);
-  const ready = account.trim().length >= 2 && password.length >= 4;
-  const authenticate = () => {
+  const [busy, setBusy] = useState<"login" | "register" | null>(null);
+  const [serverError, setServerError] = useState("");
+  const ready = account.trim().length >= 2 && password.length >= (mode === "login" ? 1 : 8) && (mode === "login" || password === confirmPassword);
+  const authenticate = async () => {
     setAttempted(true);
-    if (ready) onLogin(account.trim(), remember);
+    setServerError("");
+    if (!ready || busy) return;
+    setBusy(mode);
+    try { await onLogin(account.trim(), password, remember, mode); }
+    catch (caught) { setServerError(caught instanceof Error ? caught.message : mode === "login" ? "登录失败" : "注册失败"); }
+    finally { setBusy(null); }
   };
   const submit = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    authenticate();
+    void authenticate();
   };
 
   return <main className="login-screen">
@@ -694,21 +774,23 @@ function LoginScreen({ coverUrl, onLogin }: { coverUrl: string; onLogin: (accoun
     <section className="login-panel">
       <div className="login-form-wrap">
         <span className="panel-eyebrow">LOCAL WORKSPACE ACCESS</span>
-        <h1>欢迎回来</h1>
-        <p>登录后继续你的剧本到视频创作。</p>
+        <h1>{mode === "login" ? "欢迎回来" : "创建账号"}</h1>
+        <p>{mode === "login" ? "登录后继续你的剧本到视频创作。" : "注册后，项目和资产会隔离保存在你的账号中。"}</p>
         <form className="login-form" onSubmit={submit} noValidate>
           <label className="login-field"><span>账号</span><div><UserRound size={17} /><input value={account} onChange={(event) => setAccount(event.target.value)} autoComplete="username" placeholder="请输入账号" aria-invalid={attempted && account.trim().length < 2} /></div></label>
-          <label className="login-field"><span>密码</span><div><LockKeyhole size={17} /><input type={passwordVisible ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" placeholder="请输入密码" aria-invalid={attempted && password.length < 4} /><button type="button" aria-label={passwordVisible ? "隐藏密码" : "显示密码"} title={passwordVisible ? "隐藏密码" : "显示密码"} onClick={() => setPasswordVisible((current) => !current)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
-          <div className="login-options"><label><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} /><span>下次自动进入</span></label><small>仅保存在当前设备</small></div>
-          {attempted && !ready && <p className="login-error" role="alert">请输入至少 2 位账号和 4 位密码</p>}
+          <label className="login-field"><span>密码</span><div><LockKeyhole size={17} /><input type={passwordVisible ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} autoComplete={mode === "login" ? "current-password" : "new-password"} placeholder={mode === "login" ? "请输入密码" : "至少 8 个字符"} aria-invalid={attempted && password.length < (mode === "login" ? 1 : 8)} /><button type="button" aria-label={passwordVisible ? "隐藏密码" : "显示密码"} title={passwordVisible ? "隐藏密码" : "显示密码"} onClick={() => setPasswordVisible((current) => !current)}>{passwordVisible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
+          {mode === "register" && <label className="login-field"><span>确认密码</span><div><LockKeyhole size={17} /><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="再次输入密码" aria-invalid={attempted && password !== confirmPassword} /></div></label>}
+          <div className="login-options"><label><input type="checkbox" checked={remember} onChange={(event) => setRemember(event.target.checked)} /><span>下次自动进入</span></label><small>30 天内保持登录</small></div>
+          {attempted && !ready && <p className="login-error" role="alert">{mode === "register" && password.length < 8 ? "密码至少需要 8 个字符" : mode === "register" && password !== confirmPassword ? "两次输入的密码不一致" : password.length < 1 ? "请输入密码" : "账号至少需要 2 个字符"}</p>}
+          {serverError && <p className="login-error" role="alert">{serverError}</p>}
           <div className="login-actions">
-            <button className="login-submit" type="submit" disabled={!account.trim() || !password}>登录</button>
-            <button className="login-register" type="button" disabled={!account.trim() || !password} onClick={authenticate}>注册</button>
+            <button className="login-submit" type="submit" disabled={!ready || Boolean(busy)}>{busy ? <><LoaderCircle className="spin" size={16} />{mode === "login" ? "登录中" : "注册中"}</> : mode === "login" ? "登录" : "创建账号"}</button>
+            <button className="login-register" type="button" disabled={Boolean(busy)} onClick={() => { setMode((current) => current === "login" ? "register" : "login"); setAttempted(false); setServerError(""); }}>{mode === "login" ? "注册新账号" : "返回登录"}</button>
           </div>
         </form>
-        <div className="login-note"><LogOut size={14} /><span>密码不会保存，登录状态可随时从右上角退出。</span></div>
+        <div className="login-note"><LogOut size={14} /><span>账号数据由服务器安全保存，登录状态可随时退出。</span></div>
       </div>
-      <footer><span>拥抱世界 AI</span><small>LOCAL FIRST · PRIVATE BY DEFAULT</small></footer>
+      <footer><span>拥抱世界 AI</span><small>PRIVATE WORKSPACE · CLOUD SYNC</small></footer>
     </section>
   </main>;
 }
@@ -1826,6 +1908,7 @@ type VideoToolDraft = {
   prompt: string;
   model: VideoSettings["model"];
   ratio: "16:9" | "9:16" | "1:1";
+  resolution: VideoResolution;
   duration: number;
   generateAudio: boolean;
   watermark: boolean;
@@ -1855,7 +1938,7 @@ function readVideoImage(file: File) {
 
 function VideoToolStudio({ videoType, videoSettings, onConfigure, onToast }: { videoType: StudioVideoType; videoSettings: VideoSettings | null; onConfigure: () => void; onToast: (message: string) => void }) {
   const config = studioVideoConfig[videoType];
-  const [draft, setDraft] = useState<VideoToolDraft>({ prompt: "", model: videoSettings?.model ?? videoModelOptions[0], ratio: "16:9", duration: 5, generateAudio: true, watermark: false });
+  const [draft, setDraft] = useState<VideoToolDraft>({ prompt: "", model: videoSettings?.model ?? videoModelOptions[0], ratio: "16:9", resolution: "720p", duration: 5, generateAudio: true, watermark: false });
   const [references, setReferences] = useState<VideoUploadItem[]>([]);
   const [firstFrame, setFirstFrame] = useState<VideoUploadItem | null>(null);
   const [lastFrame, setLastFrame] = useState<VideoUploadItem | null>(null);
@@ -1933,7 +2016,7 @@ function VideoToolStudio({ videoType, videoSettings, onConfigure, onToast }: { v
     setPageError("");
     try {
       const result = await api.generateStudioVideo(videoType, {
-        prompt: draft.prompt.trim(), model: draft.model, ratio: draft.ratio, duration: draft.duration,
+        prompt: draft.prompt.trim(), model: draft.model, ratio: draft.ratio, resolution: draft.resolution, duration: draft.duration,
         generateAudio: draft.generateAudio, watermark: draft.watermark,
         referenceImages: videoType === "reference-video" ? references.map((item) => item.dataUrl) : undefined,
         firstFrame: videoType === "keyframe-video" ? firstFrame?.dataUrl : undefined,
@@ -1971,7 +2054,7 @@ function VideoToolStudio({ videoType, videoSettings, onConfigure, onToast }: { v
         </div>
         <div className="character-field character-prompt-field"><div className="character-field-label"><span>视频提示词</span><button type="button" className="character-example-button" onClick={() => change("prompt", config.example)}><Sparkles size={13} />使用示例</button></div><textarea value={draft.prompt} maxLength={16000} onChange={(event) => change("prompt", event.target.value)} placeholder={config.placeholder} /><small>{draft.prompt.length} / 16000</small></div>
         <div className="character-field"><span>视频模型</span><SmoothSelect value={draft.model} onChange={(value) => change("model", value as VideoSettings["model"])} ariaLabel="视频模型" options={modelOptions} /></div>
-        <div className="studio-video-parameter-row"><div className="character-field"><span>画面比例</span><SmoothSelect value={draft.ratio} onChange={(value) => change("ratio", value as VideoToolDraft["ratio"])} ariaLabel="视频画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="character-field"><span>视频时长</span><SmoothSelect value={String(draft.duration)} onChange={(value) => change("duration", Number(value))} ariaLabel="视频时长" options={[4, 5, 6, 8, 10, 12].map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div></div>
+        <div className="studio-video-parameter-row"><div className="character-field"><span>画面比例</span><SmoothSelect value={draft.ratio} onChange={(value) => change("ratio", value as VideoToolDraft["ratio"])} ariaLabel="视频画面比例" options={[{ value: "16:9", label: "16:9 · 横屏" }, { value: "9:16", label: "9:16 · 竖屏" }, { value: "1:1", label: "1:1 · 方形" }]} /></div><div className="character-field"><span>视频分辨率</span><SmoothSelect value={draft.resolution} onChange={(value) => change("resolution", value as VideoResolution)} ariaLabel="视频分辨率" options={videoResolutionOptions} /></div><div className="character-field"><span>视频时长</span><SmoothSelect value={String(draft.duration)} onChange={(value) => change("duration", Number(value))} ariaLabel="视频时长" options={videoDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} /></div></div>
         <div className="studio-video-toggle-row"><button type="button" className={`video-toggle ${draft.generateAudio ? "on" : ""}`} onClick={() => change("generateAudio", !draft.generateAudio)} aria-pressed={draft.generateAudio}><span>生成声音</span><i /></button><button type="button" className={`video-toggle ${draft.watermark ? "on" : ""}`} onClick={() => change("watermark", !draft.watermark)} aria-pressed={draft.watermark}><span>添加水印</span><i /></button></div>
         {pageError && <div className="character-error" role="alert">{pageError}</div>}
         {!videoSettings?.configured ? <button type="button" className="primary-button character-generate" onClick={onConfigure}><Settings2 size={17} />前往模型设置</button> : <button type="button" className="primary-button character-generate" onClick={() => void generate()} disabled={!ready}>{submitting ? <LoaderCircle className="spin" size={18} /> : <WandSparkles size={18} />}{submitting ? "正在提交任务" : "开始生成视频"}</button>}
@@ -1983,7 +2066,7 @@ function VideoToolStudio({ videoType, videoSettings, onConfigure, onToast }: { v
             {selected?.outputUrl ? <video key={selected.id} src={selected.outputUrl} controls playsInline preload="metadata" /> : <div className="character-empty">{historyLoading ? <><LoaderCircle className="spin" size={26} /><strong>正在读取本地作品</strong></> : <><Film size={31} /><strong>{selected ? "视频正在生成" : "生成结果会显示在这里"}</strong><span>{selected ? `当前进度 ${selected.progress}%` : "上传素材并填写提示词，创建第一段视频"}</span></>}</div>}
             {selected && (selected.status === "queued" || selected.status === "processing") && <div className="character-generating studio-video-generating"><LoaderCircle className="spin" size={28} /><strong>{selected.status === "queued" ? "任务正在排队" : "正在生成视频"}</strong><span>{selected.progress}% · 完成后自动保存到本地</span><div><i style={{ width: `${Math.max(3, selected.progress)}%` }} /></div></div>}
             {selected?.status === "failed" && <div className="studio-video-failed"><X size={24} /><strong>生成未完成</strong><span>{selected.errorMessage || "请调整参数后重新生成"}</span></div>}
-            {selected?.outputUrl && <div className="character-preview-actions"><span>{selected.ratio} · {selected.duration}s</span><a className="icon-button" href={selected.outputUrl} download={`${videoType}-${selected.id}.mp4`} aria-label="下载生成视频" title="下载生成视频"><Download size={17} /></a></div>}
+            {selected?.outputUrl && <div className="character-preview-actions"><span>{selected.ratio} · {(selected.resolution ?? "720p").toUpperCase()} · {selected.duration}s</span><a className="icon-button" href={selected.outputUrl} download={`${videoType}-${selected.id}.mp4`} aria-label="下载生成视频" title="下载生成视频"><Download size={17} /></a></div>}
           </div>
           <aside className="character-history studio-video-history" aria-label="最近生成"><div><strong>最近生成</strong><span>{results.length ? `${results.length} 个` : "暂无记录"}</span></div>{results.length ? <div className="character-history-strip studio-video-history-strip">{results.map((item, index) => <button type="button" key={item.id} className={`${item.id === selected?.id ? "selected" : ""} ${item.status}`} onClick={() => setSelectedId(item.id)} aria-label={`查看第 ${index + 1} 个视频`}>{item.outputUrl ? <video src={item.outputUrl} muted preload="metadata" /> : <span className="studio-video-history-state">{item.status === "failed" ? <X size={15} /> : <LoaderCircle className="spin" size={15} />}</span>}<b>{item.status === "completed" ? `${item.duration}s` : item.status === "failed" ? "失败" : `${item.progress}%`}</b></button>)}</div> : <div className="character-history-empty"><Film size={18} /><span>生成后显示</span></div>}</aside>
         </div>
@@ -2400,6 +2483,12 @@ function DeleteSubjectDialog({ subject, busy, onConfirm, onClose }: { subject: S
   return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog delete-project-dialog delete-subject-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-subject-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">DELETE SUBJECT</span><h2 id="delete-subject-title">删除这个主体吗？</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭删除确认" disabled={busy}><X size={18} /></button></div><div className="delete-project-warning"><Trash2 size={18} /><p>主体“<strong>{subject.name}</strong>”将从当前项目中移除，已生成的分镜内容不会自动修改。</p></div><div className="settings-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" onClick={onConfirm} disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}确认删除</button></div></section></div>;
 }
 
+function DeleteShotDialog({ target, shotCount, busy, onConfirm, onClose }: { target: Shot | "all"; shotCount: number; busy: boolean; onConfirm: () => void; onClose: () => void }) {
+  const deletingAll = target === "all";
+  const title = deletingAll ? "删除全部分镜吗？" : `删除镜头 ${target.episodeNumber}-${target.shotOrder} 吗？`;
+  return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog delete-project-dialog delete-shot-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-shot-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">DELETE SHOT</span><h2 id="delete-shot-title">{title}</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭删除确认" disabled={busy}><X size={18} /></button></div><div className="delete-project-warning"><Trash2 size={18} /><p>{deletingAll ? <>当前项目的 <strong>{shotCount} 个分镜</strong>及其视频生成记录都会被删除，此操作无法撤销。</> : <>“<strong>{target.title}</strong>”及其视频生成记录会被删除，本集后续镜头将自动重新编号。</>}</p></div><div className="settings-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" onClick={onConfirm} disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}{busy ? "正在删除" : deletingAll ? "删除全部" : "确认删除"}</button></div></section></div>;
+}
+
 function DeleteProjectDialog({ project, busy, onConfirm, onClose }: { project: Project; busy: boolean; onConfirm: () => void; onClose: () => void }) {
   return <div className="settings-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog delete-project-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-project-title"><div className="settings-dialog-head"><div><span className="panel-eyebrow">DELETE PROJECT</span><h2 id="delete-project-title">确定删除这个项目吗？</h2></div><button className="icon-button" onClick={onClose} aria-label="关闭删除确认" disabled={busy}><X size={18} /></button></div><div className="delete-project-warning"><Trash2 size={18} /><p>项目“<strong>{project.title}</strong>”及其剧本、分集、主体和分镜数据将一并删除，且无法恢复。</p></div><div className="settings-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" onClick={onConfirm} disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}确认删除</button></div></section></div>;
 }
@@ -2478,9 +2567,12 @@ function SubjectsStage({ subjects, onNext, working, generatingSubjectId, deletin
   const cardDisabled = Boolean(deletingSubjectId);
   return <div className="stage-view subjects-stage"><StepHeader eyebrow="04 / SUBJECTS" title="主体资产" description="先固定故事里会反复出现的角色、场景与关键道具，保证后续画面的一致性。" action={<button className="secondary-button"><Plus size={15} /> 添加主体</button>} />{subjects.length ? <div className="subject-grid">{visibleSubjects.map((subject) => <SubjectCard key={subject.id} subject={subject} generating={activeGeneratingIds.includes(subject.id)} disabled={cardDisabled} onGenerateImage={onGenerateImage} onDelete={onDeleteSubject} onViewImage={onViewImage} />)}</div> : <div className="subject-empty"><UsersRound size={22} /><p>暂无主体资产</p><small>请返回上一阶段重新提取主体。</small></div>}{subjects.length > SUBJECTS_PER_PAGE && <nav className="subject-pagination" aria-label="主体分页"><span>第 {page} / {pageCount} 页</span><div><button className="icon-button small-icon" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page === 1} aria-label="上一页" title="上一页"><ChevronLeft size={16} /></button><button className="icon-button small-icon" onClick={() => setPage((current) => Math.min(pageCount, current + 1))} disabled={page === pageCount} aria-label="下一页" title="下一页"><ChevronRight size={16} /></button></div></nav>}<div className="action-row"><span className="action-hint"><UsersRound size={15} /> {subjects.length} 个主体 · 已生成主体提示词</span><button className="primary-button" onClick={onNext} disabled={working || !subjects.length}>{working ? <LoaderCircle className="spin" size={17} /> : <ScanSearch size={17} />}提取分镜</button></div></div>;
 }
-function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, onViewVideo, working }: { shots: Shot[]; subjects: Subject[]; episodes: Episode[]; jobs: RenderJob[]; onNext: () => void; onGenerateVideo: (shot: Shot) => void; onViewVideo: (shot: Shot, url: string) => void; working: boolean }) {
+function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, onViewVideo, onDeleteShot, onDeleteAll, working, deleting }: { shots: Shot[]; subjects: Subject[]; episodes: Episode[]; jobs: RenderJob[]; onNext: () => void; onGenerateVideo: (shot: Shot) => void; onViewVideo: (shot: Shot, url: string) => void; onDeleteShot: (shot: Shot) => void; onDeleteAll: () => void; working: boolean; deleting: boolean }) {
   const [selectedEpisode, setSelectedEpisode] = useState(0);
   const visible = selectedEpisode ? shots.filter((shot) => shot.episodeNumber === selectedEpisode) : shots;
+  const projectShotIds = new Set(shots.map((shot) => shot.id));
+  const activeShotIds = new Set(jobs.filter((job) => job.shotId && projectShotIds.has(job.shotId) && (job.status === "queued" || job.status === "processing")).map((job) => job.shotId).filter((id): id is string => Boolean(id)));
+  const hasActiveVideo = activeShotIds.size > 0;
   const renderReferences = (shot: Shot, role: Subject["role"]) => {
     const references = subjectsMentionedInShot(shot, subjects).filter((subject) => subject.role === role && subject.imageUrl);
     return <span className="shot-reference-cell">{references.length ? references.map((subject) => <span className="shot-reference-thumb" key={subject.id} title={subject.name}><img src={subject.imageUrl!} alt={subject.name} /></span>) : <span className="shot-empty">—</span>}</span>;
@@ -2501,67 +2593,61 @@ function ShotsStage({ shots, subjects, episodes, jobs, onNext, onGenerateVideo, 
     return <span className="shot-video-cell"><button className="shot-video-button" onClick={() => onGenerateVideo(shot)} disabled={active} aria-label={`生成第${shot.episodeNumber}集第${shot.shotOrder}个镜头视频`} title={active ? "视频生成中" : failed ? job.errorMessage || "上次生成失败，点击重试" : "生成视频"}>{active ? <LoaderCircle className="spin" size={15} /> : <Clapperboard size={15} />}</button>{active ? <span className="shot-video-progress">{job?.status === "queued" ? "生成中" : `${job?.progress ?? 0}%`}</span> : failed ? <span className="shot-video-progress failed">生成失败</span> : null}</span>;
   };
   return <div className="stage-view shots-view">
-    <StepHeader eyebrow="05 / STORYBOARD" title="分镜清单" description="按集查看镜头、角色、物品和对白。确认后即可为单个镜头选择参考图并生成视频。" action={<div className="episode-tabs"><button className={selectedEpisode === 0 ? "selected" : ""} onClick={() => setSelectedEpisode(0)}>全部</button>{episodes.map((episode) => <button key={episode.id} className={selectedEpisode === episode.episodeNumber ? "selected" : ""} onClick={() => setSelectedEpisode(episode.episodeNumber)}>{formatEpisodeLabel(episode.episodeNumber)}</button>)}</div>} />
-    <div className="shot-table"><div className="shot-table-head"><span>镜头</span><span>角色</span><span>物品</span><span>场景 / 动作</span><span>对白</span><span>画面提示词</span><span>时长</span><span>视频</span></div>{visible.map((shot) => <article className="shot-row" key={shot.id}>
+    <StepHeader eyebrow="05 / STORYBOARD" title="分镜清单" description="按集查看镜头、角色、物品和对白。确认后即可为单个镜头选择参考图并生成视频。" action={<div className="shot-header-actions"><div className="episode-tabs"><button className={selectedEpisode === 0 ? "selected" : ""} onClick={() => setSelectedEpisode(0)}>全部</button>{episodes.map((episode) => <button key={episode.id} className={selectedEpisode === episode.episodeNumber ? "selected" : ""} onClick={() => setSelectedEpisode(episode.episodeNumber)}>{formatEpisodeLabel(episode.episodeNumber)}</button>)}</div><button type="button" className="shot-delete-all-button" onClick={onDeleteAll} disabled={!shots.length || deleting || hasActiveVideo} title={hasActiveVideo ? "仍有视频正在生成" : "删除项目中的全部分镜"}><Trash2 size={14} />删除全部</button></div>} />
+    <div className="shot-table"><div className="shot-table-head"><span>镜头</span><span>角色</span><span>物品</span><span>场景 / 动作</span><span>对白</span><span>画面提示词</span><span>时长</span><span>视频</span><span>操作</span></div>{visible.map((shot) => <article className="shot-row" key={shot.id}>
       <span className="shot-number">E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")}<strong>{shot.title.split("·").slice(1).join("·").trim()}</strong></span>
       {renderReferences(shot, "character")}
       {renderReferences(shot, "prop")}
       <span><b>{shot.location}</b><small>{shot.action}</small>{renderReferences(shot, "location")}</span>
       <span className="dialogue">{shot.dialogue || "—"}</span>
-      <span className="shot-prompt">{shot.visualPrompt}</span>
+      <span className={`shot-prompt${shot.visualPrompt.trim().length > 100 ? " is-scrollable" : ""}`}>{shot.visualPrompt}</span>
       <span className="shot-duration">{shot.durationSeconds}s<i>{shot.camera}</i></span>
       {renderVideoCell(shot)}
-    </article>)}</div>
+      <span className="shot-delete-cell"><button type="button" className="shot-delete-button" onClick={() => onDeleteShot(shot)} disabled={deleting || activeShotIds.has(shot.id)} aria-label={`删除第${shot.episodeNumber}集第${shot.shotOrder}个分镜`} title={activeShotIds.has(shot.id) ? "视频正在生成，暂时无法删除" : "删除分镜"}><Trash2 size={15} /></button></span>
+    </article>)}{!visible.length && <div className="shot-table-empty">当前没有分镜</div>}</div>
     <div className="action-row"><span className="action-hint"><ScanSearch size={15} /> {shots.length} 个镜头 · 预估 {formatDuration(shots.reduce((sum, shot) => sum + shot.durationSeconds, 0))}</span><button className="primary-button" onClick={onNext} disabled={!shots.length}><Combine size={17} />视频合并</button></div>
   </div>;
 }
 
-type ShotEditInput = Pick<Shot, "location" | "action" | "visualPrompt">;
-
-function ShotVideoPreviewDialog({ shot, url, history, onSave, onRegenerate, onClose }: { shot: Shot; url: string; history: Array<{ id: string; outputUrl: string; createdAt: string; generationPrompt: string | null }>; onSave: (input: ShotEditInput) => Promise<boolean>; onRegenerate: (prompt: string | null) => void; onClose: () => void }) {
+function ShotVideoPreviewDialog({ shot, url, history, onRegenerate, onClose }: { shot: Shot; url: string; history: Array<{ id: string; outputUrl: string; createdAt: string; generationPrompt: string | null }>; onRegenerate: (prompt: string | null) => void; onClose: () => void }) {
   const [selectedUrl, setSelectedUrl] = useState(url);
   const [selectedCreatedAt, setSelectedCreatedAt] = useState(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString());
   const [duration, setDuration] = useState<number | null>(null);
-  const [editing, setEditing] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState<ShotEditInput>({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt });
   const selectedGenerationPrompt = history.find((item) => item.outputUrl === selectedUrl)?.generationPrompt ?? null;
-  const selectedSubmittedPrompt = submittedVideoPrompt(selectedGenerationPrompt);
-  useEffect(() => { setSelectedUrl(url); setSelectedCreatedAt(history.find((item) => item.outputUrl === url)?.createdAt ?? new Date().toISOString()); }, [history, url]);
-  useEffect(() => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); }, [shot.location, shot.action, shot.visualPrompt]);
-  const cancelEditing = () => { setDraft({ location: shot.location, action: shot.action, visualPrompt: shot.visualPrompt }); setEditing(false); };
-  const saveEditing = async () => {
-    const input = { location: draft.location.trim(), action: draft.action.trim(), visualPrompt: draft.visualPrompt.trim() };
-    if (!input.location || !input.action || !input.visualPrompt) return;
-    setSaving(true);
-    const saved = await onSave(input);
-    setSaving(false);
-    if (saved) setEditing(false);
-  };
-  const validDraft = Boolean(draft.location.trim() && draft.action.trim() && draft.visualPrompt.trim());
-  return <div className="settings-backdrop shot-video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) onClose(); }}><section className="shot-video-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-preview-title">
-    <div className="shot-video-preview-main"><video className="shot-video-player" src={selectedUrl} controls autoPlay playsInline onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} /><div className="shot-video-history"><strong>历史视频</strong>{history.length ? history.map((item) => <button className={`shot-video-history-item ${item.outputUrl === selectedUrl ? "selected" : ""}`} type="button" key={item.id} aria-label="查看历史视频" onClick={() => { setSelectedUrl(item.outputUrl); setSelectedCreatedAt(item.createdAt); setDuration(null); }}><video src={item.outputUrl} muted preload="metadata" /></button>) : <button className="shot-video-history-item selected" type="button" aria-label="当前视频"><video src={selectedUrl} muted preload="metadata" /></button>}</div></div>
+  const [promptDraft, setPromptDraft] = useState(selectedGenerationPrompt ?? "");
+  useEffect(() => {
+    const selected = history.find((item) => item.outputUrl === url);
+    setSelectedUrl(url);
+    setSelectedCreatedAt(selected?.createdAt ?? new Date().toISOString());
+    setPromptDraft(selected?.generationPrompt ?? "");
+  }, [url]);
+  return <div className="settings-backdrop shot-video-preview-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="shot-video-preview-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-preview-title">
+    <div className="shot-video-preview-main"><video className="shot-video-player" src={selectedUrl} controls autoPlay playsInline onLoadedMetadata={(event) => setDuration(event.currentTarget.duration)} /><div className="shot-video-history"><strong>历史视频</strong>{history.length ? history.map((item) => <button className={`shot-video-history-item ${item.outputUrl === selectedUrl ? "selected" : ""}`} type="button" key={item.id} aria-label="查看历史视频" onClick={() => { setSelectedUrl(item.outputUrl); setSelectedCreatedAt(item.createdAt); setPromptDraft(item.generationPrompt ?? ""); setDuration(null); }}><video src={item.outputUrl} muted preload="metadata" /></button>) : <button className="shot-video-history-item selected" type="button" aria-label="当前视频"><video src={selectedUrl} muted preload="metadata" /></button>}</div></div>
     <aside className="shot-video-preview-sidebar">
-      <div className="shot-video-preview-head"><div><span className="panel-eyebrow">SHOT VIDEO</span><h2 id="shot-video-preview-title">{shot.title}</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")}</p></div><button className="icon-button" onClick={onClose} disabled={saving} aria-label="关闭视频预览"><X size={18} /></button></div>
+      <div className="shot-video-preview-head"><div><span className="panel-eyebrow">SHOT VIDEO</span><h2 id="shot-video-preview-title">{shot.title}</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")}</p></div><button className="icon-button" onClick={onClose} aria-label="关闭视频预览"><X size={18} /></button></div>
       <div className="shot-video-meta"><span>生成时间 <b>{new Date(selectedCreatedAt).toLocaleString("zh-CN", { hour12: false })}</b></span><span>视频时长 <b>{duration ? formatDuration(Math.round(duration)) : `${shot.durationSeconds}s`}</b></span><span>镜头信息 <b>{shot.camera} · {shot.durationSeconds}s</b></span></div>
-      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>场景与动作</span>{!editing && <button type="button" onClick={() => setEditing(true)}><Pencil size={13} />编辑</button>}</div>{editing ? <div className="shot-video-edit-fields"><label><span>场景</span><input value={draft.location} maxLength={500} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, location: event.target.value }))} /></label><label><span>动作</span><textarea value={draft.action} maxLength={5000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, action: event.target.value }))} /></label></div> : <p>{shot.location} · {shot.action}</p>}</section>
-      <section className={`shot-video-detail ${editing ? "is-editing" : ""}`}><div className="shot-video-detail-head"><span>分镜画面提示词</span></div>{editing ? <textarea className="shot-video-prompt-editor" value={draft.visualPrompt} maxLength={12000} disabled={saving} onChange={(event) => setDraft((current) => ({ ...current, visualPrompt: event.target.value }))} /> : <p>{shot.visualPrompt}</p>}</section>
-      {!editing && <section className="shot-video-detail"><div className="shot-video-detail-head"><span>本次视频实际生成提示词</span></div><p className={`shot-video-generation-prompt ${selectedSubmittedPrompt ? "" : "is-missing"}`}>{selectedSubmittedPrompt || "该历史视频生成时尚未记录提示词；重新生成后会在这里显示本次提交的内容。"}</p>{selectedGenerationPrompt && selectedSubmittedPrompt !== selectedGenerationPrompt.trim() && <details className="shot-video-full-prompt"><summary>查看模型收到的完整提示词</summary><p>{selectedGenerationPrompt}</p></details>}</section>}
-      <div className="shot-video-preview-actions">{editing ? <div className="shot-video-edit-actions"><button className="secondary-button" type="button" onClick={cancelEditing} disabled={saving}>取消</button><button className="primary-button" type="button" onClick={() => void saveEditing()} disabled={saving || !validDraft}>{saving ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存修改</button></div> : <button className="secondary-button" type="button" onClick={() => onRegenerate(selectedSubmittedPrompt)}><RefreshCw size={15} /> 重新生成</button>}</div>
+      <label className="shot-video-detail shot-video-prompt-only"><span className="shot-video-detail-head"><span>完整提示词</span></span><textarea className="shot-video-generation-prompt" value={promptDraft} maxLength={16000} placeholder="该历史视频生成时尚未记录完整提示词" onChange={(event) => setPromptDraft(event.target.value)} /></label>
+      <div className="shot-video-preview-actions"><button className="secondary-button" type="button" onClick={() => onRegenerate(promptDraft.trim())} disabled={!promptDraft.trim()}><RefreshCw size={15} /> 重新生成</button></div>
     </aside>
   </section></div>;
 }
 
-function ShotVideoDialog({ shot, previousShot, subjects, videoModel, initialPrompt, busy, onGenerate, onClose }: { shot: Shot; previousShot?: Shot; subjects: Subject[]; videoModel?: VideoSettings["model"]; initialPrompt?: string | null; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"], duration: number, options: { prompt: string; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => void; onClose: () => void }) {
-  const referencedImageSubjects = subjectsMentionedInShot(shot, subjects).filter((subject) => Boolean(subject.imageUrl));
-  const [selectedIds, setSelectedIds] = useState<string[]>(referencedImageSubjects.map((subject) => subject.id));
-  const [prompt, setPrompt] = useState(() => initialPrompt?.trim() || shotVideoPrompt(shot, previousShot));
+function ShotVideoDialog({ shot, previousShot, subjects, projectStyle, videoModel, initialPrompt, promptMode, busy, onGenerate, onClose }: { shot: Shot; previousShot?: Shot; subjects: Subject[]; projectStyle: string; videoModel?: VideoSettings["model"]; initialPrompt?: string | null; promptMode: VideoPromptMode; busy: boolean; onGenerate: (references: Subject[], model: VideoSettings["model"], duration: number, options: { prompt: string; promptMode: VideoPromptMode; resolution: VideoResolution; watermark: boolean; audioMode: VideoAudioMode; speechRate: VideoSpeechRate; bgm: boolean; continuityMode: VideoContinuityMode }) => void; onClose: () => void }) {
+  const referencedSubjects = subjectsMentionedInShot(shot, subjects);
+  const referencedImageSubjects = referencedSubjects.filter((subject) => Boolean(subject.imageUrl));
+  const [selectedIds, setSelectedIds] = useState<string[]>(referencedImageSubjects.slice(0, 12).map((subject) => subject.id));
+  const [prompt, setPrompt] = useState(() => {
+    const savedPrompt = initialPrompt?.trim();
+    if (savedPrompt && promptMode === "complete") return savedPrompt;
+    return savedPrompt && hasStructuredVideoPrompt(savedPrompt) ? savedPrompt : shotVideoPrompt(shot, previousShot, referencedSubjects, projectStyle);
+  });
   const [model, setModel] = useState<VideoSettings["model"]>(videoModel ?? videoModelOptions[0]);
-  const [duration, setDuration] = useState(String(Math.min(12, Math.max(2, shot.durationSeconds))));
-  const [resolution, setResolution] = useState("720p");
+  const [duration, setDuration] = useState(String(normalizeVideoDuration(shot.durationSeconds)));
+  const [resolution, setResolution] = useState<VideoResolution>("720p");
   const [audioMode, setAudioMode] = useState<VideoAudioMode>(dialogueWithoutNarration(shot.dialogue) ? "dialogue" : "ambient");
   const [speechRate, setSpeechRate] = useState<VideoSpeechRate>("natural");
   const [bgm, setBgm] = useState(false);
+  const [watermark, setWatermark] = useState(false);
   const [continuityMode, setContinuityMode] = useState<VideoContinuityMode>("auto");
   const contentRef = useRef<HTMLDivElement>(null);
   const [continuityPreview, setContinuityPreview] = useState<ShotContinuityPreview | null>(previousShot ? null : { status: "first-shot", previousShotId: null, tailFrameUrl: null, message: "这是本集第一个镜头，无需承接上一镜头。" });
@@ -2577,24 +2663,24 @@ function ShotVideoDialog({ shot, previousShot, subjects, videoModel, initialProm
       .finally(() => { if (active) setContinuityPreviewLoading(false); });
     return () => { active = false; };
   }, [previousShot, shot.id, shot.projectId]);
-  const toggleReference = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  const toggleReference = (id: string) => setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : current.length < 12 ? [...current, id] : current);
   const selected = referencedImageSubjects.filter((subject) => selectedIds.includes(subject.id));
   return <div className="settings-backdrop video-generation-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}><section className="settings-dialog video-generation-dialog" role="dialog" aria-modal="true" aria-labelledby="shot-video-title">
     <div className="settings-dialog-head"><div><span className="panel-eyebrow">VIDEO GENERATION</span><h2 id="shot-video-title">视频生成</h2><p>E{String(shot.episodeNumber).padStart(2, "0")} · {String(shot.shotOrder).padStart(2, "0")} · {shot.title}</p></div><button className="icon-button" onClick={onClose} disabled={busy} aria-label="关闭视频生成"><X size={18} /></button></div>
     <div className="video-generation-content" ref={contentRef}>
-      <section className="video-generation-section"><span className="image-field-label">参考图 <small>仅显示当前镜头已引用的主体图片</small></span><div className="video-reference-grid">{referencedImageSubjects.map((subject) => <button type="button" key={subject.id} className={`video-reference-card ${selectedIds.includes(subject.id) ? "selected" : ""}`} onClick={() => toggleReference(subject.id)} disabled={busy}><img src={subject.imageUrl!} alt={subject.name} /><span>{subject.name}</span>{selectedIds.includes(subject.id) && <Check size={14} />}</button>)}{!referencedImageSubjects.length && <div className="video-reference-empty">当前镜头暂无已引用的主体图片。</div>}</div><small className="video-reference-count">已选择 {selected.length} 张参考图</small></section>
+      <section className="video-generation-section"><span className="image-field-label">参考图 <small>仅显示当前镜头已引用的主体图片，最多选择 12 张</small></span><div className="video-reference-grid">{referencedImageSubjects.map((subject) => { const selectedReference = selectedIds.includes(subject.id); return <button type="button" key={subject.id} className={`video-reference-card ${selectedReference ? "selected" : ""}`} onClick={() => toggleReference(subject.id)} disabled={busy || (!selectedReference && selectedIds.length >= 12)}><img src={subject.imageUrl!} alt={subject.name} /><span>{subject.name}</span>{selectedReference && <Check size={14} />}</button>; })}{!referencedImageSubjects.length && <div className="video-reference-empty">当前镜头暂无已引用的主体图片。</div>}</div><small className="video-reference-count">已选择 {selected.length} / 12 张参考图</small></section>
       <section className="video-generation-section continuity-preview-section"><span className="image-field-label">上一镜头尾帧 <small>{previousShot ? `E${String(previousShot.episodeNumber).padStart(2, "0")} · ${String(previousShot.shotOrder).padStart(2, "0")} · ${previousShot.title}` : "本集首镜头"}</small></span><div className={`continuity-preview ${continuityPreview?.tailFrameUrl ? "has-frame" : ""}`}>{continuityPreviewLoading ? <><LoaderCircle className="spin" size={20} /><span>正在截取上一镜头稳定尾帧</span></> : continuityPreview?.tailFrameUrl ? <><img src={continuityPreview.tailFrameUrl} alt="上一镜头稳定尾帧" /><div><strong>此画面将用于动作续接</strong><small>{continuityPreview.message}</small></div></> : <><Film size={20} /><span>{continuityPreview?.message ?? "暂时无法读取上一镜头尾帧。"}</span></>}</div></section>
       <section className="video-generation-section"><span className="image-field-label">镜头衔接</span><div className="video-tabs continuity-tabs" role="group" aria-label="镜头衔接方式">{([
         ["auto", "智能"], ["continue", "动作续接"], ["cut", "直接切镜"], ["scene", "场景切换"],
       ] as Array<[VideoContinuityMode, string]>).map(([value, label]) => <button type="button" key={value} className={continuityMode === value ? "selected" : ""} disabled={busy} onClick={() => setContinuityMode(value)}>{label}</button>)}</div></section>
-      <label className="video-generation-section prompt-section"><span className="image-field-label">视频提示词 <b>*</b></span><textarea value={prompt} maxLength={16000} disabled={busy} onChange={(event) => setPrompt(event.target.value)} /><small className="prompt-count">{prompt.length} / 16000</small></label>
+      <label className="video-generation-section prompt-section"><span className="image-field-label">{promptMode === "complete" ? "完整视频提示词" : "视频提示词"} <b>*</b></span><textarea value={prompt} maxLength={16000} disabled={busy} onChange={(event) => setPrompt(event.target.value)} /><small className="prompt-count">{prompt.length} / 16000</small></label>
       <div className="image-control image-model-control"><span>模型</span><SmoothSelect value={model} options={videoModelOptions.map((value) => ({ value, label: videoModelLabels[value] }))} disabled={busy} ariaLabel="视频模型" onChange={(value) => setModel(value as VideoSettings["model"])} /></div>
-      <div className="image-parameter-grid video-parameter-grid"><div className="image-control"><span>分辨率</span><SmoothSelect value={resolution} options={[{ value: "720p", label: "720p" }, { value: "1080p", label: "1080p" }]} disabled={busy} ariaLabel="视频分辨率" onChange={setResolution} /></div><label className="image-control video-duration-control"><span>时长 <small>2 - 12 秒</small></span><div className="video-duration-input"><input type="number" min={2} max={12} step={1} value={duration} disabled={busy} aria-label="自定义视频时长" onChange={(event) => setDuration(event.target.value.replace(/[^0-9]/g, ""))} /><b>秒</b></div></label></div>
-      <div className="image-parameter-grid video-audio-grid"><div className="image-control"><span>声音内容</span><SmoothSelect value={audioMode} options={[{ value: "dialogue", label: "原文对白 / 内心 OS" }, { value: "ambient", label: "仅环境音" }, { value: "silent", label: "无声" }]} disabled={busy} ariaLabel="声音内容" onChange={(value) => setAudioMode(value as VideoAudioMode)} /></div><div className="image-control"><span>说话语速</span><SmoothSelect value={speechRate} options={[{ value: "natural", label: "自然" }, { value: "slow", label: "舒缓" }]} disabled={busy || audioMode !== "dialogue"} ariaLabel="说话语速" onChange={(value) => setSpeechRate(value as VideoSpeechRate)} /></div></div>
+      <div className="image-parameter-grid video-parameter-grid"><div className="image-control"><span>分辨率</span><SmoothSelect value={resolution} options={videoResolutionOptions} disabled={busy} ariaLabel="视频分辨率" onChange={(value) => setResolution(value as VideoResolution)} /></div><div className="image-control"><span>时长</span><SmoothSelect value={duration} options={videoDurationOptions.map((value) => ({ value: String(value), label: `${value} 秒` }))} disabled={busy} ariaLabel="视频时长" onChange={setDuration} /></div></div>
+      <div className="image-parameter-grid video-audio-grid"><div className="image-control"><span>声音内容</span><SmoothSelect value={audioMode} options={[{ value: "dialogue", label: "原文对白 / 内心 OS" }, { value: "ambient", label: "仅环境音" }, { value: "silent", label: "无声" }]} disabled={busy} ariaLabel="声音内容" onChange={(value) => setAudioMode(value as VideoAudioMode)} /></div><div className="image-control"><span>说话语速</span><SmoothSelect value={speechRate} options={[{ value: "natural", label: "自然" }, { value: "slow", label: "舒缓" }]} disabled={busy || audioMode !== "dialogue"} ariaLabel="说话语速" onChange={(value) => setSpeechRate(value as VideoSpeechRate)} /></div><button type="button" className={`video-toggle shot-watermark-toggle ${watermark ? "on" : ""}`} onClick={() => setWatermark((current) => !current)} disabled={busy} aria-pressed={watermark}><span>添加水印</span><i /></button></div>
       <div className="video-toggle-grid single"><button type="button" className={`video-toggle ${bgm ? "on" : ""}`} onClick={() => setBgm((current) => !current)} disabled={audioMode === "silent"}><span>背景音乐</span><i /></button></div>
       <p className="video-generation-note">智能模式会在同机位动作续接时使用上一段稳定尾帧；换机位直接切镜，换地点直接进入新场景。</p>
     </div>
-    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model, Math.min(12, Math.max(2, Number(duration) || 10)), { prompt: prompt.trim(), audioMode, speechRate, bgm: audioMode !== "silent" && bgm, continuityMode })} disabled={busy || !prompt.trim() || Number(duration) < 2 || Number(duration) > 12}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "视频生成中" : "创作视频"}</button>
+    <button className="primary-button image-create-button" onClick={() => onGenerate(selected, model, Number(duration), { prompt: prompt.trim(), promptMode, resolution, watermark, audioMode, speechRate, bgm: audioMode !== "silent" && bgm, continuityMode })} disabled={busy || !prompt.trim()}>{busy ? <LoaderCircle className="spin" size={18} /> : <Clapperboard size={18} />} {busy ? "视频生成中" : "创作视频"}</button>
   </section></div>;
 }
 function RenderStage({ project, shots, jobs, onCoverCreated, onBack }: { project: Project | null; shots: Shot[]; jobs: RenderJob[]; onCoverCreated: (coverUrl: string) => void; onBack: () => void }) {

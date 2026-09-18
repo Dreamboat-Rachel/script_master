@@ -41,6 +41,7 @@ import {
   MessageSquarePlus,
   MessageSquareText,
   Package,
+  Pencil,
   Play,
   Plus,
   Search,
@@ -60,7 +61,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { api } from "./api";
-import type { AssetLibraryItem, Episode, ImageSettings, RenderJob, Shot, Subject, VideoSettings } from "./types";
+import type { AssetLibraryItem, CanvasProjectDetail, CanvasProjectSummary, Episode, ImageSettings, RenderJob, Shot, Subject, VideoResolution, VideoSettings } from "./types";
 
 type CanvasNodeKind = "note" | "text" | "imageGenerator" | "videoGenerator" | "image" | "video" | "audio" | "character" | "scene" | "prop" | "prompt" | "script" | "formattedScript" | "episodes" | "subjects" | "shot" | "shotItem" | "merge" | "media";
 type CanvasOperation = "format-script" | "extract-episodes" | "extract-subjects" | "generate-subject-images" | "extract-shots" | "render-videos" | "merge-videos";
@@ -86,8 +87,11 @@ type CanvasNode = Node<CanvasNodeData, "canvasCard">;
 type SavedCanvas = { nodes: CanvasNode[]; edges: Edge[] };
 type DragPayload = Partial<CanvasNodeData> & { kind: CanvasNodeKind };
 type ShotSubjectReference = { id: string; name: string; imageUrl: string | null; kind: "character" | "scene" | "prop" };
+type CanvasProject = CanvasProjectSummary;
 
-const STORAGE_KEY = "script-master-infinite-canvas-v1";
+const LEGACY_STORAGE_KEY = "script-master-infinite-canvas-v1";
+const CANVAS_PROJECTS_KEY = "script-master-infinite-canvas-projects-v1";
+const canvasStorageKey = (id: string) => `script-master-infinite-canvas-project-v1:${id}`;
 const dragMime = "application/x-script-master-canvas-node";
 const builtInSubjectStyles = ["电影写实", "日系动漫", "吉卜力治愈手绘", "赛博朋克动漫"];
 
@@ -187,12 +191,15 @@ const defaultEdges: Edge[] = [
   { id: "sample-shot-media", source: "sample-shot", target: "sample-media", type: "default", markerEnd: { type: MarkerType.ArrowClosed } },
 ];
 
-function readSavedCanvas(): SavedCanvas {
+function createCanvasProjectId() {
+  return globalThis.crypto?.randomUUID?.() ?? `canvas-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function parseSavedCanvas(raw: string | null, fallback: SavedCanvas): SavedCanvas {
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { nodes: defaultNodes, edges: defaultEdges };
+    if (!raw) return fallback;
     const parsed = JSON.parse(raw) as Partial<SavedCanvas>;
-    if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) return { nodes: defaultNodes, edges: defaultEdges };
+    if (!Array.isArray(parsed.nodes) || !Array.isArray(parsed.edges)) return fallback;
     return {
       nodes: parsed.nodes.map((node) => {
         const generatedSubject = node.data.source === "generated" && ["character", "scene", "prop"].includes(node.data.kind);
@@ -224,8 +231,45 @@ function readSavedCanvas(): SavedCanvas {
       edges: parsed.edges.map((edge) => ({ ...edge, type: "default" })),
     };
   } catch {
-    return { nodes: defaultNodes, edges: defaultEdges };
+    return fallback;
   }
+}
+
+function readSavedCanvas(canvasId: string): SavedCanvas {
+  return parseSavedCanvas(window.localStorage.getItem(canvasStorageKey(canvasId)), { nodes: [], edges: [] });
+}
+
+function writeCanvasProjects(projects: CanvasProject[]) {
+  window.localStorage.setItem(CANVAS_PROJECTS_KEY, JSON.stringify(projects));
+}
+
+function readCanvasProjects(): CanvasProject[] {
+  try {
+    const raw = window.localStorage.getItem(CANVAS_PROJECTS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) return parsed
+        .filter((project): project is CanvasProject => Boolean(project && typeof project === "object" && typeof (project as CanvasProject).id === "string" && typeof (project as CanvasProject).name === "string"))
+        .map((project) => ({ ...project, version: Number(project.version ?? 1) }));
+    }
+  } catch {
+    // A broken index should not prevent recovery of the legacy canvas below.
+  }
+
+  const legacyRaw = window.localStorage.getItem(LEGACY_STORAGE_KEY);
+  if (!legacyRaw) return [];
+  const legacy = parseSavedCanvas(legacyRaw, { nodes: defaultNodes, edges: defaultEdges });
+  const now = new Date().toISOString();
+  const project: CanvasProject = { id: createCanvasProjectId(), name: "原有画布", createdAt: now, updatedAt: now, nodeCount: legacy.nodes.length, version: 1 };
+  window.localStorage.setItem(canvasStorageKey(project.id), JSON.stringify(legacy));
+  writeCanvasProjects([project]);
+  return [project];
+}
+
+function formatCanvasProjectTime(value: string) {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "刚刚更新";
+  return new Intl.DateTimeFormat("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }).format(timestamp);
 }
 
 const shotScales = ["远景", "全景", "中景", "近景", "特写"];
@@ -234,11 +278,12 @@ const shotDurations = ["3 秒", "5 秒", "8 秒"];
 const shotRatios = ["16:9", "9:16", "1:1"];
 const subjectStyleOptions = [...builtInSubjectStyles, "自定义风格"];
 const defaultSubjectImageModels = ["doubao-seedream-5-0-pro-260628", "doubao-seedream-4-0-250828"];
-const defaultVideoModels: VideoSettings["model"][] = ["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"];
+const defaultVideoModels: VideoSettings["model"][] = ["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128", "doubao-seedance-2-5-260628"];
 const videoModelLabels: Record<VideoSettings["model"], string> = {
   "doubao-seedance-2-0-mini-260615": "Seedance 2.0 Mini",
   "doubao-seedance-2-0-260128": "Seedance 2.0",
   "doubao-seedance-2-0-fast-260128": "Seedance 2.0 Fast",
+  "doubao-seedance-2-5-260628": "Seedance 2.5",
 };
 
 const canvasAspectRatioOptions = [
@@ -253,6 +298,8 @@ const canvasAspectRatioOptions = [
 
 const canvasVideoRatioOptions = canvasAspectRatioOptions.filter(({ value }) => ["1:1", "16:9", "9:16"].includes(value));
 const canvasVideoDurationOptions = [4, 5, 6, 8, 10, 12];
+const canvasVideoResolutionOptions: Array<{ value: VideoResolution; label: string }> = [{ value: "480p", label: "480P" }, { value: "720p", label: "720P" }, { value: "1080p", label: "1080P" }];
+const normalizeCanvasVideoDuration = (value: number) => canvasVideoDurationOptions.reduce((closest, option) => Math.abs(option - value) < Math.abs(closest - value) ? option : closest);
 
 function nodeString(data: CanvasNodeData, key: string, fallback: string) {
   const value = data[key];
@@ -417,6 +464,7 @@ function VideoGeneratorCanvasNode({ id, data, selected }: NodeProps<CanvasNode>)
   const model = defaultVideoModels.includes(savedModel) ? savedModel : runtime?.videoModel ?? defaultVideoModels[0];
   const modelOptions = runtime?.videoModelOptions ?? defaultVideoModels;
   const ratio = nodeString(data, "videoRatio", "16:9");
+  const resolution = nodeString(data, "videoResolution", "720p") as VideoResolution;
   const savedDuration = numericChoice(data.videoDuration, 5);
   const duration = String(canvasVideoDurationOptions.includes(savedDuration) ? savedDuration : 5);
   const generateAudio = data.generateAudio !== false;
@@ -431,8 +479,9 @@ function VideoGeneratorCanvasNode({ id, data, selected }: NodeProps<CanvasNode>)
         <textarea className="nodrag nowheel" {...prompt.inputProps} maxLength={16000} placeholder="留空时读取上游文本节点" />
       </label>
       <label className="infinite-generator-field"><span>视频模型</span><CanvasSelect value={model} ariaLabel="视频生成模型" options={modelOptions.map((item) => ({ value: item, label: videoModelLabels[item] }))} onChange={(value) => updateNodeData(id, { videoModel: value })} /></label>
-      <div className="infinite-generator-grid">
+      <div className="infinite-generator-grid infinite-video-generator-grid">
         <label className="infinite-generator-field"><span>画面比例</span><CanvasSelect value={ratio} ariaLabel="视频比例" options={canvasVideoRatioOptions} onChange={(value) => updateNodeData(id, { videoRatio: value })} /></label>
+        <label className="infinite-generator-field"><span>视频分辨率</span><CanvasSelect value={resolution} ariaLabel="视频分辨率" options={canvasVideoResolutionOptions} onChange={(value) => updateNodeData(id, { videoResolution: value })} /></label>
         <label className="infinite-generator-field"><span>视频时长</span><CanvasSelect value={duration} ariaLabel="视频时长" options={canvasVideoDurationOptions.map((item) => ({ value: String(item), label: `${item} 秒` }))} onChange={(value) => updateNodeData(id, { videoDuration: value })} /></label>
       </div>
       <div className="infinite-generator-options">
@@ -634,12 +683,13 @@ function ShotCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
   const metadata = kindMeta.shotItem;
   const videoRunState = data.videoRunState as CanvasRunState | undefined;
   const running = videoRunState === "running";
-  const duration = Math.min(12, Math.max(2, numericChoice(data.recommendedDuration, 6)));
+  const duration = normalizeCanvasVideoDuration(numericChoice(data.recommendedDuration, 6));
   const location = nodeString(data, "location", "未设场景");
   const camera = nodeString(data, "camera", "默认机位");
   const savedModel = nodeString(data, "videoModel", runtime?.videoModel ?? defaultVideoModels[0]) as VideoSettings["model"];
   const videoModel = defaultVideoModels.includes(savedModel) ? savedModel : runtime?.videoModel ?? defaultVideoModels[0];
   const videoModelOptions = runtime?.videoModelOptions ?? defaultVideoModels;
+  const videoResolution = nodeString(data, "videoResolution", "720p") as VideoResolution;
   const subjectReferences = (Array.isArray(data.subjectReferences) ? data.subjectReferences : []).filter((item): item is ShotSubjectReference => Boolean(item && typeof item === "object" && typeof (item as ShotSubjectReference).id === "string" && typeof (item as ShotSubjectReference).name === "string"));
 
   return <article className={`infinite-node infinite-shot-card infinite-node-shotItem infinite-node-generated ${selected ? "selected" : ""}`} style={{ "--node-accent": metadata.color } as React.CSSProperties}>
@@ -671,6 +721,7 @@ function ShotCanvasNode({ id, data, selected }: NodeProps<CanvasNode>) {
     </div>
     <div className="infinite-shot-actions nodrag nowheel">
       <label className="infinite-shot-model-field"><span>视频模型</span><CanvasSelect value={videoModel} ariaLabel={`${data.label}视频模型`} options={videoModelOptions.map((model) => ({ value: model, label: videoModelLabels[model] }))} onChange={(model) => updateNodeData(id, { videoModel: model })} /></label>
+      <label className="infinite-shot-model-field"><span>视频分辨率</span><CanvasSelect value={videoResolution} ariaLabel={`${data.label}视频分辨率`} options={canvasVideoResolutionOptions} onChange={(value) => updateNodeData(id, { videoResolution: value })} /></label>
       {videoRunState === "error" && <p className="infinite-shot-status error"><CircleAlert size={12} />{nodeString(data, "videoStatusMessage", "视频生成失败")}</p>}
       {videoRunState === "success" && <p className="infinite-shot-status success"><Check size={12} />视频已生成并加入资产库</p>}
       <button type="button" disabled={running} onClick={() => runtime?.generateShotVideo(id)}>
@@ -867,8 +918,15 @@ async function canvasVideoReference(value: string) {
   });
 }
 
-export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (message: string) => void; onBack: () => void }) {
-  const saved = useMemo(readSavedCanvas, []);
+function InfiniteCanvasWorkspace({ initialCanvas, onToast, onBackToManager, onProjectSaved }: {
+  initialCanvas: CanvasProjectDetail;
+  onToast: (message: string) => void;
+  onBackToManager: () => void;
+  onProjectSaved: (project: CanvasProject) => void;
+}) {
+  const canvasId = initialCanvas.id;
+  const canvasName = initialCanvas.name;
+  const saved = useMemo(() => parseSavedCanvas(JSON.stringify({ nodes: initialCanvas.nodes, edges: initialCanvas.edges }), { nodes: [], edges: [] }), [initialCanvas]);
   const [nodes, setNodes, onNodesChange] = useNodesState<CanvasNode>(saved.nodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(saved.edges);
   const [flow, setFlow] = useState<ReactFlowInstance<CanvasNode, Edge> | null>(null);
@@ -880,7 +938,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
   const [assetQuery, setAssetQuery] = useState("");
   const [assetsOpen, setAssetsOpen] = useState(false);
   const [shotPromptDialog, setShotPromptDialog] = useState<{ episodeNodeId: string; episodeLabel: string; systemPrompt: string; style: string } | null>(null);
-  const [saveState, setSaveState] = useState<"saving" | "saved">("saved");
+  const [saveState, setSaveState] = useState<"saving" | "saved" | "error">("saved");
   const [zoom, setZoom] = useState(.75);
   const [historyPosition, setHistoryPosition] = useState({ index: 0, length: 1 });
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -889,9 +947,13 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
   const applyingHistoryRef = useRef(false);
   const nodesRef = useRef(nodes);
   const edgesRef = useRef(edges);
+  const saveSequenceRef = useRef(0);
+  const saveQueueRef = useRef<Promise<unknown>>(Promise.resolve());
+  const toastRef = useRef(onToast);
 
   useEffect(() => { nodesRef.current = nodes; }, [nodes]);
   useEffect(() => { edgesRef.current = edges; }, [edges]);
+  useEffect(() => { toastRef.current = onToast; }, [onToast]);
 
   useEffect(() => {
     let active = true;
@@ -903,12 +965,22 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
 
   useEffect(() => {
     setSaveState("saving");
+    const sequence = ++saveSequenceRef.current;
     const timer = window.setTimeout(() => {
-      window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ nodes, edges }));
-      setSaveState("saved");
-    }, 280);
+      saveQueueRef.current = saveQueueRef.current.catch(() => undefined).then(() => api.updateCanvas(canvasId, { name: canvasName, nodes, edges }))
+        .then((updated) => {
+          if (sequence !== saveSequenceRef.current) return;
+          onProjectSaved(updated);
+          setSaveState("saved");
+        })
+        .catch((caught) => {
+          if (sequence !== saveSequenceRef.current) return;
+          setSaveState("error");
+          toastRef.current(caught instanceof Error ? caught.message : "画布保存失败");
+        });
+    }, 700);
     return () => window.clearTimeout(timer);
-  }, [nodes, edges]);
+  }, [canvasId, canvasName, edges, nodes, onProjectSaved]);
 
   useEffect(() => {
     if (applyingHistoryRef.current) {
@@ -1129,6 +1201,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
       const savedModel = nodeString(node.data, "videoModel", settings.model || defaultVideoModels[0]) as VideoSettings["model"];
       const model = defaultVideoModels.includes(savedModel) ? savedModel : settings.model;
       const ratio = nodeString(node.data, "videoRatio", "16:9") as "16:9" | "9:16" | "1:1";
+      const resolution = nodeString(node.data, "videoResolution", "720p") as VideoResolution;
       const savedDuration = numericChoice(node.data.videoDuration, 5);
       const duration = canvasVideoDurationOptions.includes(savedDuration) ? savedDuration : 5;
       const referenceImages = await Promise.all(referenceUrls.map(canvasVideoReference));
@@ -1136,6 +1209,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         prompt,
         model,
         ratio,
+        resolution,
         duration,
         generateAudio: node.data.generateAudio !== false,
         watermark: false,
@@ -1153,12 +1227,12 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         kind: "video",
         label: "视频结果",
         description: prompt,
-        meta: `${ratio} · ${duration} 秒 · ${videoModelLabels[model]}`,
+        meta: `${ratio} · ${resolution.toUpperCase()} · ${duration} 秒 · ${videoModelLabels[model]}`,
         mediaUrl: result.outputUrl,
         thumbnailUrl: null,
         mediaType: "video",
       }], "canvas-output");
-      patchCanvasNode(nodeId, { runState: "success", statusMessage: "视频已生成并加入资产库", videoModel: model, videoRatio: ratio, videoDuration: String(duration), referenceCount: referenceImages.length });
+      patchCanvasNode(nodeId, { runState: "success", statusMessage: "视频已生成并加入资产库", videoModel: model, videoRatio: ratio, videoResolution: resolution, videoDuration: String(duration), referenceCount: referenceImages.length });
       await refreshAssets();
       onToast("视频已生成并加入资产库");
     } catch (error) {
@@ -1223,7 +1297,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
       onToast("当前镜头缺少项目数据，请重新生成本集分镜");
       return;
     }
-    const duration = Math.min(12, Math.max(2, numericChoice(node.data.recommendedDuration, 6)));
+    const duration = normalizeCanvasVideoDuration(numericChoice(node.data.recommendedDuration, 6));
     patchCanvasNode(nodeId, { videoRunState: "running", videoStatusMessage: "正在提交视频任务" });
     try {
       const referenceSubjectIds = (Array.isArray(node.data.subjectReferences) ? node.data.subjectReferences : [])
@@ -1232,7 +1306,8 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         .slice(0, 12);
       const savedModel = nodeString(node.data, "videoModel", videoSettings?.model ?? defaultVideoModels[0]) as VideoSettings["model"];
       const model = defaultVideoModels.includes(savedModel) ? savedModel : videoSettings?.model ?? defaultVideoModels[0];
-      const submitted = await api.render(projectId, { shotId, duration, model, continuityMode: "auto", ...(referenceSubjectIds.length ? { referenceSubjectIds } : {}) });
+      const resolution = nodeString(node.data, "videoResolution", "720p") as VideoResolution;
+      const submitted = await api.render(projectId, { shotId, duration, model, resolution, continuityMode: "auto", ...(referenceSubjectIds.length ? { referenceSubjectIds } : {}) });
       let completed: RenderJob | null = submitted.status === "completed" ? submitted : null;
       for (let attempt = 0; !completed && attempt < 360; attempt += 1) {
         const job = (await api.jobs()).find((item) => item.id === submitted.id);
@@ -1251,7 +1326,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         kind: "video",
         label: node.data.label,
         description: completed.generationPrompt || nodeString(node.data, "visualPrompt", node.data.description),
-        meta: `${duration} 秒 · 已生成`,
+        meta: `${resolution.toUpperCase()} · ${duration} 秒 · 已生成`,
         mediaUrl: completed.outputUrl,
         thumbnailUrl: null,
         mediaType: "video",
@@ -1777,10 +1852,10 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
   return <main className="infinite-canvas-content">
     <header className="infinite-canvas-head">
       <div className="infinite-canvas-title">
-        <button type="button" onClick={onBack} aria-label="返回首页" title="返回首页"><ArrowLeft size={18} /></button>
+        <button type="button" onClick={onBackToManager} aria-label="返回画布管理" title="返回画布管理"><ArrowLeft size={18} /></button>
         <span><LayoutGrid size={14} /></span>
-        <strong>无限画布</strong>
-        <small>{nodes.length} 个节点</small>
+        <strong>{canvasName}</strong>
+        <small>无限画布 · {nodes.length} 个节点</small>
       </div>
       <div className="infinite-toolbar-center">
         <button type="button" disabled={historyPosition.index === 0} onClick={() => moveHistory(-1)} aria-label="撤销" title="撤销"><Undo2 size={16} /></button>
@@ -1796,7 +1871,7 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         <button type="button" className="infinite-clear-canvas" disabled={!nodes.length} onClick={clearAllNodes} aria-label="清空全部节点" title="清空全部节点"><Trash2 size={16} /></button>
       </div>
       <div className="infinite-head-actions">
-        <span className={`infinite-save-state ${saveState}`}><Check size={13} />{saveState === "saving" ? "保存中" : "已保存"}</span>
+        <span className={`infinite-save-state ${saveState}`}>{saveState === "error" ? <CircleAlert size={13} /> : <Check size={13} />}{saveState === "saving" ? "保存中" : saveState === "error" ? "保存失败" : "已保存"}</span>
       </div>
     </header>
 
@@ -1893,6 +1968,181 @@ export default function InfiniteCanvasStudio({ onToast, onBack }: { onToast: (me
         <div className="settings-actions">
           <button type="button" className="secondary-button" onClick={() => setShotPromptDialog(null)}>取消</button>
           <button type="button" className="primary-button" onClick={confirmEpisodeShots}><Clapperboard size={16} />开始生成</button>
+        </div>
+      </section>
+    </div>}
+  </main>;
+}
+
+type CanvasNameDialog = { mode: "create"; name: string } | { mode: "rename"; projectId: string; name: string };
+
+export default function InfiniteCanvasStudio({ onToast }: { onToast: (message: string) => void }) {
+  const [projects, setProjects] = useState<CanvasProject[]>([]);
+  const [activeCanvas, setActiveCanvas] = useState<CanvasProjectDetail | null>(null);
+  const [nameDialog, setNameDialog] = useState<CanvasNameDialog | null>(null);
+  const [nameError, setNameError] = useState("");
+  const [projectQuery, setProjectQuery] = useState("");
+  const [loadingProjects, setLoadingProjects] = useState(true);
+  const [openingCanvasId, setOpeningCanvasId] = useState<string | null>(null);
+  const [mutating, setMutating] = useState(false);
+  const managerToastRef = useRef(onToast);
+
+  useEffect(() => { managerToastRef.current = onToast; }, [onToast]);
+
+  const visibleProjects = useMemo(() => {
+    const query = projectQuery.trim().toLocaleLowerCase();
+    return [...projects]
+      .filter((project) => !query || project.name.toLocaleLowerCase().includes(query))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt));
+  }, [projectQuery, projects]);
+
+  const updateProject = useCallback((updated: CanvasProject) => {
+    setProjects((current) => current.map((project) => project.id === updated.id ? updated : project));
+  }, []);
+  const backToManager = useCallback(() => {
+    setActiveCanvas(null);
+    void api.canvases().then(setProjects).catch((caught) => managerToastRef.current(caught instanceof Error ? caught.message : "画布列表读取失败"));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      try {
+        const localProjects = readCanvasProjects();
+        if (localProjects.length) {
+          for (const localProject of localProjects) {
+            const saved = readSavedCanvas(localProject.id);
+            await api.createCanvas({ name: localProject.name, nodes: saved.nodes, edges: saved.edges, sourceId: localProject.id });
+          }
+          for (const localProject of localProjects) window.localStorage.removeItem(canvasStorageKey(localProject.id));
+          window.localStorage.removeItem(CANVAS_PROJECTS_KEY);
+          window.localStorage.removeItem(LEGACY_STORAGE_KEY);
+          if (active) managerToastRef.current(`已将 ${localProjects.length} 个本地画布迁移到当前账号`);
+        }
+        const next = await api.canvases();
+        if (active) setProjects(next);
+      } catch (caught) {
+        if (active) managerToastRef.current(caught instanceof Error ? caught.message : "画布列表读取失败");
+      } finally {
+        if (active) setLoadingProjects(false);
+      }
+    };
+    void load();
+    return () => { active = false; };
+  }, []);
+
+  const openCanvas = async (project: CanvasProject) => {
+    if (openingCanvasId) return;
+    setOpeningCanvasId(project.id);
+    try { setActiveCanvas(await api.canvas(project.id)); }
+    catch (caught) { onToast(caught instanceof Error ? caught.message : "画布读取失败"); }
+    finally { setOpeningCanvasId(null); }
+  };
+
+  const openCreateDialog = () => {
+    setNameError("");
+    setNameDialog({ mode: "create", name: "" });
+  };
+
+  const closeNameDialog = () => {
+    setNameDialog(null);
+    setNameError("");
+  };
+
+  const submitCanvasName = async () => {
+    if (!nameDialog || mutating) return;
+    const name = nameDialog.name.trim();
+    if (!name) {
+      setNameError("请输入画布名称");
+      return;
+    }
+    const duplicate = projects.some((project) => project.name === name && (nameDialog.mode === "create" || project.id !== nameDialog.projectId));
+    if (duplicate) {
+      setNameError("已有同名画布，请换一个名称");
+      return;
+    }
+
+    setMutating(true);
+    try {
+      if (nameDialog.mode === "create") {
+        const project = await api.createCanvas({ name, nodes: [], edges: [] });
+        setProjects((current) => [project, ...current]);
+        setNameDialog(null);
+        setActiveCanvas(project);
+        onToast(`已创建画布“${name}”`);
+      } else {
+        const project = await api.updateCanvas(nameDialog.projectId, { name });
+        updateProject(project);
+        setNameDialog(null);
+        onToast("画布名称已更新");
+      }
+    } catch (caught) {
+      setNameError(caught instanceof Error ? caught.message : "画布保存失败");
+    } finally { setMutating(false); }
+  };
+
+  const deleteProject = async (project: CanvasProject) => {
+    if (!window.confirm(`确定删除画布“${project.name}”吗？画布内的节点和连线也会被删除。`)) return;
+    try {
+      await api.deleteCanvas(project.id);
+      setProjects((current) => current.filter((item) => item.id !== project.id));
+      onToast("画布已删除");
+    } catch (caught) { onToast(caught instanceof Error ? caught.message : "画布删除失败"); }
+  };
+
+  if (activeCanvas) {
+    return <InfiniteCanvasWorkspace
+      key={activeCanvas.id}
+      initialCanvas={activeCanvas}
+      onToast={onToast}
+      onBackToManager={backToManager}
+      onProjectSaved={updateProject}
+    />;
+  }
+
+  return <main className="infinite-project-manager">
+    <section className="infinite-project-manager-body">
+      <div className="infinite-project-section-head">
+        <h1 className="infinite-project-a11y-title">无限画布项目</h1>
+        <div className="infinite-project-tools">
+          <label className="infinite-project-search"><Search size={15} /><input value={projectQuery} onChange={(event) => setProjectQuery(event.target.value)} placeholder="搜索画布" aria-label="搜索画布" />{projectQuery && <button type="button" onClick={() => setProjectQuery("")} aria-label="清空搜索"><X size={13} /></button>}</label>
+          <button type="button" className="primary-button infinite-project-create" onClick={openCreateDialog}><Plus size={16} />新建画布</button>
+        </div>
+      </div>
+      <div className="infinite-project-grid">
+        {!projectQuery && <button type="button" className="infinite-project-new-tile" onClick={openCreateDialog}><span><Plus size={24} /></span><strong>新建画布</strong><small>从空白画布开始</small></button>}
+        {loadingProjects && <div className="infinite-project-empty"><LoaderCircle className="spin" size={24} /><strong>正在读取账号画布</strong></div>}
+        {visibleProjects.map((project) => <article className="infinite-project-card" key={project.id}>
+        <button type="button" className="infinite-project-open" disabled={Boolean(openingCanvasId)} onClick={() => void openCanvas(project)}>
+          <span className="infinite-project-preview">
+            <span className="infinite-project-map" aria-hidden="true"><i /><i /><i /><b /><b /></span>
+            <em>{project.nodeCount} 个节点</em>
+          </span>
+          <span className="infinite-project-info"><strong>{project.name}</strong><small>最后编辑 {formatCanvasProjectTime(project.updatedAt)}</small></span>
+        </button>
+        <div className="infinite-project-card-actions">
+          <button type="button" title="重命名" aria-label={`重命名${project.name}`} onClick={() => { setNameError(""); setNameDialog({ mode: "rename", projectId: project.id, name: project.name }); }}><Pencil size={15} /></button>
+          <button type="button" title="删除" aria-label={`删除${project.name}`} onClick={() => void deleteProject(project)}><Trash2 size={15} /></button>
+        </div>
+      </article>)}
+      </div>
+      {projectQuery && !visibleProjects.length && <div className="infinite-project-empty"><Search size={24} /><strong>没有找到匹配的画布</strong><button type="button" className="secondary-button" onClick={() => setProjectQuery("")}>清空搜索</button></div>}
+    </section>
+
+    {nameDialog && <div className="settings-backdrop infinite-canvas-name-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeNameDialog(); }}>
+      <section className="settings-dialog infinite-canvas-name-dialog" role="dialog" aria-modal="true" aria-labelledby="infinite-canvas-name-title">
+        <div className="settings-dialog-head">
+          <div><span className="panel-eyebrow">CANVAS PROJECT</span><h2 id="infinite-canvas-name-title">{nameDialog.mode === "create" ? "新建画布" : "重命名画布"}</h2></div>
+          <button type="button" className="icon-button" onClick={closeNameDialog} aria-label="关闭"><X size={18} /></button>
+        </div>
+        <label className="infinite-canvas-name-field">
+          <span>画布名称</span>
+          <input autoFocus value={nameDialog.name} maxLength={40} disabled={mutating} onChange={(event) => { setNameError(""); setNameDialog((current) => current ? { ...current, name: event.target.value } : current); }} onKeyDown={(event) => { if (event.key === "Enter" && !event.nativeEvent.isComposing) void submitCanvasName(); }} placeholder="例如：第一季短剧制作" />
+          <small className={nameError ? "error" : ""}>{nameError || `${nameDialog.name.length} / 40`}</small>
+        </label>
+        <div className="settings-actions">
+          <button type="button" className="secondary-button" onClick={closeNameDialog}>取消</button>
+          <button type="button" className="primary-button" disabled={mutating} onClick={() => void submitCanvasName()}>{mutating ? <LoaderCircle className="spin" size={15} /> : null}{nameDialog.mode === "create" ? "创建并进入" : "保存名称"}</button>
         </div>
       </section>
     </div>}

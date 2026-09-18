@@ -4,8 +4,54 @@ CREATE DATABASE IF NOT EXISTS script_master
 
 USE script_master;
 
+CREATE TABLE IF NOT EXISTS users (
+  id CHAR(36) PRIMARY KEY,
+  account VARCHAR(80) NOT NULL,
+  password_hash VARCHAR(128) NOT NULL,
+  password_salt VARCHAR(128) NOT NULL,
+  role VARCHAR(16) NOT NULL DEFAULT 'user',
+  display_name VARCHAR(80) NOT NULL DEFAULT '',
+  email VARCHAR(254) NOT NULL DEFAULT '',
+  avatar_url VARCHAR(2000) NOT NULL DEFAULT '',
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  UNIQUE KEY uq_users_account (account)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS auth_rate_limits (
+  bucket_key CHAR(64) PRIMARY KEY,
+  window_started_at DATETIME(3) NOT NULL,
+  attempt_count INT UNSIGNED NOT NULL DEFAULT 0
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS user_sessions (
+  token_hash CHAR(64) PRIMARY KEY,
+  user_id CHAR(36) NOT NULL,
+  expires_at DATETIME(3) NOT NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  CONSTRAINT fk_user_sessions_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_sessions_expires_at (expires_at)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS canvas_projects (
+  id CHAR(36) PRIMARY KEY,
+  user_id CHAR(36) NOT NULL,
+  name VARCHAR(120) NOT NULL,
+  nodes_json LONGTEXT NOT NULL,
+  edges_json LONGTEXT NOT NULL,
+  node_count INT UNSIGNED NOT NULL DEFAULT 0,
+  version INT UNSIGNED NOT NULL DEFAULT 1,
+  source_id VARCHAR(100) NULL,
+  created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  CONSTRAINT fk_canvas_projects_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  UNIQUE KEY uq_canvas_source (user_id, source_id),
+  INDEX idx_canvas_user_updated (user_id, updated_at DESC)
+) ENGINE=InnoDB;
+
 CREATE TABLE IF NOT EXISTS projects (
   id CHAR(36) PRIMARY KEY,
+  user_id CHAR(36) NULL,
   title VARCHAR(120) NOT NULL,
   logline VARCHAR(5000) NOT NULL DEFAULT '',
   genre VARCHAR(40) NOT NULL,
@@ -18,6 +64,8 @@ CREATE TABLE IF NOT EXISTS projects (
   cover_url VARCHAR(1000) NULL,
   created_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  CONSTRAINT fk_projects_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  INDEX idx_projects_user_updated (user_id, updated_at DESC),
   INDEX idx_projects_updated_at (updated_at DESC),
   INDEX idx_projects_status (status)
 ) ENGINE=InnoDB;

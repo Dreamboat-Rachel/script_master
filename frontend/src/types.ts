@@ -1,5 +1,28 @@
 export type ProjectStatus = "draft" | "scripting" | "storyboarding" | "rendering" | "completed" | "failed";
 
+export interface AuthUser {
+  id: string;
+  account: string;
+  role: "admin" | "user";
+  displayName: string;
+  email: string;
+  avatarUrl: string;
+}
+
+export interface CanvasProjectSummary {
+  id: string;
+  name: string;
+  nodeCount: number;
+  version: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CanvasProjectDetail extends CanvasProjectSummary {
+  nodes: unknown[];
+  edges: unknown[];
+}
+
 export interface Project {
   id: string;
   title: string;
@@ -126,11 +149,12 @@ export interface ImageUpscaleResult {
 
 export interface VideoSettings {
   provider: ImageSettings["provider"];
-  model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+  model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128" | "doubao-seedance-2-5-260628";
   apiBase: string;
   configured: boolean;
 }
 
+export type VideoResolution = "480p" | "720p" | "1080p";
 export type VideoAudioMode = "dialogue" | "ambient" | "silent";
 export type VideoSpeechRate = "slow" | "natural";
 export type VideoContinuityMode = "auto" | "continue" | "cut" | "scene";
@@ -172,6 +196,7 @@ export interface StudioVideoInput {
   prompt: string;
   model: VideoSettings["model"];
   ratio: "16:9" | "9:16" | "1:1";
+  resolution: VideoResolution;
   duration: number;
   generateAudio: boolean;
   watermark: boolean;
@@ -190,6 +215,7 @@ export interface StudioVideoResult {
   prompt: string;
   model: VideoSettings["model"];
   ratio: StudioVideoInput["ratio"];
+  resolution: VideoResolution;
   duration: number;
   createdAt: string;
   updatedAt: string;

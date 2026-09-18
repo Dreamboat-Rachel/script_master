@@ -3,17 +3,17 @@ import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { readFile, readdir, rename, rm, stat, unlink, writeFile } from "node:fs/promises";
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, scrypt, timingSafeEqual } from "node:crypto";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { basename, resolve } from "node:path";
 import WebSocket, { WebSocketServer } from "ws";
 import { z } from "zod";
-import { createDatabaseStore } from "./database.js";
+import { createDatabaseStore, type UserRecord } from "./database.js";
 import { configureImage, getImageSettings, imageConfig, ImageGenerationService } from "./image.js";
 import { AliyunOssService } from "./oss.js";
 import { VolcengineImageUpscaleService } from "./upscale.js";
-import { configureVideo, getVideoSettings, VideoGenerationService } from "./video.js";
+import { configureVideo, getVideoSettings, videoModelOptions, videoResolutionOptions, VideoGenerationService, type VideoModel, type VideoResolution } from "./video.js";
 import { MiniMaxVoiceCloneService } from "./voice.js";
 import { ViduLiveService } from "./vidu.js";
 import { configureDeepSeek, deepSeekConfig, DeepSeekService, getDeepSeekSettings, SCRIPT_GENERATION_INPUT_TOKEN_BUDGET, SCRIPT_GENERATION_OUTPUT_TOKEN_BUDGET } from "./llm.js";
@@ -23,6 +23,23 @@ import type { Project, RenderJob, Shot, Subject } from "./types.js";
 const port = Number(process.env.PORT ?? 8787);
 const clientOrigin = process.env.CLIENT_ORIGIN ?? "http://localhost:5173";
 const databaseUrl = process.env.DATABASE_URL ?? "sqlite://./data/script-master.db";
+const mediaSigningSecret = process.env.MEDIA_SIGNING_SECRET?.trim() || randomBytes(32).toString("hex");
+const isProduction = process.env.NODE_ENV === "production";
+const allowedOrigins = new Set(clientOrigin.split(",").map((origin) => origin.trim().replace(/\/$/, "")).filter(Boolean));
+
+function originIsAllowed(origin: string) {
+  const normalized = origin.replace(/\/$/, "");
+  if (allowedOrigins.has(normalized)) return true;
+  if (isProduction) return false;
+  try {
+    const parsed = new URL(normalized);
+    const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "[::1]";
+    const portNumber = Number(parsed.port);
+    return loopback && parsed.protocol === "http:" && portNumber >= 5173 && portNumber <= 5199;
+  } catch {
+    return false;
+  }
+}
 const db = createDatabaseStore(databaseUrl);
 const deepSeek = new DeepSeekService();
 const imageGeneration = new ImageGenerationService();
@@ -47,20 +64,22 @@ const projectCoverDirectory = resolve(generatedDirectory, "covers");
 const voiceCloneDirectory = resolve(generatedDirectory, "voices");
 const textToSpeechDirectory = resolve(generatedDirectory, "speech");
 const imageUpscaleOutputDirectory = resolve(generatedDirectory, "upscales");
+const avatarDirectory = resolve(generatedDirectory, "avatars");
 const videoGeneration = new VideoGenerationService();
 const aliyunOss = new AliyunOssService();
 const imageUpscale = new VolcengineImageUpscaleService();
 const voiceCloning = new MiniMaxVoiceCloneService();
 const viduLive = new ViduLiveService();
-const renderJobStreams = new Set<Response>();
+const renderJobStreams = new Map<Response, string>();
 const continuityFrameCache = new Map<string, string>();
-const viduLiveSources = new Map<string, string>();
+const viduLiveSources = new Map<string, { objectName: string; userId: string }>();
 
 type StudioVideoType = keyof typeof studioVideoDirectories;
 type StudioAssetType = keyof typeof studioImageDirectories;
 type StudioVideoStatus = "queued" | "processing" | "completed" | "failed";
 interface StoredStudioImage {
   id: string;
+  userId: string;
   imageUrl: string;
   model: string;
   size: string;
@@ -69,6 +88,7 @@ interface StoredStudioImage {
 }
 interface StoredImageUpscale {
   id: string;
+  userId: string;
   imageUrl: string;
   originalName: string;
   resolution: "4k" | "8k";
@@ -77,14 +97,16 @@ interface StoredImageUpscale {
 }
 interface StoredStudioVideo {
   id: string;
+  userId: string;
   videoType: StudioVideoType;
   status: StudioVideoStatus;
   progress: number;
   outputUrl: string | null;
   errorMessage: string | null;
   prompt: string;
-  model: "doubao-seedance-2-0-mini-260615" | "doubao-seedance-2-0-260128" | "doubao-seedance-2-0-fast-260128";
+  model: VideoModel;
   ratio: "16:9" | "9:16" | "1:1";
+  resolution: VideoResolution;
   duration: number;
   createdAt: string;
   updatedAt: string;
@@ -92,6 +114,7 @@ interface StoredStudioVideo {
 }
 interface StoredVoiceClone {
   id: string;
+  userId: string;
   voiceId: string;
   name: string;
   language: "zh-CN" | "zh-HK" | "en-US" | "ja-JP";
@@ -104,6 +127,7 @@ interface StoredVoiceClone {
 }
 interface StoredSpeechGeneration {
   id: string;
+  userId: string;
   voiceId: string;
   voiceName: string;
   text: string;
@@ -137,6 +161,7 @@ mkdirSync(projectCoverDirectory, { recursive: true });
 mkdirSync(voiceCloneDirectory, { recursive: true });
 mkdirSync(textToSpeechDirectory, { recursive: true });
 mkdirSync(imageUpscaleOutputDirectory, { recursive: true });
+mkdirSync(avatarDirectory, { recursive: true });
 
 function writeLog(level: "INFO" | "WARN" | "ERROR", message: string, data?: Record<string, unknown>) {
   const line = `${new Date().toISOString()} [${level}] ${message}${data ? ` ${JSON.stringify(data)}` : ""}`;
@@ -151,10 +176,15 @@ const wait = (milliseconds: number) => new Promise<void>((resolveWait) => setTim
 
 async function broadcastRenderJobs() {
   if (!renderJobStreams.size) return;
-  const message = `data: ${JSON.stringify(await db.listJobs())}\n\n`;
-  for (const stream of renderJobStreams) {
+  const jobsByUser = new Map<string, RenderJob[]>();
+  for (const [stream, userId] of renderJobStreams) {
     try {
-      stream.write(message);
+      let jobs = jobsByUser.get(userId);
+      if (!jobs) {
+        jobs = await db.listJobs(userId);
+        jobsByUser.set(userId, jobs);
+      }
+      stream.write(`data: ${JSON.stringify(jobs)}\n\n`);
     } catch {
       renderJobStreams.delete(stream);
     }
@@ -169,10 +199,26 @@ async function localVideoStorageStats() {
   return { videoCount: sizes.filter((size) => size > 0).length, bytes: sizes.reduce((total, size) => total + size, 0) };
 }
 
+function signedMediaPath(value: string) {
+  if (!value.startsWith("/api/generated/")) return value;
+  const expires = Math.floor(Date.now() / 1000) + 15 * 60;
+  const signature = createHmac("sha256", mediaSigningSecret).update(`${value}|${expires}`).digest("hex");
+  return `${value}?expires=${expires}&signature=${signature}`;
+}
+
+function validMediaSignature(path: string, expiresValue: unknown, signatureValue: unknown) {
+  const expires = Number(expiresValue);
+  const signature = typeof signatureValue === "string" ? signatureValue : "";
+  if (!Number.isInteger(expires) || expires < Math.floor(Date.now() / 1000) || expires > Math.floor(Date.now() / 1000) + 3600 || !/^[0-9a-f]{64}$/i.test(signature)) return false;
+  const expected = createHmac("sha256", mediaSigningSecret).update(`${path}|${expires}`).digest("hex");
+  return timingSafeEqual(Buffer.from(signature, "hex"), Buffer.from(expected, "hex"));
+}
+
 function publicMediaUrl(value: string, requestBase: string) {
   if (/^https?:\/\//i.test(value)) return value;
   const configuredBase = process.env.VIDEO_PUBLIC_BASE_URL?.trim().replace(/\/$/, "");
-  return `${configuredBase || requestBase}${value.startsWith("/") ? value : `/${value}`}`;
+  const path = value.startsWith("/") ? value : `/${value}`;
+  return `${configuredBase || requestBase}${signedMediaPath(path)}`;
 }
 
 function imageMimeType(value: string) {
@@ -222,6 +268,10 @@ async function persistGeneratedVideo(jobId: string, sourceUrl: string) {
 
 function studioVideoKey(videoType: StudioVideoType, id: string) {
   return `${videoType}:${id}`;
+}
+
+function normalizeStoredStudioVideo(record: StoredStudioVideo) {
+  return { ...record, resolution: videoResolutionOptions.includes(record.resolution) ? record.resolution : "720p" as const };
 }
 
 async function writeStudioVideoRecord(record: StoredStudioVideo) {
@@ -280,24 +330,24 @@ async function pollStudioVideo(record: StoredStudioVideo) {
   }
 }
 
-async function readStudioVideoRecord(videoType: StudioVideoType, id: string) {
+async function readStudioVideoRecord(videoType: StudioVideoType, id: string, userId?: string, includeLegacy = false) {
   const active = studioVideoTasks.get(studioVideoKey(videoType, id));
-  if (active) return active;
+  if (active) return !userId || active.userId === userId || (includeLegacy && !active.userId) ? active : null;
   try {
-    const value = JSON.parse(await readFile(resolve(studioVideoDirectories[videoType], `${id}.json`), "utf8")) as StoredStudioVideo;
-    return value.videoType === videoType && value.id === id ? value : null;
+    const value = normalizeStoredStudioVideo(JSON.parse(await readFile(resolve(studioVideoDirectories[videoType], `${id}.json`), "utf8")) as StoredStudioVideo);
+    return value.videoType === videoType && value.id === id && (!userId || value.userId === userId || (includeLegacy && !value.userId)) ? value : null;
   } catch {
     return null;
   }
 }
 
-async function listStudioVideos(videoType: StudioVideoType, limit = 24) {
+async function listStudioVideos(videoType: StudioVideoType, userId?: string, limit = 24, includeLegacy = false) {
   const directory = studioVideoDirectories[videoType];
   const names = await readdir(directory).catch(() => [] as string[]);
-  const stored = (await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readStudioVideoRecord(videoType, basename(name, ".json")))))
+  const stored = (await Promise.all(names.filter((name) => name.endsWith(".json")).map((name) => readStudioVideoRecord(videoType, basename(name, ".json"), userId, includeLegacy))))
     .filter((item): item is StoredStudioVideo => Boolean(item));
   const merged = new Map(stored.map((item) => [item.id, item]));
-  for (const item of studioVideoTasks.values()) if (item.videoType === videoType) merged.set(item.id, item);
+  for (const item of studioVideoTasks.values()) if (item.videoType === videoType && (!userId || item.userId === userId || (includeLegacy && !item.userId))) merged.set(item.id, item);
   return [...merged.values()].sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
 }
 
@@ -350,12 +400,12 @@ async function saveVoicePreview(voiceId: string, source: string) {
   return `/api/generated/voices/${fileName}`;
 }
 
-async function listVoiceClones(limit = 24) {
+async function listVoiceClones(userId: string, limit = 24, includeLegacy = false) {
   const names = await readdir(voiceCloneDirectory).catch(() => [] as string[]);
   const records = (await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
     try {
       const record = JSON.parse(await readFile(resolve(voiceCloneDirectory, name), "utf8")) as StoredVoiceClone;
-      return record.id && record.audioUrl ? record : null;
+      return record.id && record.audioUrl && (record.userId === userId || (includeLegacy && !record.userId)) ? record : null;
     } catch {
       return null;
     }
@@ -363,12 +413,12 @@ async function listVoiceClones(limit = 24) {
   return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
 }
 
-async function listSpeechGenerations(limit = 30) {
+async function listSpeechGenerations(userId: string, limit = 30, includeLegacy = false) {
   const names = await readdir(textToSpeechDirectory).catch(() => [] as string[]);
   const records = (await Promise.all(names.filter((name) => name.endsWith(".json")).map(async (name) => {
     try {
       const record = JSON.parse(await readFile(resolve(textToSpeechDirectory, name), "utf8")) as StoredSpeechGeneration;
-      return record.id && record.audioUrl ? record : null;
+      return record.id && record.audioUrl && (record.userId === userId || (includeLegacy && !record.userId)) ? record : null;
     } catch {
       return null;
     }
@@ -376,7 +426,7 @@ async function listSpeechGenerations(limit = 30) {
   return records.sort((left, right) => right.createdAt.localeCompare(left.createdAt)).slice(0, limit);
 }
 
-async function listStudioImages(assetType: StudioAssetType, limit = 24) {
+async function listStudioImages(assetType: StudioAssetType, userId: string, limit = 24, includeLegacy = false) {
   const directory = studioImageDirectories[assetType];
   const names = await readdir(directory).catch(() => [] as string[]);
   const images = (await Promise.all(names
@@ -387,8 +437,10 @@ async function listStudioImages(assetType: StudioAssetType, limit = 24) {
       const stored = await readFile(resolve(directory, `${name}.json`), "utf8")
         .then((value) => JSON.parse(value) as Partial<StoredStudioImage>)
         .catch(() => null);
+      if (stored?.userId !== userId && !(includeLegacy && !stored?.userId)) return null;
       return {
         id: name,
+        userId: stored?.userId ?? "",
         imageUrl: `/api/generated/${basename(directory)}/${name}`,
         model: typeof stored?.model === "string" ? stored.model : "",
         size: typeof stored?.size === "string" ? stored.size : "",
@@ -401,7 +453,7 @@ async function listStudioImages(assetType: StudioAssetType, limit = 24) {
   return images.slice(0, limit);
 }
 
-async function listImageUpscales(limit = 200) {
+async function listImageUpscales(userId: string, limit = 200, includeLegacy = false) {
   const names = await readdir(imageUpscaleOutputDirectory).catch(() => [] as string[]);
   const images = (await Promise.all(names
     .filter((name) => /\.(png|jpe?g|webp)$/i.test(name))
@@ -411,8 +463,10 @@ async function listImageUpscales(limit = 200) {
       const stored = await readFile(resolve(imageUpscaleOutputDirectory, `${name}.json`), "utf8")
         .then((value) => JSON.parse(value) as Partial<StoredImageUpscale>)
         .catch(() => null);
+      if (stored?.userId !== userId && !(includeLegacy && !stored?.userId)) return null;
       return {
         id: name,
+        userId: stored?.userId ?? "",
         imageUrl: `/api/generated/${basename(imageUpscaleOutputDirectory)}/${name}`,
         originalName: typeof stored?.originalName === "string" ? stored.originalName : "",
         resolution: stored?.resolution === "8k" ? "8k" as const : stored?.resolution === "4k" ? "4k" as const : null,
@@ -422,6 +476,50 @@ async function listImageUpscales(limit = 200) {
     .filter((item): item is NonNullable<typeof item> => Boolean(item))
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   return images.slice(0, limit);
+}
+
+async function generatedMediaBelongsToUser(relativePath: string, user: PublicUser) {
+  const normalized = relativePath.replace(/^\/+/, "");
+  const [category, ...remaining] = normalized.split("/");
+  const fileName = basename(remaining.join("/"));
+  if (!category || !fileName || fileName.endsWith(".json")) return false;
+  if (category === "avatars") return fileName.startsWith(`${user.id}-`);
+
+  const metadataDirectories: Record<string, string> = {
+    characters: characterImageDirectory,
+    scenes: sceneImageDirectory,
+    props: propImageDirectory,
+    "canvas-images": canvasImageDirectory,
+    upscales: imageUpscaleOutputDirectory,
+  };
+  const metadataDirectory = metadataDirectories[category];
+  if (metadataDirectory) {
+    const metadata = await readFile(resolve(metadataDirectory, `${fileName}.json`), "utf8").then((value) => JSON.parse(value) as { userId?: string }).catch(() => null);
+    return metadata?.userId === user.id || (user.role === "admin" && !metadata?.userId);
+  }
+
+  const studioVideoDirectory = Object.values(studioVideoDirectories).find((directory) => basename(directory) === category);
+  if (studioVideoDirectory) {
+    const id = basename(fileName, ".mp4");
+    const metadata = await readFile(resolve(studioVideoDirectory, `${id}.json`), "utf8").then((value) => JSON.parse(value) as { userId?: string }).catch(() => null);
+    return metadata?.userId === user.id || (user.role === "admin" && !metadata?.userId);
+  }
+
+  if (category === "voices" || category === "speech") {
+    const directory = category === "voices" ? voiceCloneDirectory : textToSpeechDirectory;
+    const id = fileName.replace(/\.[^.]+$/, "");
+    const metadata = await readFile(resolve(directory, `${id}.json`), "utf8").then((value) => JSON.parse(value) as { userId?: string }).catch(() => null);
+    return metadata?.userId === user.id || (user.role === "admin" && !metadata?.userId);
+  }
+
+  const projects = await db.listProjects(user.id);
+  if (category === "videos") return (await db.listJobs(user.id)).some((job) => job.id === basename(fileName, ".mp4") && job.outputUrl?.endsWith(`/${fileName}`));
+  if (category === "subjects") {
+    const subjects = (await Promise.all(projects.map((project) => db.listSubjects(project.id)))).flat();
+    return subjects.some((subject) => subject.imageUrl && basename(subject.imageUrl) === fileName);
+  }
+  if (["merges", "covers", "continuity"].includes(category)) return projects.some((project) => fileName.startsWith(`${project.id}-`));
+  return false;
 }
 
 async function extractStableTailFrame(videoUrl: string, projectId: string, shotId: string) {
@@ -520,8 +618,31 @@ async function resumeVideoTasks() {
 
 const app = express();
 app.disable("x-powered-by");
-app.use(cors({ origin: clientOrigin }));
-app.use("/api/generated", express.static(generatedDirectory, { maxAge: "1h" }));
+if (process.env.TRUST_PROXY === "true") app.set("trust proxy", 1);
+app.use(cors({
+  credentials: true,
+  origin(origin, callback) {
+    if (!origin || originIsAllowed(origin)) return callback(null, true);
+    callback(null, false);
+  },
+}));
+app.use((request, response, next) => {
+  response.set({
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "camera=(self), microphone=(self), geolocation=()",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+  });
+  const unsafeMethod = !["GET", "HEAD", "OPTIONS"].includes(request.method);
+  const origin = request.headers.origin?.replace(/\/$/, "");
+  const crossSite = request.headers["sec-fetch-site"] === "cross-site";
+  if (unsafeMethod && (crossSite || (origin && !originIsAllowed(origin)))) {
+    return response.status(403).json({ error: "请求来源不受信任" });
+  }
+  next();
+});
 app.use(express.json({ limit: "22mb" }));
 app.use((request, response, next) => {
   const startedAt = Date.now();
@@ -539,6 +660,68 @@ app.use((request, response, next) => {
 
 const asyncRoute = (handler: (request: Request, response: Response, next: NextFunction) => Promise<unknown>) =>
   (request: Request, response: Response, next: NextFunction) => void handler(request, response, next).catch(next);
+const generatedStatic = express.static(generatedDirectory, { maxAge: "1h", fallthrough: false });
+
+app.use("/api/generated", (request, response, next) => {
+  const mediaPath = `/api/generated${request.path}`;
+  if (validMediaSignature(mediaPath, request.query.expires, request.query.signature)) return generatedStatic(request, response, next);
+  next();
+});
+
+const sessionCookieName = "script_master_session";
+type PublicUser = Pick<UserRecord, "id" | "account" | "role" | "displayName" | "email" | "avatarUrl">;
+type AuthenticatedRequest = Request & { authUser?: PublicUser };
+
+function cookieValue(request: Request, name: string) {
+  const cookies = request.headers.cookie?.split(";") ?? [];
+  for (const cookie of cookies) {
+    const [key, ...parts] = cookie.trim().split("=");
+    if (key === name) return decodeURIComponent(parts.join("="));
+  }
+  return "";
+}
+
+function sessionHash(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function passwordHash(password: string, salt: string) {
+  return new Promise<string>((resolveHash, rejectHash) => {
+    scrypt(password, salt, 64, (error, key) => error ? rejectHash(error) : resolveHash(key.toString("hex")));
+  });
+}
+
+async function passwordMatches(password: string, salt: string, expected: string) {
+  const actual = Buffer.from(await passwordHash(password, salt), "hex");
+  const stored = Buffer.from(expected, "hex");
+  return actual.length === stored.length && timingSafeEqual(actual, stored);
+}
+
+function setSessionCookie(response: Response, token: string, remember: boolean) {
+  const parts = [`${sessionCookieName}=${encodeURIComponent(token)}`, "Path=/", "HttpOnly", "SameSite=Lax"];
+  if (remember) parts.push(`Max-Age=${30 * 24 * 60 * 60}`);
+  if (process.env.NODE_ENV === "production") parts.push("Secure");
+  response.setHeader("Set-Cookie", parts.join("; "));
+}
+
+function clearSessionCookie(response: Response) {
+  const parts = [`${sessionCookieName}=`, "Path=/", "HttpOnly", "SameSite=Lax", "Max-Age=0"];
+  if (process.env.NODE_ENV === "production") parts.push("Secure");
+  response.setHeader("Set-Cookie", parts.join("; "));
+}
+
+const requireAuth = asyncRoute(async (request, response, next) => {
+  const token = cookieValue(request, sessionCookieName);
+  const user = token ? await db.getUserBySession(sessionHash(token)) : null;
+  if (!user) return response.status(401).json({ error: "请先登录" });
+  (request as AuthenticatedRequest).authUser = publicUser(user);
+  next();
+});
+
+const requireAdmin = (request: Request, response: Response, next: NextFunction) => {
+  if ((request as AuthenticatedRequest).authUser?.role !== "admin") return response.status(403).json({ error: "仅管理员可修改服务配置" });
+  next();
+};
 
 const projectSchema = z.object({
   title: z.string().trim().min(1).max(120),
@@ -599,7 +782,7 @@ const imageSettingsSchema = z.object({
 const videoSettingsSchema = z.object({
   provider: z.enum(["volcengine", "aliyun", "openai", "custom"]).optional(),
   apiKey: z.string().max(1000).optional(),
-  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  model: z.enum(videoModelOptions).optional(),
   apiBase: z.string().trim().url().max(500).optional(),
 });
 const subjectImageSchema = z.object({
@@ -615,8 +798,9 @@ const canvasImageSchema = subjectImageSchema.extend({
 });
 const studioVideoSchema = z.object({
   prompt: z.string().trim().min(10, "视频提示词至少需要 10 个字").max(16000),
-  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]),
+  model: z.enum(videoModelOptions),
   ratio: z.enum(["16:9", "9:16", "1:1"]),
+  resolution: z.enum(videoResolutionOptions).default("720p"),
   duration: z.coerce.number().int().refine((value) => [4, 5, 6, 8, 10, 12].includes(value), "视频时长仅支持 4、5、6、8、10 或 12 秒"),
   generateAudio: z.boolean().default(true),
   watermark: z.boolean().default(false),
@@ -649,10 +833,13 @@ const textToSpeechSchema = z.object({
 });
 const renderInputSchema = z.object({
   shotId: z.string().uuid().optional(),
-  referenceSubjectIds: z.array(z.string().uuid()).max(12).default([]),
-  model: z.enum(["doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-260128", "doubao-seedance-2-0-fast-260128"]).optional(),
+  referenceSubjectIds: z.array(z.string().uuid()).max(200).transform((ids) => Array.from(new Set(ids)).slice(0, 12)).default([]),
+  model: z.enum(videoModelOptions).optional(),
+  resolution: z.enum(videoResolutionOptions).default("720p"),
   duration: z.coerce.number().int().min(2).max(12).optional(),
+  watermark: z.boolean().default(false),
   prompt: z.string().trim().min(1).max(16000).optional(),
+  promptMode: z.enum(["structured", "complete"]).default("structured"),
   audioMode: z.enum(["dialogue", "ambient", "silent"]).default("dialogue"),
   speechRate: z.enum(["slow", "natural"]).default("natural"),
   bgm: z.boolean().default(false),
@@ -690,39 +877,68 @@ function resolveContinuityMode(mode: ContinuityMode, shot: Shot, previousShot?: 
   return "continue";
 }
 
-function videoPromptForShot(shot: Shot, input: z.infer<typeof renderInputSchema>, continuityMode: ResolvedContinuityMode, previousShot?: Shot, hasFirstFrame = false, referenceSubjects: Subject[] = []) {
+const videoPromptHeadings = ["当前场景", "当前动作", "当前摄影", "视觉风格", "本镜头引用主体资产", "本镜头首帧", "本镜头发展", "本镜头尾帧", "人物对白 / 内心 OS", "禁止事项"] as const;
+const legacyVideoPromptHeadings = ["当前场景", "当前动作", "当前摄影", "视觉风格", "本镜头引用主体资产", "承接上一镜头结束状态", "本镜头第0秒必须从上述结束状态自然开始", "本镜头首帧", "本镜头发展", "本镜头结束状态", "人物对白 / 内心 OS", "禁止事项"] as const;
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function visualPromptSection(prompt: string, heading: string) {
+  const escaped = escapeRegExp(heading);
+  const nextHeading = [...videoPromptHeadings, ...legacyVideoPromptHeadings].filter((value, index, all) => all.indexOf(value) === index).map(escapeRegExp).join("|");
+  return prompt.match(new RegExp(`(?:\\*\\*)?${escaped}(?:\\*\\*)?[：:]\\s*([\\s\\S]*?)(?=\\r?\\n(?:\\*\\*)?(?:${nextHeading})(?:\\*\\*)?[：:]|$)`))?.[1]?.trim() ?? "";
+}
+
+function hasStructuredVideoPrompt(prompt: string) {
+  return videoPromptHeadings.every((heading) => visualPromptSection(prompt, heading)) || legacyVideoPromptHeadings.every((heading) => visualPromptSection(prompt, heading));
+}
+
+function structuredVideoPrompt(shot: Shot, previousShot: Shot | undefined, style: string, referenceSubjects: Subject[]) {
+  const source = shot.visualPrompt;
+  const subjectNames = referenceSubjects.map((subject) => `「${subject.name}」`).join("、") || "无已绑定主体资产";
+  const dialogue = dialogueWithoutNarration(shot.dialogue);
+  const firstFrame = visualPromptSection(source, "本镜头首帧")
+    || (previousShot ? "以上一镜头输出的尾帧作为本镜头首帧；只从该画面继续当前动作。" : `${shot.camera}。画面位于 ${shot.location}，${subjectNames} 按当前动作开始前的状态出现在各自位置。`);
+  const development = visualPromptSection(source, "本镜头发展") || shot.action;
+  const ending = visualPromptSection(source, "本镜头尾帧") || visualPromptSection(source, "本镜头结束状态")
+    || `${shot.action}完成后的最终姿势、位置、视线和道具状态清晰可见；摄影机停在${shot.camera}。`;
+  const background = visualPromptSection(source, "本镜头引用主体资产").split(/\r?\n/).find((line) => line.trim().startsWith("背景保留"));
+  return [
+    `**当前场景**：${shot.location}`,
+    `**当前动作**：${shot.action}`,
+    `**当前摄影**：${shot.camera}`,
+    `**视觉风格**：${visualPromptSection(source, "视觉风格") || style}`,
+    `**本镜头引用主体资产**：\n${subjectNames}。${background ? `\n${background}` : ""}`,
+    `**本镜头首帧**：\n${firstFrame}`,
+    `**本镜头发展**：\n${development}`,
+    `**本镜头尾帧**：\n${ending}`,
+    `**人物对白 / 内心 OS**：${dialogue || "无。禁止添加旁白或解说。"}`,
+    `**禁止事项**：\n禁止重新入场、重复上一镜头已完成的动作、重置空间、无理由转景或在片内制作转场。\n禁止改变人物身份、外观、服装、道具及其相对位置。\n禁止改变当前镜头的空间方位和锁定的光线调色。`,
+  ].join("\n");
+}
+
+function videoPromptForShot(shot: Shot, input: z.infer<typeof renderInputSchema>, continuityMode: ResolvedContinuityMode, previousShot?: Shot, hasFirstFrame = false, referenceSubjects: Subject[] = [], style = "电影写实") {
   const dialogue = dialogueWithoutNarration(shot.dialogue);
   const audioMode = input.audioMode === "dialogue" && !dialogue ? "ambient" : input.audioMode;
-  const basePrompt = input.prompt ?? [
-    `镜头：${shot.title}`,
-    `场景：${shot.location}`,
-    `动作：${shot.action}`,
-    `摄影：${shot.camera}`,
-    `画面：${shot.visualPrompt}`,
-  ].join("\n");
-  const previousState = previousShot ? [
-    `上一镜头场景：${previousShot.location}`,
-    `上一镜头结束动作：${previousShot.action}`,
-    `上一镜头画面提示词（以它描述的最终画面为本镜头起点）：${previousShot.visualPrompt}`,
-  ] : [];
+  const submittedPrompt = input.prompt?.trim();
+  if (input.promptMode === "complete" && submittedPrompt) return submittedPrompt;
+  const basePrompt = submittedPrompt && hasStructuredVideoPrompt(submittedPrompt) ? submittedPrompt : structuredVideoPrompt(shot, previousShot, style, referenceSubjects);
   const continuityPrompt = continuityMode === "continue" ? [
     "衔接方式：动作续接。剪辑点位于视频开始之前，本视频只呈现当前镜头，不制作片内转场。",
     hasFirstFrame ? "输入首帧来自上一镜头的稳定尾帧，是本次生成的最高优先级视觉约束。视频第 0 秒必须与输入首帧一致，禁止重新绘制开场、替换构图或跳到另一幅画面；必须从该姿势、人物位置、视线、道具位置和运动方向开始继续动作。" : "从上一镜头结束状态继续动作，不重复已经完成的动作。",
-    ...previousState,
-    "当前镜头不是一段独立重启的画面，必须以上一镜头提示词和尾帧的结束状态为起点，在连续时间中逐步发展到当前镜头描述的动作与构图。",
+    "当前镜头不是一段独立重启的画面；输入尾帧就是当前镜头的首帧，只需从该画面继续当前镜头描述的动作与构图。",
     "保持当前摄影机的景别、机位和构图稳定；严禁从上一构图旋转、推拉、环绕或变形成当前构图，严禁淡入淡出、叠化、甩镜或无理由转景。",
     "色彩锁定：输入首帧的实际像素是本视频唯一的色彩基准。后文即使出现“暖色调”“冷色调”或其他与首帧不一致、含糊的调色描述，也只能理解为保持首帧现状，不能据此重新调色。",
     "从第 0 秒到结束逐帧锁定首帧的色温、白平衡、曝光、对比度、黑白场、饱和度和光源方向；严禁逐渐变暖或变冷，严禁叠加黄色、橙色、绿色滤镜，严禁发生泛黄、褪色、色偏或亮度漂移。只允许物体运动造成局部自然明暗变化。",
     "保持同一人物的面容、发型、服装、体态和所持道具一致，保持空间方位和运动方向连续。",
   ].join("\n") : continuityMode === "cut" ? [
     "衔接方式：直接切镜。剪辑切换已经发生在视频开始之前，第一帧必须直接呈现当前镜头指定的景别、机位和构图。",
-    ...previousState,
-    "只继承人物外观、服装、道具、光线、视线、空间方位和动作进度；不要展示从上一机位移动到当前机位的过程。",
+    "只从输入尾帧继承人物外观、服装、道具、光线、视线、空间方位和动作进度；不要展示从上一机位移动到当前机位的过程。",
     "严禁片内转场、镜头绕行、构图变形、淡入淡出、叠化或甩镜。",
   ].join("\n") : [
     "衔接方式：场景切换。场景切换已经发生在视频开始之前，第一帧直接进入当前场景和目标构图。",
-    ...previousState,
-    "即使更换了地点，也要继承上一镜头已经建立的可见人物外观、服装、道具、动作进度、视线方向、叙事因果、基础色温和统一调色；只在剪辑点切换空间，不要把当前镜头写成与前镜头无关的全新故事。",
+    "如输入了上一镜头尾帧，只继承其中已经可见的人物外观、服装、道具、动作进度、视线方向、基础色温和统一调色；只在剪辑点切换空间，不要把当前镜头写成独立重启。",
     "除非当前镜头内容明确要求，否则严禁在片内制作转场、淡入淡出、叠化、甩镜、穿越遮挡或从上一场景变形成当前场景。",
   ].join("\n");
   const audioPrompt = audioMode === "silent"
@@ -751,10 +967,11 @@ function videoPromptForShot(shot: Shot, input: z.infer<typeof renderInputSchema>
       return `${roleName}「${subject.name}」：${subject.description || "未设定"}；视觉特征：${subject.visualPrompt || "未设定"}；${roleGuard}`;
     }),
   ].join("\n") : "";
-  const contentPrompt = input.prompt
+  const contentPrompt = submittedPrompt && hasStructuredVideoPrompt(submittedPrompt)
     ? `用户确认的视频提示词（除连续性首帧约束外必须执行）：\n${basePrompt}`
     : `${basePrompt}`;
-  return [contentPrompt, continuityPrompt, subjectPrompt, audioPrompt, musicPrompt, "画面中不要生成字幕、标题、标牌式说明文字或水印。"].filter(Boolean).join("\n\n");
+  const watermarkPrompt = input.watermark ? "水印要求：允许视频平台添加水印；除平台水印外，不生成字幕、标题或标牌式说明文字。" : "画面中不要生成字幕、标题、标牌式说明文字或水印。";
+  return [contentPrompt, continuityPrompt, subjectPrompt, audioPrompt, musicPrompt, watermarkPrompt].filter(Boolean).join("\n\n");
 }
 
 async function latestCompletedVideo(projectId: string, shotId: string) {
@@ -904,7 +1121,7 @@ async function processRenderSequence(input: {
         : subjects.filter((subject) => subject.imageUrl && subject.name.trim() && content.includes(subject.name.trim())))
         .filter((subject) => subject.imageUrl)
         .slice(0, firstFrameUrl ? 11 : 12);
-      const generationPrompt = videoPromptForShot(shot, { ...renderInput, prompt: shots.length === 1 ? renderInput.prompt : undefined }, continuityMode, previousShot, Boolean(firstFrameUrl), referenceSubjects);
+      const generationPrompt = videoPromptForShot(shot, { ...renderInput, prompt: shots.length === 1 ? renderInput.prompt : undefined }, continuityMode, previousShot, Boolean(firstFrameUrl), referenceSubjects, project.style);
       await db.setRenderJobPrompt(job.id, generationPrompt);
       const task = await videoGeneration.createTask({
         prompt: generationPrompt,
@@ -912,8 +1129,10 @@ async function processRenderSequence(input: {
         referenceImageUrls: await Promise.all(referenceSubjects.map((subject) => referenceImageSource(subject.imageUrl!, requestBase))),
         firstFrameUrl,
         ratio: project.aspectRatio,
+        resolution: renderInput.resolution,
         duration: renderInput.duration ?? shot.durationSeconds,
         generateAudio: renderInput.audioMode !== "silent",
+        watermark: renderInput.watermark,
       });
       await db.startRenderJob(job.id, task.taskId, task.status, task.progress);
       await broadcastRenderJobs();
@@ -1030,12 +1249,15 @@ function shotsFromEpisodes(projectId: string, episodes: Array<{ id: string; epis
     ["月台建立", "午夜车站 / 月台", "雨水沿着站牌滴落，林默独自检查最后一盏灯。", "", "广角，雨后旧车站，孤独人物，电影级低照度，空气透视", "横移"],
     ["信件出现", "检票亭 / 内", "一封没有寄件人的信从售票窗口缓缓滑入。", "林默：这不可能。", "手部特写，泛黄信件，红色未来日期，悬疑氛围", "推近"],
     ["列车入站", "远端月台 / 外", "远处没有轨道的方向亮起车灯，铁轨开始震动。", "广播：请最后一位乘客上车。", "超现实列车冲入黑夜，雾气，冷蓝与暖橙对撞，史诗构图", "快速拉远"],
+    ["抉择时刻", "月台边缘 / 外", "林默攥紧未来来信，在车门关闭前迈向列车。", "林默：我必须知道答案。", "人物近景，信件与列车门形成视觉焦点，雨夜逆光，克制悬疑", "缓慢推近"],
+    ["尾声钩子", "列车车厢 / 内", "车窗外的旧车站消失，信纸背面浮现新的日期。", "", "信纸特写，车窗倒影，未知日期显现，留下悬念，无新增人物", "固定特写"],
   ];
   return episodes.flatMap((episode) => templates.map((template, index) => {
-    const continuity = index === 0
-      ? "连续性锚点：本集首镜头建立人物、道具、空间方位、光线、色温和运动方向基线，并写清结束状态。"
-      : "连续性锚点：本镜头第 0 秒从上一镜头结束状态自然开始，继承人物/道具位置、姿势、视线、空间方位、光线、色温、曝光、饱和度和运动方向；先保持状态再逐步完成当前动作，禁止重新入场或片内转场。";
-    return { episodeId: episode.id, episodeNumber: episode.episodeNumber, shotOrder: index + 1, title: `${String(index + 1).padStart(2, "0")} · ${template[0]}`, location: template[1], action: template[2], dialogue: template[3], visualPrompt: `${continuity}\n当前画面：${style}，${template[4]}`, camera: template[5], durationSeconds: index === 2 ? 8 : 6, status: "ready" as const };
+    const firstFrame = index === 0
+      ? "本镜头首帧：建立当前场景、人物、道具、空间方位与光线基线。"
+      : "本镜头首帧：以上一镜头输出的尾帧作为起点，只从该画面继续当前动作，不复述上一镜头。";
+    const endFrame = `本镜头尾帧：${template[2]}完成后的姿势、位置、道具状态与摄影机状态清晰可见，作为下一镜头的起始画面。`;
+    return { episodeId: episode.id, episodeNumber: episode.episodeNumber, shotOrder: index + 1, title: `${String(index + 1).padStart(2, "0")} · ${template[0]}`, location: template[1], action: template[2], dialogue: template[3], visualPrompt: `${firstFrame}\n当前画面：${style}，${template[4]}。\n当前动作：${template[2]}\n当前摄影：${template[5]}。\n${endFrame}\n禁止新增人物、改变空间方位或片内转场。`, camera: template[5], durationSeconds: index === 2 ? 8 : 6, status: "ready" as const };
   }));
 }
 
@@ -1063,15 +1285,225 @@ function scriptFromProject(project: { title: string; logline: string; genre: str
 主角面对真相，也必须为自己的选择承担后果。远处天色开始变亮，故事在一个明确但仍有余韵的决定中结束。`;
 }
 
+const authBaseSchema = z.object({
+  account: z.string().trim().min(2, "账号至少需要 2 个字符").max(80),
+  remember: z.boolean().default(true),
+});
+const loginSchema = authBaseSchema.extend({ password: z.string().min(1, "请输入密码").max(128) });
+const registrationSchema = authBaseSchema.extend({ password: z.string().min(8, "密码至少需要 8 个字符").max(128) });
+
+const profileSchema = z.object({
+  displayName: z.string().trim().max(80).default(""),
+  email: z.string().trim().max(254).refine((value) => !value || z.string().email().safeParse(value).success, "邮箱格式不正确").default(""),
+  avatarUrl: z.string().trim().max(2_000).refine((value) => !value || /^https?:\/\//i.test(value) || /^data:image\/(?:png|jpeg|webp);base64,/i.test(value), "头像地址格式不正确").default(""),
+});
+
+const passwordChangeSchema = z.object({
+  currentPassword: z.string().min(1, "请输入当前密码").max(128),
+  newPassword: z.string().min(8, "新密码至少需要 8 个字符").max(128),
+}).refine((value) => value.currentPassword !== value.newPassword, { message: "新密码不能与当前密码相同", path: ["newPassword"] });
+
+const canvasContentSchema = z.object({
+  name: z.string().trim().min(1, "请输入画布名称").max(120),
+  nodes: z.array(z.unknown()).max(2000, "单个画布最多保存 2000 个节点"),
+  edges: z.array(z.unknown()).max(10000, "单个画布最多保存 10000 条连线"),
+  sourceId: z.string().trim().min(1).max(100).optional(),
+});
+
+const canvasPatchSchema = canvasContentSchema.omit({ sourceId: true }).partial().refine((value) => Object.keys(value).length > 0, "没有可保存的画布内容");
+
+function publicUser(user: PublicUser) {
+  return { id: user.id, account: user.account, role: user.role, displayName: user.displayName, email: user.email, avatarUrl: user.avatarUrl };
+}
+
+function authenticatedUser(request: Request) {
+  return (request as AuthenticatedRequest).authUser!;
+}
+
+function ownedProject(request: Request, projectId: string) {
+  return db.getProject(projectId, authenticatedUser(request).id);
+}
+
+function canvasSummary(canvas: NonNullable<Awaited<ReturnType<typeof db.getCanvas>>>) {
+  return { id: canvas.id, name: canvas.name, nodeCount: canvas.nodeCount, version: canvas.version, createdAt: canvas.createdAt, updatedAt: canvas.updatedAt };
+}
+
+function canvasDetail(canvas: NonNullable<Awaited<ReturnType<typeof db.getCanvas>>>) {
+  const parse = (value: string) => { try { const parsed = JSON.parse(value); return Array.isArray(parsed) ? parsed : []; } catch { return []; } };
+  return { ...canvasSummary(canvas), nodes: parse(canvas.nodesJson), edges: parse(canvas.edgesJson) };
+}
+
+async function startUserSession(response: Response, user: PublicUser, remember: boolean) {
+  const token = randomBytes(32).toString("base64url");
+  const durationMs = remember ? 30 * 24 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+  await db.createSession(user.id, sessionHash(token), new Date(Date.now() + durationMs).toISOString());
+  setSessionCookie(response, token, remember);
+}
+
+function authRateKey(request: Request, account: string) {
+  const address = request.ip || request.socket.remoteAddress || "unknown";
+  return createHash("sha256").update(`${address}|${account.trim().toLocaleLowerCase()}`).digest("hex");
+}
+
+async function enforceAuthRateLimit(request: Request, response: Response, account: string) {
+  const key = authRateKey(request, account);
+  const result = await db.consumeAuthAttempt(key, 8, 15 * 60);
+  if (result.allowed) return key;
+  response.setHeader("Retry-After", String(result.retryAfterSeconds));
+  response.status(429).json({ error: `尝试次数过多，请在 ${result.retryAfterSeconds} 秒后重试` });
+  return null;
+}
+
+async function claimConfiguredLegacyProjects(user: PublicUser) {
+  const ownerAccount = process.env.LEGACY_OWNER_ACCOUNT?.trim().toLocaleLowerCase();
+  if (user.role !== "admin" || !ownerAccount || user.account.trim().toLocaleLowerCase() !== ownerAccount) return 0;
+  return db.claimUnownedProjects(user.id);
+}
+
+app.get("/api/auth/session", requireAuth, asyncRoute(async (request, response) => {
+  response.setHeader("Cache-Control", "no-store");
+  response.json({ data: publicUser((request as AuthenticatedRequest).authUser!) });
+}));
+
+app.post("/api/auth/register", asyncRoute(async (request, response) => {
+  const input = registrationSchema.parse(request.body);
+  const rateKey = await enforceAuthRateLimit(request, response, input.account);
+  if (!rateKey) return;
+  if (await db.getUserByAccount(input.account)) return response.status(409).json({ error: "该账号已存在，请直接登录" });
+  const salt = randomBytes(16).toString("hex");
+  const role = !isProduction && await db.countUsers() === 0 ? "admin" : "user";
+  const user = await db.createUser(input.account, await passwordHash(input.password, salt), salt, role);
+  await claimConfiguredLegacyProjects(user);
+  await db.resetAuthAttempt(rateKey);
+  await startUserSession(response, user, input.remember);
+  response.status(201).json({ data: publicUser(user) });
+}));
+
+app.post("/api/auth/login", asyncRoute(async (request, response) => {
+  const input = loginSchema.parse(request.body);
+  const rateKey = await enforceAuthRateLimit(request, response, input.account);
+  if (!rateKey) return;
+  const user = await db.getUserByAccount(input.account);
+  if (!user || !await passwordMatches(input.password, user.passwordSalt, user.passwordHash)) return response.status(401).json({ error: "账号或密码不正确" });
+  await claimConfiguredLegacyProjects(user);
+  await db.resetAuthAttempt(rateKey);
+  await startUserSession(response, user, input.remember);
+  response.json({ data: publicUser(user) });
+}));
+
+app.post("/api/auth/logout", asyncRoute(async (request, response) => {
+  const token = cookieValue(request, sessionCookieName);
+  if (token) await db.deleteSession(sessionHash(token));
+  clearSessionCookie(response);
+  response.status(204).end();
+}));
+
+app.patch("/api/auth/profile", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  const updated = await db.updateUserProfile(user.id, profileSchema.parse(request.body));
+  if (!updated) return response.status(404).json({ error: "账号不存在" });
+  response.json({ data: publicUser(updated) });
+}));
+
+app.post("/api/auth/avatar", requireAuth, asyncRoute(async (request, response) => {
+  const authUser = (request as AuthenticatedRequest).authUser!;
+  const contentType = request.headers["content-type"] ?? "";
+  if (!contentType.toLowerCase().startsWith("multipart/form-data;")) return response.status(415).json({ error: "请上传头像图片" });
+  const body = await readLimitedRequestBody(request, 2.2 * 1024 * 1024, "AVATAR_TOO_LARGE").catch((error) => {
+    if (error instanceof Error && error.message === "AVATAR_TOO_LARGE") return null;
+    throw error;
+  });
+  if (!body) return response.status(413).json({ error: "头像图片不能超过 2MB" });
+  let form: FormData;
+  try {
+    form = await new globalThis.Request("http://localhost/avatar-upload", { method: "POST", headers: { "Content-Type": contentType }, body: new Uint8Array(body) }).formData();
+  } catch {
+    return response.status(400).json({ error: "头像图片读取失败" });
+  }
+  const file = form.get("file");
+  if (!(file instanceof Blob)) return response.status(400).json({ error: "请选择头像图片" });
+  if (file.size > 2 * 1024 * 1024) return response.status(413).json({ error: "头像图片不能超过 2MB" });
+  if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) return response.status(400).json({ error: "头像仅支持 JPG、PNG 或 WebP" });
+  const extension = file.type === "image/png" ? "png" : file.type === "image/webp" ? "webp" : "jpg";
+  const fileName = `${authUser.id}-${randomUUID()}.${extension}`;
+  await writeFile(resolve(avatarDirectory, fileName), Buffer.from(await file.arrayBuffer()));
+  const updated = await db.updateUserProfile(authUser.id, { displayName: authUser.displayName, email: authUser.email, avatarUrl: `/api/generated/avatars/${fileName}` });
+  if (!updated) return response.status(404).json({ error: "账号不存在" });
+  if (authUser.avatarUrl.startsWith("/api/generated/avatars/")) await unlink(resolve(avatarDirectory, basename(authUser.avatarUrl))).catch(() => undefined);
+  response.json({ data: publicUser(updated) });
+}));
+
+app.post("/api/auth/change-password", requireAuth, asyncRoute(async (request, response) => {
+  const authUser = (request as AuthenticatedRequest).authUser!;
+  const input = passwordChangeSchema.parse(request.body);
+  const user = await db.getUserByAccount(authUser.account);
+  if (!user || !await passwordMatches(input.currentPassword, user.passwordSalt, user.passwordHash)) return response.status(400).json({ error: "当前密码不正确" });
+  const salt = randomBytes(16).toString("hex");
+  await db.updateUserPassword(user.id, await passwordHash(input.newPassword, salt), salt);
+  await db.deleteUserSessions(user.id);
+  await startUserSession(response, user, true);
+  response.json({ data: publicUser(user) });
+}));
+
+app.post("/api/auth/logout-all", requireAuth, asyncRoute(async (request, response) => {
+  await db.deleteUserSessions((request as AuthenticatedRequest).authUser!.id);
+  clearSessionCookie(response);
+  response.status(204).end();
+}));
+
+app.get("/api/canvases", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  response.json({ data: (await db.listCanvases(user.id)).map(canvasSummary) });
+}));
+
+app.post("/api/canvases", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  const input = canvasContentSchema.parse(request.body);
+  const canvas = await db.createCanvas(user.id, { name: input.name, nodesJson: JSON.stringify(input.nodes), edgesJson: JSON.stringify(input.edges), nodeCount: input.nodes.length, sourceId: input.sourceId });
+  response.status(201).json({ data: canvasDetail(canvas) });
+}));
+
+app.get("/api/canvases/:id", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  const canvas = await db.getCanvas(user.id, String(request.params.id));
+  if (!canvas) return response.status(404).json({ error: "画布不存在" });
+  response.json({ data: canvasDetail(canvas) });
+}));
+
+app.patch("/api/canvases/:id", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  const input = canvasPatchSchema.parse(request.body);
+  const canvas = await db.updateCanvas(user.id, String(request.params.id), {
+    ...(input.name !== undefined ? { name: input.name } : {}),
+    ...(input.nodes !== undefined ? { nodesJson: JSON.stringify(input.nodes), nodeCount: input.nodes.length } : {}),
+    ...(input.edges !== undefined ? { edgesJson: JSON.stringify(input.edges) } : {}),
+  });
+  if (!canvas) return response.status(404).json({ error: "画布不存在" });
+  response.json({ data: canvasDetail(canvas) });
+}));
+
+app.delete("/api/canvases/:id", requireAuth, asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
+  if (!await db.deleteCanvas(user.id, String(request.params.id))) return response.status(404).json({ error: "画布不存在" });
+  response.status(204).end();
+}));
+
 app.get("/api/health", (_request, response) => {
   response.json({ ok: true, service: "script-master-api", database: databaseUrl.startsWith("mysql://") ? "mysql" : "sqlite", model: deepSeekConfig.model, modelEnabled: deepSeekConfig.enabled, localFallback, time: new Date().toISOString() });
 });
+
+app.use("/api", requireAuth);
+app.use("/api/generated", asyncRoute(async (request, response, next) => {
+  if (!await generatedMediaBelongsToUser(request.path, authenticatedUser(request))) return response.status(404).json({ error: "文件不存在" });
+  next();
+}));
+app.use("/api/generated", generatedStatic);
 
 app.get("/api/settings/llm", (_request, response) => {
   response.json({ data: getDeepSeekSettings() });
 });
 
-app.put("/api/settings/llm", asyncRoute(async (request, response) => {
+app.put("/api/settings/llm", requireAdmin, asyncRoute(async (request, response) => {
   const input = llmSettingsSchema.parse(request.body);
   response.json({ data: configureDeepSeek(input) });
 }));
@@ -1080,7 +1512,7 @@ app.get("/api/settings/image", (_request, response) => {
   response.json({ data: getImageSettings() });
 });
 
-app.put("/api/settings/image", asyncRoute(async (request, response) => {
+app.put("/api/settings/image", requireAdmin, asyncRoute(async (request, response) => {
   const input = imageSettingsSchema.parse(request.body);
   response.json({ data: configureImage(input) });
 }));
@@ -1089,12 +1521,13 @@ app.get("/api/settings/video", (_request, response) => {
   response.json({ data: getVideoSettings() });
 });
 
-app.put("/api/settings/video", asyncRoute(async (request, response) => {
+app.put("/api/settings/video", requireAdmin, asyncRoute(async (request, response) => {
   const input = videoSettingsSchema.parse(request.body);
   response.json({ data: configureVideo(input) });
 }));
 
 app.post("/api/tools/image-upscales", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   if (!imageUpscale.enabled) return response.status(503).json({ error: "尚未配置火山视觉 AccessKey 和 SecretKey" });
   if (!aliyunOss.enabled) return response.status(503).json({ error: "OSS 尚未配置，请在 backend/.env 中填写阿里云 OSS 密钥" });
   const contentType = request.headers["content-type"] ?? "";
@@ -1158,6 +1591,7 @@ app.post("/api/tools/image-upscales", asyncRoute(async (request, response) => {
     const imageUrl = `/api/generated/${basename(imageUpscaleOutputDirectory)}/${outputName}`;
     const record: StoredImageUpscale = {
       id: outputName,
+      userId: user.id,
       imageUrl,
       originalName,
       resolution: resolutionValue,
@@ -1184,6 +1618,7 @@ app.get("/api/tools/digital-human/status", (_request, response) => {
 });
 
 app.post("/api/tools/digital-human/lives", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   if (!viduLive.enabled) return response.status(503).json({ error: "Vidu Live 尚未配置，请在 backend/.env 中填写 VIDU_API_KEY" });
   if (!aliyunOss.enabled) return response.status(503).json({ error: "OSS 尚未配置，请在 backend/.env 中填写阿里云 OSS 密钥" });
   const contentType = request.headers["content-type"] ?? "";
@@ -1237,7 +1672,7 @@ app.post("/api/tools/digital-human/lives", asyncRoute(async (request, response) 
     // Both UI modes need an animated avatar. The selected mode only controls
     // whether the browser publishes the caller's camera to AliRTC.
     const session = await viduLive.createRealtimeSession({ callMode: "video", persona, imageUri: source.url, voice });
-    viduLiveSources.set(session.liveId, source.objectName);
+    viduLiveSources.set(session.liveId, { objectName: source.objectName, userId: user.id });
     writeLog("INFO", "[digital-human] Vidu Live 会话已创建", { liveId: session.liveId, callMode: "video", callerMediaMode: callMode });
     response.status(201).json({ data: { liveId: session.liveId, rtc: session.rtc } });
   } catch (error) {
@@ -1247,25 +1682,29 @@ app.post("/api/tools/digital-human/lives", asyncRoute(async (request, response) 
 }));
 
 app.delete("/api/tools/digital-human/lives/:liveId", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const liveId = String(request.params.liveId ?? "").trim();
-  const objectName = viduLiveSources.get(liveId);
-  if (objectName) {
+  const source = viduLiveSources.get(liveId);
+  if (source && source.userId !== user.id) return response.status(404).json({ error: "数字人会话不存在" });
+  if (source) {
     viduLiveSources.delete(liveId);
-    await aliyunOss.deleteObject(objectName).catch((error) => {
+    await aliyunOss.deleteObject(source.objectName).catch((error) => {
       writeLog("WARN", "[digital-human] OSS 临时形象清理失败", { liveId, error: error instanceof Error ? error.message : String(error) });
     });
   }
   response.status(204).end();
 }));
 
-app.get("/api/tools/voice-clones", asyncRoute(async (_request, response) => {
+app.get("/api/tools/voice-clones", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   response.json({
-    data: await listVoiceClones(),
+    data: await listVoiceClones(user.id, 24, user.role === "admin"),
     settings: { configured: voiceCloning.enabled, model: voiceCloning.model },
   });
 }));
 
 app.post("/api/tools/voice-clones", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   if (!voiceCloning.enabled) return response.status(503).json({ error: "尚未配置 MiniMax Token，请在后端设置 MINIMAX_API_KEY" });
   const contentType = request.headers["content-type"] ?? "";
   if (!contentType.toLowerCase().startsWith("multipart/form-data;")) {
@@ -1325,6 +1764,7 @@ app.post("/api/tools/voice-clones", asyncRoute(async (request, response) => {
   const audioUrl = await saveVoicePreview(voiceId, cloned.demoAudio);
   const record: StoredVoiceClone = {
     id: voiceId,
+    userId: user.id,
     voiceId,
     name: metadata.name,
     language: metadata.language,
@@ -1340,14 +1780,16 @@ app.post("/api/tools/voice-clones", asyncRoute(async (request, response) => {
   response.status(201).json({ data: record });
 }));
 
-app.get("/api/tools/text-to-speech", asyncRoute(async (_request, response) => {
+app.get("/api/tools/text-to-speech", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   response.json({
-    data: await listSpeechGenerations(),
+    data: await listSpeechGenerations(user.id, 30, user.role === "admin"),
     settings: { configured: voiceCloning.enabled, model: voiceCloning.model },
   });
 }));
 
 app.post("/api/tools/text-to-speech", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   if (!voiceCloning.enabled) return response.status(503).json({ error: "尚未配置 MiniMax Token，请在后端设置 MINIMAX_API_KEY" });
   const input = textToSpeechSchema.parse(request.body);
   const startedAt = Date.now();
@@ -1358,6 +1800,7 @@ app.post("/api/tools/text-to-speech", asyncRoute(async (request, response) => {
   await writeFile(resolve(textToSpeechDirectory, fileName), generated.audio);
   const record: StoredSpeechGeneration = {
     id,
+    userId: user.id,
     voiceId: input.voiceId,
     voiceName: input.voiceName,
     text: input.text,
@@ -1379,13 +1822,15 @@ app.post("/api/tools/text-to-speech", asyncRoute(async (request, response) => {
 }));
 
 app.get("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const assetType = String(request.params.assetType) as StudioAssetType;
   const directory = studioImageDirectories[assetType];
   if (!directory) return response.status(404).json({ error: "不支持的资产类型" });
-  response.json({ data: await listStudioImages(assetType) });
+  response.json({ data: await listStudioImages(assetType, user.id, 24, user.role === "admin") });
 }));
 
 app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const startedAt = Date.now();
   const assetType = String(request.params.assetType) as keyof typeof studioImageDirectories;
   const directory = studioImageDirectories[assetType];
@@ -1398,27 +1843,30 @@ app.post("/api/tools/:assetType-images", asyncRoute(async (request, response) =>
   const extension = generated.mimeType === "image/jpeg" ? "jpg" : generated.mimeType === "image/webp" ? "webp" : "png";
   const fileName = `${randomUUID()}.${extension}`;
   await writeFile(resolve(directory, fileName), generated.bytes);
-  const result = { id: fileName, imageUrl: `/api/generated/${basename(directory)}/${fileName}`, model: input.model, size: generated.size, prompt: input.prompt, createdAt: new Date().toISOString() };
+  const result: StoredStudioImage = { id: fileName, userId: user.id, imageUrl: `/api/generated/${basename(directory)}/${fileName}`, model: input.model, size: generated.size, prompt: input.prompt, createdAt: new Date().toISOString() };
   await writeFile(resolve(directory, `${fileName}.json`), JSON.stringify(result, null, 2), "utf8");
   writeLog("INFO", "[generate-studio-asset] 完成", { assetType, imageUrl: result.imageUrl, model: input.model, size: generated.size, elapsedMs: Date.now() - startedAt });
   response.json({ data: result });
 }));
 
 app.get("/api/tools/:videoType-videos", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const videoType = String(request.params.videoType) as StudioVideoType;
   if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
-  response.json({ data: await listStudioVideos(videoType) });
+  response.json({ data: await listStudioVideos(videoType, user.id, 24, user.role === "admin") });
 }));
 
 app.get("/api/tools/:videoType-videos/:id", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const videoType = String(request.params.videoType) as StudioVideoType;
   if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
-  const item = await readStudioVideoRecord(videoType, String(request.params.id));
+  const item = await readStudioVideoRecord(videoType, String(request.params.id), user.id, user.role === "admin");
   if (!item) return response.status(404).json({ error: "视频任务不存在" });
   response.json({ data: item });
 }));
 
 app.post("/api/tools/:videoType-videos", asyncRoute(async (request, response) => {
+  const user = (request as AuthenticatedRequest).authUser!;
   const videoType = String(request.params.videoType) as StudioVideoType;
   if (!studioVideoDirectories[videoType]) return response.status(404).json({ error: "不支持的视频工具" });
   if (!videoGeneration.enabled) return response.status(503).json({ error: "尚未配置视频生成 API Key，请先打开模型设置" });
@@ -1433,14 +1881,15 @@ app.post("/api/tools/:videoType-videos", asyncRoute(async (request, response) =>
     firstFrameUrl: videoType === "keyframe-video" ? input.firstFrame : undefined,
     lastFrameUrl: videoType === "keyframe-video" ? input.lastFrame : undefined,
     ratio: input.ratio,
+    resolution: input.resolution,
     duration: input.duration,
     generateAudio: input.generateAudio,
     watermark: input.watermark,
   });
   const now = new Date().toISOString();
   let record: StoredStudioVideo = {
-    id: randomUUID(), videoType, status: task.status, progress: task.progress, outputUrl: null, errorMessage: null,
-    prompt: input.prompt, model: input.model, ratio: input.ratio, duration: input.duration, createdAt: now, updatedAt: now, providerTaskId: task.taskId,
+    id: randomUUID(), userId: user.id, videoType, status: task.status, progress: task.progress, outputUrl: null, errorMessage: null,
+    prompt: input.prompt, model: input.model, ratio: input.ratio, resolution: input.resolution, duration: input.duration, createdAt: now, updatedAt: now, providerTaskId: task.taskId,
   };
   studioVideoTasks.set(studioVideoKey(videoType, record.id), record);
   await writeStudioVideoRecord(record);
@@ -1454,8 +1903,10 @@ app.post("/api/tools/:videoType-videos", asyncRoute(async (request, response) =>
   response.status(202).json({ data: record });
 }));
 
-app.get("/api/dashboard", asyncRoute(async (_request, response) => {
-  const [projects, jobs, localVideos] = await Promise.all([db.listProjects(), db.listJobs(), localVideoStorageStats()]);
+app.get("/api/dashboard", asyncRoute(async (request, response) => {
+  const user = authenticatedUser(request);
+  const [projects, jobs] = await Promise.all([db.listProjects(user.id), db.listJobs(user.id)]);
+  const localVideos = { videoCount: jobs.filter((job) => job.status === "completed" && job.outputUrl?.startsWith("/api/generated/")).length, bytes: 0 };
   const completed = projects.filter((project) => project.status === "completed").length;
   response.json({
     stats: {
@@ -1471,24 +1922,26 @@ app.get("/api/dashboard", asyncRoute(async (_request, response) => {
   });
 }));
 
-app.get("/api/assets", asyncRoute(async (_request, response) => {
-  const projects = await db.listProjects();
+app.get("/api/assets", asyncRoute(async (request, response) => {
+  const user = authenticatedUser(request);
+  const includeLegacy = user.role === "admin";
+  const projects = await db.listProjects(user.id);
   const [projectBundles, jobs, characterImages, sceneImages, propImages, canvasImages, imageUpscales, voiceClones, speechGenerations, referenceVideos, keyframeVideos, canvasVideos] = await Promise.all([
     Promise.all(projects.map(async (project) => {
       const [subjects, shots, merges] = await Promise.all([db.listSubjects(project.id), db.listShots(project.id), listVideoMerges(project.id)]);
       return { project, subjects, shots, merges };
     })),
-    db.listJobs(),
-    listStudioImages("character", 200),
-    listStudioImages("scene", 200),
-    listStudioImages("prop", 200),
-    listStudioImages("canvas", 200),
-    listImageUpscales(200),
-    listVoiceClones(200),
-    listSpeechGenerations(300),
-    listStudioVideos("reference-video", 200),
-    listStudioVideos("keyframe-video", 200),
-    listStudioVideos("canvas-video", 200),
+    db.listJobs(user.id),
+    listStudioImages("character", user.id, 200, includeLegacy),
+    listStudioImages("scene", user.id, 200, includeLegacy),
+    listStudioImages("prop", user.id, 200, includeLegacy),
+    listStudioImages("canvas", user.id, 200, includeLegacy),
+    listImageUpscales(user.id, 200, includeLegacy),
+    listVoiceClones(user.id, 200, includeLegacy),
+    listSpeechGenerations(user.id, 300, includeLegacy),
+    listStudioVideos("reference-video", user.id, 200, includeLegacy),
+    listStudioVideos("keyframe-video", user.id, 200, includeLegacy),
+    listStudioVideos("canvas-video", user.id, 200, includeLegacy),
   ]);
   const projectById = new Map(projects.map((project) => [project.id, project]));
   const shotById = new Map(projectBundles.flatMap(({ shots }) => shots.map((shot) => [`${shot.projectId}:${shot.id}`, shot] as const)));
@@ -1555,7 +2008,7 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
     .map((video) => ({
       id: `tool-video:${video.id}`, kind: "video" as const, source: "tool" as const, mediaType: "video" as const,
       title: video.videoType === "reference-video" ? "参考生视频" : video.videoType === "keyframe-video" ? "首尾帧视频" : "画布生成视频", description: video.prompt, mediaUrl: video.outputUrl!, thumbnailUrl: null,
-      projectId: null, projectTitle: null, detail: `${video.ratio} · ${video.duration} 秒`, createdAt: video.createdAt,
+    projectId: null, projectTitle: null, detail: `${video.ratio} · ${video.resolution.toUpperCase()} · ${video.duration} 秒`, createdAt: video.createdAt,
     }));
   const items = [...projectImages, ...standaloneImages, ...canvasGeneratedImages, ...upscaleImages, ...audioAssets, ...projectVideos, ...mergedVideos, ...standaloneVideos]
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
@@ -1564,8 +2017,8 @@ app.get("/api/assets", asyncRoute(async (_request, response) => {
   response.json({ items, counts });
 }));
 
-app.get("/api/projects", asyncRoute(async (_request, response) => {
-  response.json({ data: await db.listProjects() });
+app.get("/api/projects", asyncRoute(async (request, response) => {
+  response.json({ data: await db.listProjects(authenticatedUser(request).id) });
 }));
 
 app.post("/api/projects", asyncRoute(async (request, response) => {
@@ -1573,7 +2026,7 @@ app.post("/api/projects", asyncRoute(async (request, response) => {
   try {
     const input = projectSchema.parse(request.body);
     writeLog("INFO", "[create-project] 开始", { title: input.title, genre: input.genre, durationSeconds: input.durationSeconds, loglineLength: input.logline.length });
-    const project = await db.createProject(input);
+    const project = await db.createProject(authenticatedUser(request).id, input);
     writeLog("INFO", "[create-project] 完成", { projectId: project.id, elapsedMs: Date.now() - startedAt });
     response.status(201).json({ data: project });
   } catch (error) {
@@ -1584,14 +2037,14 @@ app.post("/api/projects", asyncRoute(async (request, response) => {
 
 app.delete("/api/projects/:id", asyncRoute(async (request, response) => {
   const projectId = String(request.params.id);
-  const deleted = await db.deleteProject(projectId);
+  const deleted = await db.deleteProject(projectId, authenticatedUser(request).id);
   if (!deleted) return response.status(404).json({ error: "项目不存在" });
   writeLog("INFO", "[delete-project] 完成", { projectId });
   response.status(204).send();
 }));
 
 app.get("/api/projects/:id", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const scenes = await db.listScenes(project.id);
   response.json({ data: { ...project, scenes } });
@@ -1599,20 +2052,20 @@ app.get("/api/projects/:id", asyncRoute(async (request, response) => {
 
 app.patch("/api/projects/:id", asyncRoute(async (request, response) => {
   const input = patchProjectSchema.parse(request.body);
-  const project = await db.updateProject(String(request.params.id), input);
+  const project = await db.updateProject(String(request.params.id), input, authenticatedUser(request).id);
   if (!project) return response.status(404).json({ error: "项目不存在" });
   response.json({ data: project });
 }));
 
 app.get("/api/projects/:id/pipeline", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const [document, episodes, subjects, shots] = await Promise.all([db.getScriptDocument(project.id), db.listEpisodes(project.id), db.listSubjects(project.id), db.listShots(project.id)]);
   response.json({ data: { project, document, episodes, subjects, shots } });
 }));
 
 app.post("/api/projects/:id/format", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const { text, systemPrompt } = scriptInputSchema.parse(request.body);
   if (!deepSeek.enabled && !localFallback) return response.status(503).json({ error: "尚未配置 DeepSeek API Key，请先打开模型设置" });
@@ -1637,7 +2090,7 @@ app.post("/api/projects/:id/format", asyncRoute(async (request, response) => {
 
 app.post("/api/projects/:id/episodes/extract", asyncRoute(async (request, response) => {
   const startedAt = Date.now();
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const document = await db.getScriptDocument(project.id);
   if (!document?.formattedText) return response.status(409).json({ error: "请先完成剧本格式化" });
@@ -1657,7 +2110,7 @@ app.post("/api/projects/:id/episodes/extract", asyncRoute(async (request, respon
 }));
 
 app.post("/api/projects/:id/subjects/extract", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const input = episodeExtractionSchema.parse(request.body ?? {});
   const episodes = await db.listEpisodes(project.id);
@@ -1709,7 +2162,7 @@ app.post("/api/projects/:id/subjects/extract", asyncRoute(async (request, respon
 }));
 
 app.delete("/api/projects/:id/subjects/:subjectId", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const subject = (await db.listSubjects(project.id)).find((item) => item.id === String(request.params.subjectId));
   if (!subject) return response.status(404).json({ error: "主体不存在" });
@@ -1723,7 +2176,7 @@ app.post("/api/projects/:id/subjects/:subjectId/image", asyncRoute(async (reques
   const startedAt = Date.now();
   const projectId = String(request.params.id);
   const subjectId = String(request.params.subjectId);
-  const project = await db.getProject(projectId);
+  const project = await ownedProject(request, projectId);
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const subject = (await db.listSubjects(projectId)).find((item) => item.id === subjectId);
   if (!subject) return response.status(404).json({ error: "主体不存在" });
@@ -1754,7 +2207,7 @@ app.post("/api/projects/:id/subjects/:subjectId/image", asyncRoute(async (reques
 
 app.post("/api/projects/:id/shots/extract", asyncRoute(async (request, response) => {
   const startedAt = Date.now();
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const input = shotExtractionSchema.parse(request.body ?? {});
   const episodes = await db.listEpisodes(project.id);
@@ -1791,7 +2244,7 @@ app.post("/api/projects/:id/generate-script", asyncRoute(async (request, respons
   const projectId = String(request.params.id);
   const startedAt = Date.now();
   try {
-    const project = await db.getProject(projectId);
+    const project = await ownedProject(request, projectId);
     if (!project) return response.status(404).json({ error: "项目不存在" });
     const input = projectSchema.parse(request.body);
     const engine = deepSeek.enabled ? deepSeekConfig.model : "local-fallback";
@@ -1822,7 +2275,7 @@ app.post("/api/projects/:id/generate-script", asyncRoute(async (request, respons
 
 app.patch("/api/projects/:id/shots/:shotId", asyncRoute(async (request, response) => {
   const projectId = String(request.params.id);
-  const project = await db.getProject(projectId);
+  const project = await ownedProject(request, projectId);
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const input = shotEditSchema.parse(request.body ?? {});
   const shot = await db.updateShot(projectId, String(request.params.shotId), input);
@@ -1830,10 +2283,41 @@ app.patch("/api/projects/:id/shots/:shotId", asyncRoute(async (request, response
   response.json({ data: shot });
 }));
 
+app.delete("/api/projects/:id/shots/:shotId", asyncRoute(async (request, response) => {
+  const projectId = String(request.params.id);
+  const shotId = String(request.params.shotId);
+  const project = await ownedProject(request, projectId);
+  if (!project) return response.status(404).json({ error: "项目不存在" });
+  const shot = (await db.listShots(projectId)).find((candidate) => candidate.id === shotId);
+  if (!shot) return response.status(404).json({ error: "分镜不存在" });
+  const activeJob = (await db.listJobs(authenticatedUser(request).id)).some((job) => job.projectId === projectId && job.shotId === shotId && (job.status === "queued" || job.status === "processing"));
+  if (activeJob) return response.status(409).json({ error: "该分镜的视频正在生成，请等待任务完成后再删除" });
+  const deleted = await db.deleteShot(projectId, shotId);
+  if (!deleted) return response.status(404).json({ error: "分镜不存在" });
+  for (const key of continuityFrameCache.keys()) if (key.startsWith(`${shotId}:`)) continuityFrameCache.delete(key);
+  const shots = await db.listShots(projectId);
+  await broadcastRenderJobs();
+  response.json({ data: { shots, deletedCount: 1 } });
+}));
+
+app.delete("/api/projects/:id/shots", asyncRoute(async (request, response) => {
+  const projectId = String(request.params.id);
+  const project = await ownedProject(request, projectId);
+  if (!project) return response.status(404).json({ error: "项目不存在" });
+  const shots = await db.listShots(projectId);
+  const activeJob = (await db.listJobs(authenticatedUser(request).id)).some((job) => job.projectId === projectId && job.shotId && (job.status === "queued" || job.status === "processing"));
+  if (activeJob) return response.status(409).json({ error: "项目中仍有视频正在生成，请等待任务完成后再删除全部分镜" });
+  const deletedCount = await db.deleteShots(projectId);
+  const shotIds = new Set(shots.map((shot) => shot.id));
+  for (const key of continuityFrameCache.keys()) if (shotIds.has(key.slice(0, key.indexOf(":")))) continuityFrameCache.delete(key);
+  await broadcastRenderJobs();
+  response.json({ data: { shots: [], deletedCount } });
+}));
+
 app.get("/api/projects/:id/shots/:shotId/continuity-preview", asyncRoute(async (request, response) => {
   const projectId = String(request.params.id);
   const shotId = String(request.params.shotId);
-  const project = await db.getProject(projectId);
+  const project = await ownedProject(request, projectId);
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const shots = await db.listShots(projectId);
   const shot = shots.find((candidate) => candidate.id === shotId);
@@ -1859,7 +2343,7 @@ app.get("/api/projects/:id/shots/:shotId/continuity-preview", asyncRoute(async (
 }));
 
 app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   if (!videoGeneration.enabled) return response.status(503).json({ error: "尚未配置视频生成 API Key，请先打开模型设置" });
   const input = renderInputSchema.parse(request.body ?? {});
@@ -1881,7 +2365,7 @@ app.post("/api/projects/:id/render", asyncRoute(async (request, response) => {
 }));
 
 app.get("/api/projects/:id/video-merges", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const records = await listVideoMerges(project.id);
   const recordsWithCovers = await Promise.all(records.map(async (record) => {
@@ -1906,7 +2390,7 @@ app.get("/api/projects/:id/video-merges", asyncRoute(async (request, response) =
 }));
 
 app.post("/api/projects/:id/video-merges", asyncRoute(async (request, response) => {
-  const project = await db.getProject(String(request.params.id));
+  const project = await ownedProject(request, String(request.params.id));
   if (!project) return response.status(404).json({ error: "项目不存在" });
   const input = videoMergeSchema.parse(request.body ?? {});
   const selectedIds = new Set(input.shotIds);
@@ -1917,7 +2401,7 @@ app.post("/api/projects/:id/video-merges", asyncRoute(async (request, response) 
     .sort((left, right) => left.episodeNumber - right.episodeNumber || left.shotOrder - right.shotOrder);
   if (shots.length !== input.shotIds.length) return response.status(404).json({ error: "部分分镜不存在" });
 
-  const latestJobs = (await db.listJobs())
+  const latestJobs = (await db.listJobs(authenticatedUser(request).id))
     .filter((job) => job.projectId === project.id && job.shotId && job.status === "completed" && job.outputUrl)
     .sort((left, right) => right.createdAt.localeCompare(left.createdAt));
   const videoByShot = new Map<string, string>();
@@ -1965,11 +2449,12 @@ app.post("/api/projects/:id/video-merges", asyncRoute(async (request, response) 
   }
 }));
 
-app.get("/api/jobs", asyncRoute(async (_request, response) => {
-  response.json({ data: await db.listJobs() });
+app.get("/api/jobs", asyncRoute(async (request, response) => {
+  response.json({ data: await db.listJobs(authenticatedUser(request).id) });
 }));
 
 app.get("/api/jobs/stream", asyncRoute(async (request, response) => {
+  const user = authenticatedUser(request);
   response.set({
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
@@ -1977,8 +2462,8 @@ app.get("/api/jobs/stream", asyncRoute(async (request, response) => {
     "X-Accel-Buffering": "no",
   });
   response.flushHeaders();
-  renderJobStreams.add(response);
-  response.write(`retry: 10000\ndata: ${JSON.stringify(await db.listJobs())}\n\n`);
+  renderJobStreams.set(response, user.id);
+  response.write(`retry: 10000\ndata: ${JSON.stringify(await db.listJobs(user.id))}\n\n`);
   const heartbeat = setInterval(() => response.write(": keep-alive\n\n"), 25000);
   request.on("close", () => {
     clearInterval(heartbeat);
@@ -1995,23 +2480,37 @@ app.use((error: unknown, request: Request, response: Response, _next: NextFuncti
   const detail = error instanceof Error ? error.message : "未知错误";
   writeLog("ERROR", "[api-error]", { method: request.method, path: request.originalUrl, error: error instanceof Error ? error.stack ?? detail : detail });
   const timedOut = detail.includes("请求超过") || detail.toLowerCase().includes("timeout");
+  const modelBalanceIssue = detail.includes("DeepSeek 账户余额不足");
+  const modelRateIssue = detail.includes("DeepSeek 请求过于频繁");
+  const modelProviderIssue = detail.startsWith("DeepSeek ");
   const modelResponseIssue = detail.includes("DeepSeek 返回空内容") || detail.includes("DeepSeek 返回了无法解析的 JSON");
   const imageResponseIssue = detail.includes("图片平台") || detail.includes("生成图片") || detail.includes("异步任务") || detail.includes("图片高清") || detail.includes("火山视觉");
   const storageResponseIssue = detail.includes("OSS") || detail.includes("对象存储");
   const videoResponseIssue = detail.includes("视频平台") || detail.includes("视频任务") || detail.includes("视频生成") || detail.includes("视频合并") || detail.includes("FFmpeg") || detail.includes("镜头视频");
   const voiceResponseIssue = detail.includes("MiniMax") || detail.includes("声音克隆") || detail.includes("试听音频");
   const digitalHumanResponseIssue = detail.includes("Vidu Live") || detail.includes("数字人");
-  const publicError = timedOut && digitalHumanResponseIssue ? "数字人会话创建超时" : timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : storageResponseIssue ? "图片上传到 OSS 失败" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : voiceResponseIssue ? "声音克隆失败" : digitalHumanResponseIssue ? "数字人会话连接失败" : "服务器内部错误";
-  response.status(timedOut ? 504 : modelResponseIssue || imageResponseIssue || storageResponseIssue || videoResponseIssue || voiceResponseIssue || digitalHumanResponseIssue ? 502 : 500).json({ error: publicError, details: detail });
+  const publicError = modelBalanceIssue || modelRateIssue || modelProviderIssue ? detail : timedOut && digitalHumanResponseIssue ? "数字人会话创建超时" : timedOut ? "模型请求超时" : modelResponseIssue ? "模型返回结果异常" : storageResponseIssue ? "图片上传到 OSS 失败" : imageResponseIssue ? "图片生成失败" : videoResponseIssue ? "视频处理失败" : voiceResponseIssue ? "声音克隆失败" : digitalHumanResponseIssue ? "数字人会话连接失败" : "服务器内部错误";
+  const status = modelBalanceIssue ? 402 : modelRateIssue ? 429 : timedOut ? 504 : modelProviderIssue || modelResponseIssue || imageResponseIssue || storageResponseIssue || videoResponseIssue || voiceResponseIssue || digitalHumanResponseIssue ? 502 : 500;
+  response.status(status).json({ error: publicError, ...(!modelProviderIssue && !isProduction ? { details: detail } : {}) });
 });
 
 await db.initialize();
+const bootstrapAccount = process.env.ADMIN_BOOTSTRAP_ACCOUNT?.trim();
+const bootstrapPassword = process.env.ADMIN_BOOTSTRAP_PASSWORD ?? "";
+if (await db.countAdmins() === 0 && bootstrapAccount && bootstrapPassword) {
+  if (bootstrapPassword.length < 12) throw new Error("ADMIN_BOOTSTRAP_PASSWORD 至少需要 12 个字符");
+  const salt = randomBytes(16).toString("hex");
+  await db.bootstrapAdmin(bootstrapAccount, await passwordHash(bootstrapPassword, salt), salt);
+  writeLog("INFO", "[auth] 已创建初始管理员", { account: bootstrapAccount });
+} else if (isProduction && await db.countAdmins() === 0) {
+  throw new Error("生产环境首次启动必须配置 ADMIN_BOOTSTRAP_ACCOUNT 和 ADMIN_BOOTSTRAP_PASSWORD");
+}
 await resumeVideoTasks();
 await resumeStudioVideoTasks();
 const server = createServer(app);
 const digitalHumanControlServer = new WebSocketServer({ noServer: true });
 
-server.on("upgrade", (request, socket, head) => {
+server.on("upgrade", async (request, socket, head) => {
   const requestUrl = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
   const match = requestUrl.pathname.match(/^\/api\/tools\/digital-human\/lives\/([^/]+)\/control$/);
   if (!match || !viduLive.enabled) {
@@ -2021,6 +2520,15 @@ server.on("upgrade", (request, socket, head) => {
   }
 
   const liveId = decodeURIComponent(match[1]);
+  const cookieHeader = request.headers.cookie ?? "";
+  const sessionToken = cookieHeader.split(";").map((item) => item.trim()).find((item) => item.startsWith(`${sessionCookieName}=`))?.slice(sessionCookieName.length + 1);
+  const user = sessionToken ? await db.getUserBySession(sessionHash(decodeURIComponent(sessionToken))) : null;
+  const source = viduLiveSources.get(liveId);
+  if (!user || !source || source.userId !== user.id) {
+    socket.write(`HTTP/1.1 ${user ? "404 Not Found" : "401 Unauthorized"}\r\nConnection: close\r\n\r\n`);
+    socket.destroy();
+    return;
+  }
   digitalHumanControlServer.handleUpgrade(request, socket, head, (client) => {
     const connId = requestUrl.searchParams.get("conn_id")?.trim();
     const upstreamQuery = new URLSearchParams({ live_id: liveId });
